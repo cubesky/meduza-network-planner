@@ -17,7 +17,8 @@ jobs:
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
       GITEA_SERVER_URL: ${{ gitea.server_url }}
       GITEA_ACTOR: ${{ gitea.actor }}
-      GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+      GITEA_TOKEN_SECRET: ${{ secrets.GITEA_TOKEN }}
+      GITEA_TOKEN_CTX: ${{ gitea.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,10 +44,14 @@ jobs:
             REGISTRY_USER="${GITEA_ACTOR}"
           fi
           if [[ -z "${REGISTRY_PASSWORD}" ]]; then
-            REGISTRY_PASSWORD="${GITEA_TOKEN}"
+            TOKEN="${GITEA_TOKEN_SECRET}"
+            if [[ -z "${TOKEN}" ]]; then
+              TOKEN="${GITEA_TOKEN_CTX}"
+            fi
+            REGISTRY_PASSWORD="${TOKEN}"
           fi
           if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
-            echo "Missing registry credentials. Set REGISTRY_USER/REGISTRY_PASSWORD or GITEA_TOKEN."
+            echo "Missing registry credentials. Set REGISTRY_USER/REGISTRY_PASSWORD or provide a Gitea token."
             exit 1
           fi
           echo "REGISTRY_USER=${REGISTRY_USER}" >> "${GITHUB_ENV}"
