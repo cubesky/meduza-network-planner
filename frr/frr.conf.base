@@ -1,0 +1,2 @@
+frr defaults traditional
+service integrated-vtysh-config

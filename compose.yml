@@ -1,0 +1,23 @@
+services:
+  gateway:
+    build:
+      context: .
+      args:
+        EASYTIER_VERSION: 2.4.5
+        MIHOMO_VERSION: 1.19.17
+    network_mode: host
+    privileged: true
+    environment:
+      NODE_ID: gw-a
+      ETCD_ENDPOINTS: https://127.0.0.1:2379
+      ETCD_CA: /certs/ca.pem
+      ETCD_CERT: /certs/gw.pem
+      ETCD_KEY: /certs/gw-key.pem
+      ETCD_USER: gateway
+      ETCD_PASS: secret
+      # DEFAULT_GW: 192.0.2.1
+      # DEFAULT_GW_DEV: eth0
+      # UPDATE_TTL_SECONDS: 60
+      # OPENVPN_STATUS_INTERVAL: 10
+    volumes:
+      - ./certs:/certs:ro

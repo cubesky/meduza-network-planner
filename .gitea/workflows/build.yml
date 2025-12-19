@@ -1,0 +1,86 @@
+name: build-and-push
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ secrets.REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      GITEA_SERVER_URL: ${{ gitea.server_url }}
+      GITEA_ACTOR: ${{ gitea.actor }}
+      GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve registry host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${REGISTRY}" ]]; then
+            REGISTRY_HOST="${REGISTRY}"
+          else
+            REGISTRY_HOST="${GITEA_SERVER_URL#http://}"
+            REGISTRY_HOST="${REGISTRY_HOST#https://}"
+            REGISTRY_HOST="${REGISTRY_HOST%/}"
+          fi
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "${GITHUB_ENV}"
+          echo "IMAGE=${REGISTRY_HOST}/${{ gitea.repository }}" >> "${GITHUB_ENV}"
+
+      - name: Validate registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USER}" ]]; then
+            REGISTRY_USER="${GITEA_ACTOR}"
+          fi
+          if [[ -z "${REGISTRY_PASSWORD}" ]]; then
+            REGISTRY_PASSWORD="${GITEA_TOKEN}"
+          fi
+          if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
+            echo "Missing registry credentials. Set REGISTRY_USER/REGISTRY_PASSWORD or GITEA_TOKEN."
+            exit 1
+          fi
+          echo "REGISTRY_USER=${REGISTRY_USER}" >> "${GITHUB_ENV}"
+          echo "REGISTRY_PASSWORD=${REGISTRY_PASSWORD}" >> "${GITHUB_ENV}"
+
+      - name: Login to registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ gitea.sha }}" \
+            .
+
+      - name: Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ gitea.sha }}"
+
+      - name: Push tag image
+        if: startsWith(gitea.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITEA_REF#refs/tags/}"
+          docker tag "${IMAGE}:${{ gitea.sha }}" "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:${TAG}"
+        env:
+          GITEA_REF: ${{ gitea.ref }}
