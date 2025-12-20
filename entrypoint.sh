@@ -39,8 +39,43 @@ fi
 # FRR must be up before any transparent proxy rules are applied.
 /usr/lib/frr/frrinit.sh start
 
-# Start Clash (config will be written & reloaded by watcher)
-mihomo -d /etc/clash >/var/log/clash.log 2>&1 &
-echo $! >/run/clash/mihomo.pid
+supervise() {
+  local name="$1"
+  shift
+  local delay=1
+  local cap=60
+  while true; do
+    echo "[supervise] start ${name}" >&2
+    "$@" &
+    local pid=$!
+    wait "$pid"
+    echo "[supervise] ${name} exited, restarting in ${delay}s" >&2
+    sleep "$delay"
+    delay=$(( delay * 2 ))
+    if (( delay > cap )); then delay=$cap; fi
+  done
+}
 
-exec python3 /watcher.py
+supervise_watchfrr() {
+  local delay=1
+  local cap=60
+  while true; do
+    if ! pgrep -x watchfrr >/dev/null 2>&1; then
+      echo "[supervise] watchfrr missing, restarting frr" >&2
+      /usr/lib/frr/frrinit.sh start || true
+      echo "[supervise] watchfrr restart backoff ${delay}s" >&2
+      sleep "$delay"
+      delay=$(( delay * 2 ))
+      if (( delay > cap )); then delay=$cap; fi
+    else
+      delay=1
+      sleep 5
+    fi
+  done
+}
+
+# Start Clash (config will be written & reloaded by watcher)
+supervise mihomo mihomo -d /etc/clash >/var/log/clash.log 2>&1 &
+supervise_watchfrr &
+
+exec supervise watcher python3 /watcher.py

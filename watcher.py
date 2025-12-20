@@ -589,6 +589,70 @@ def openvpn_status_loop():
             _write_openvpn_status(name, status)
 
 
+def monitor_children_loop():
+    backoffs: Dict[str, Backoff] = {}
+    next_time: Dict[str, float] = {}
+
+    def should_try(key: str) -> bool:
+        return time.time() >= next_time.get(key, 0)
+
+    def on_fail(key: str) -> None:
+        b = backoffs.setdefault(key, Backoff())
+        next_time[key] = time.time() + b.next_sleep()
+
+    def on_ok(key: str) -> None:
+        b = backoffs.setdefault(key, Backoff())
+        b.reset()
+        next_time[key] = 0
+
+    while True:
+        time.sleep(3)
+        try:
+            node = load_prefix(f"/nodes/{NODE_ID}/")
+            global_cfg = load_prefix("/global/")
+            mesh_type = global_cfg.get("/global/mesh_type", "easytier")
+
+            if mesh_type == "tinc":
+                if node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true":
+                    if tinc_proc is None or not _proc_alive(tinc_proc):
+                        key = "tinc"
+                        if should_try(key):
+                            try:
+                                reload_tinc(node, load_all_nodes(), global_cfg)
+                                on_ok(key)
+                            except Exception:
+                                on_fail(key)
+            else:
+                if node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true":
+                    if easytier_proc is None or not _proc_alive(easytier_proc):
+                        key = "easytier"
+                        if should_try(key):
+                            try:
+                                easytier_domain = {k: v for k, v in node.items() if "/easytier/" in k}
+                                reload_easytier(easytier_domain, global_cfg)
+                                on_ok(key)
+                            except Exception:
+                                on_fail(key)
+
+            ovpn = parse_openvpn(node)
+            for name, cfg in ovpn.items():
+                if cfg.get("enable") != "true":
+                    continue
+                if "config" not in cfg:
+                    continue
+                proc = openvpn_procs.get(name)
+                if proc is None or not _proc_alive(proc):
+                    key = f"openvpn:{name}"
+                    if should_try(key):
+                        try:
+                            openvpn_procs[name] = openvpn_start(name, cfg["config"])
+                            on_ok(key)
+                        except Exception:
+                            on_fail(key)
+        except Exception:
+            continue
+
+
 # ---------- LANs ----------
 
 def node_lans(node: Dict[str, str]) -> List[str]:
@@ -994,6 +1058,7 @@ def watch_loop() -> None:
 def main() -> None:
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
+    threading.Thread(target=monitor_children_loop, daemon=True).start()
 
     publish_update("startup")
     watch_loop()
