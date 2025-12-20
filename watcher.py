@@ -344,6 +344,8 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
     run("pkill tincd || true")
 
     netname = global_cfg.get("/global/tinc/netname", "mesh")
+    if not netname:
+        raise RuntimeError("missing /global/tinc/netname")
     name = node.get(f"/nodes/{NODE_ID}/tinc/name", NODE_ID)
     dev_name = node.get(f"/nodes/{NODE_ID}/tinc/dev_name", "tnc0")
     port = node.get(f"/nodes/{NODE_ID}/tinc/port", "655")
@@ -367,7 +369,9 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
     if not (privkey or ed25519_priv):
         raise RuntimeError("missing /nodes/<NODE_ID>/tinc/private_key or /nodes/<NODE_ID>/tinc/ed25519_private_key")
 
-    hosts_dir = f"/etc/tinc/{netname}/hosts"
+    base_dir = f"/etc/tinc/{netname}"
+    os.makedirs(base_dir, exist_ok=True)
+    hosts_dir = f"{base_dir}/hosts"
     os.makedirs(hosts_dir, exist_ok=True)
     for f in os.listdir(hosts_dir):
         try:
