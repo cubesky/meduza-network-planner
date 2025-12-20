@@ -78,4 +78,4 @@ supervise_watchfrr() {
 supervise mihomo mihomo -d /etc/clash >/var/log/clash.log 2>&1 &
 supervise_watchfrr &
 
-exec supervise watcher python3 /watcher.py
+supervise watcher python3 /watcher.py
