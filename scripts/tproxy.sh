@@ -36,6 +36,7 @@ remove_rules() {
   iptables -t mangle -F CLASH_TPROXY 2>/dev/null || true
   iptables -t mangle -X CLASH_TPROXY 2>/dev/null || true
 
+  ip rule del pref 100 fwmark ${MARK} table ${TABLE} 2>/dev/null || true
   ip rule del fwmark ${MARK} table ${TABLE} 2>/dev/null || true
   ip route flush table ${TABLE} 2>/dev/null || true
 }
@@ -60,7 +61,7 @@ apply_rules() {
   iptables -t mangle -A PREROUTING -j CLASH_TPROXY
 
   # policy routing for marked packets (mark is set by TPROXY in PREROUTING)
-  ip rule add fwmark ${MARK} table ${TABLE}
+  ip rule add pref 100 fwmark ${MARK} table ${TABLE}
   ip route add local 0.0.0.0/0 dev lo table ${TABLE}
 }
 
