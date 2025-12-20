@@ -68,8 +68,11 @@ etcd = etcd3.client(
 
 def load_prefix(prefix: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    for k, v in etcd.get_prefix(prefix):
-        out[k.decode("utf-8")] = v.decode("utf-8")
+    for value, meta in etcd.get_prefix(prefix):
+        key = getattr(meta, "key", None)
+        if key is None:
+            continue
+        out[key.decode("utf-8")] = value.decode("utf-8")
     return out
 
 
