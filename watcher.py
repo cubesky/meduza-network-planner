@@ -184,7 +184,7 @@ def reload_easytier(domain: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     # Global private_mode (default false)
     if gg("private_mode", "false") == "true":
-        args.append("--private-mode")
+        args.append("--private-mode=true")
 
     # Node ipv4 is still node-specific (per-node address within overlay)
     ipv4 = ng("ipv4", "")
@@ -449,12 +449,14 @@ def generate_frr(node: Dict[str, str], global_cfg: Dict[str, str]) -> str:
     ]
 
     if ospf_enable:
+        for i in active_ifaces:
+            lines.append(f"interface {i}")
+            lines.append(" no ip ospf passive")
+            lines.append("!")
         lines.append("router ospf")
         if router_id:
             lines.append(f" ospf router-id {router_id}")
         lines.append(" passive-interface default")
-        for i in active_ifaces:
-            lines.append(f" no passive-interface {i}")
         if inject_site_lan:
             lines.append(" redistribute connected")
         if ospf_redistribute_bgp:

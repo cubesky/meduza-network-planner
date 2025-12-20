@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     frr frr-pythontools \
     openvpn \
     iproute2 iptables \
+    procps \
     curl jq python3 python3-pip \
     ca-certificates \
     unzip gzip \
