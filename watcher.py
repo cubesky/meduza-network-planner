@@ -152,11 +152,20 @@ def ensure_online_lease():
 def publish_update(reason: str) -> None:
     """Write last timestamp (persistent) and online TTL key."""
     try:
-            ts = now_utc_iso()
-            _etcd_call(lambda: etcd.put(UPDATE_LAST_KEY, ts))
-            lease = ensure_online_lease()
+        ts = now_utc_iso()
+        _etcd_call(lambda: etcd.put(UPDATE_LAST_KEY, ts))
+        lease = ensure_online_lease()
+        try:
             _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
-            print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
+        except grpc.RpcError as e:
+            if e.code() == StatusCode.NOT_FOUND:
+                with _lease_lock:
+                    _online_lease = None
+                lease = ensure_online_lease()
+                _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+            else:
+                raise
+        print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
     except Exception as e:
         with _lease_lock:
             _online_lease = None
@@ -168,14 +177,16 @@ def keepalive_loop():
     while True:
         time.sleep(interval)
         try:
-            with _lease_lock:
-                lease = _online_lease
-            if lease:
+                with _lease_lock:
+                    lease = _online_lease
+                if lease:
                     try:
                         lease.refresh()
                     except grpc.RpcError as e:
-                        if e.code() == StatusCode.UNAUTHENTICATED:
+                        if e.code() in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
                             _reset_etcd()
+                            with _lease_lock:
+                                _online_lease = None
                         else:
                             raise
         except Exception:
