@@ -29,15 +29,32 @@ RUN apt-get update && apt-get install -y \
 # --- EasyTier ---
 # Release asset name: easytier-linux-x86_64-v<VER>.zip
 # Zip structure: easytier-linux-x86_64/{easytier-core,easytier-cli,easytier-web,easytier-web-embed}
-RUN set -eux;         ASSET="easytier-linux-x86_64-v${EASYTIER_VERSION}.zip";         URL="https://github.com/EasyTier/EasyTier/releases/download/v${EASYTIER_VERSION}/${ASSET}";         curl -fL "$URL" -o /tmp/easytier.zip;         unzip -q /tmp/easytier.zip -d /tmp/easytier;         install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-core /usr/local/bin/easytier-core;         install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-cli /usr/local/bin/easytier-cli || true;         rm -rf /tmp/easytier /tmp/easytier.zip
+RUN set -eux; \
+    PROXY="http://10.42.1.2:7890"; \
+    CURL_PROXY=""; \
+    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
+      CURL_PROXY="--proxy ${PROXY}"; \
+    fi; \
+    ASSET="easytier-linux-x86_64-v${EASYTIER_VERSION}.zip"; \
+    URL="https://github.com/EasyTier/EasyTier/releases/download/v${EASYTIER_VERSION}/${ASSET}"; \
+    curl -fL ${CURL_PROXY} "$URL" -o /tmp/easytier.zip; \
+    unzip -q /tmp/easytier.zip -d /tmp/easytier; \
+    install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-core /usr/local/bin/easytier-core; \
+    install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-cli /usr/local/bin/easytier-cli || true; \
+    rm -rf /tmp/easytier /tmp/easytier.zip
 
 # --- Clash Meta (mihomo) ---
 # Release asset name: mihomo-linux-amd64-v2-v<VER>.gz
 # Gzip contains binary: mihomo-linux-amd64-v2
 RUN set -eux; \
+    PROXY="http://10.42.1.2:7890"; \
+    CURL_PROXY=""; \
+    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
+      CURL_PROXY="--proxy ${PROXY}"; \
+    fi; \
     ASSET="mihomo-linux-amd64-v2-v${MIHOMO_VERSION}.gz"; \
     URL="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/${ASSET}"; \
-    curl -fL "$URL" -o /tmp/mihomo.gz; \
+    curl -fL ${CURL_PROXY} "$URL" -o /tmp/mihomo.gz; \
     gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
     chmod +x /usr/local/bin/mihomo; \
     rm -f /tmp/mihomo.gz
