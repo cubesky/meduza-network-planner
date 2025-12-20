@@ -2,7 +2,7 @@
 
 Single-container **edge gateway** controlled by **etcd** (single source of truth), coordinating:
 
-- EasyTier (overlay only)
+- EasyTier or Tinc (overlay)
 - FRR (OSPF + BGP)
 - OpenVPN (BGP transport only)
 - Clash Meta (mihomo) (mixed / tproxy fallback)
@@ -25,7 +25,7 @@ Then update etcd keys and bump `/commit`.
 
 ## Schema change (sites merged into nodes)
 
-- `sites` is removed; LANs are now 1:1 with nodes under `/nodes/<NODE_ID>/lan/*`.
+- `sites` is removed; LANs are now 1:1 with nodes under `/nodes/<NODE_ID>/lan` (newline-separated).
 - Clash TPROXY exclusion uses **all Local segments** dynamically:
   - RFC1918/reserved + overlay (10.42.1.0/24) + node LANs.
 
@@ -41,22 +41,13 @@ Then update etcd keys and bump `/commit`.
 - Local-originated traffic (**OUTPUT**) is **not** proxied; only forwarded/inbound traffic is intercepted.
 
 
-## Online monitoring (/update/<NODE_ID>)
-
-If etcd ACL grants write permission to `/update/<NODE_ID>`, the watcher will:
-
-- put `/update/<NODE_ID>` = UTC epoch timestamp
-- attach a lease with TTL (default 60s) and refresh it periodically
-
-This enables simple online monitoring: if the key disappears, the node is offline (or cannot reach etcd).
-
-ENV:
-- `UPDATE_TTL_SECONDS` (optional, default `60`)
-
 ## Online monitoring (last + online)
 
 - `/updated/<NODE_ID>/online` (TTL): presence = online
-- `/updated/<NODE_ID>/last` (persistent): last successful apply time
+- `/updated/<NODE_ID>/last` (persistent): `YYYY-MM-DDTHH:mm:ss+0000`
+
+ENV:
+- `UPDATE_TTL_SECONDS` (optional, default `60`)
 
 ## OpenVPN status reporting
 
@@ -67,12 +58,13 @@ When OpenVPN is enabled, the gateway writes:
 ENV:
 - `OPENVPN_STATUS_INTERVAL` (default `10`)
 
-## Build notes (EasyTier / mihomo assets)
+## Build notes (EasyTier / Tinc / mihomo assets)
 
 This repo uses a `Dockerfile` (not Containerfile).
 
 Build args:
 - `EASYTIER_VERSION` (default `2.4.5`) downloads `easytier-linux-x86_64-v<VER>.zip` and installs `easytier-core` as `/usr/local/bin/easytier-core` (daemon) and `easytier-cli` as `/usr/local/bin/easytier-cli` (optional).
+- `TINC_VERSION` (default `1.1pre18`) downloads `tinc-<VER>.tar.gz` and builds `tincd`.
 - `MIHOMO_VERSION` (default `1.19.17`) downloads `mihomo-linux-amd64-v2-v<VER>.gz` and installs it as `/usr/local/bin/mihomo`.
 
 Example:
@@ -118,11 +110,17 @@ If not set, defaults to **deny default route inbound** and **permit all outbound
 
 To keep consistency across the fleet:
 
+- Mesh type selector:
+  - `/global/mesh_type` = `easytier` | `tinc`
+
 - EasyTier network identity is global:
   - `/global/easytier/network_name`
   - `/global/easytier/network_secret`
   - `/global/easytier/private_mode`
   - `/global/easytier/dhcp`
+
+- Tinc netname is global:
+  - `/global/tinc/netname`
 
 - Clash subscription URLs are global:
   - `/global/clash/subscriptions/<name>/url`

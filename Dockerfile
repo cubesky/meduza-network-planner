@@ -3,9 +3,10 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Versions can be overridden at build time:
-#   docker build --build-arg EASYTIER_VERSION=2.4.5 --build-arg MIHOMO_VERSION=1.19.17 .
+#   docker build --build-arg EASYTIER_VERSION=2.4.5 --build-arg MIHOMO_VERSION=1.19.17 --build-arg TINC_VERSION=1.1pre18 .
 ARG EASYTIER_VERSION=2.4.5
 ARG MIHOMO_VERSION=1.19.17
+ARG TINC_VERSION=1.1pre18
 
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -27,6 +28,8 @@ RUN apt-get update && apt-get install -y \
     curl jq python3 python3-pip \
     ca-certificates \
     unzip gzip \
+    build-essential autoconf automake libtool pkg-config \
+    libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # --- EasyTier ---
@@ -61,6 +64,25 @@ RUN set -eux; \
     gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
     chmod +x /usr/local/bin/mihomo; \
     rm -f /tmp/mihomo.gz
+
+# --- Tinc 1.1 ---
+# Release asset name: tinc-<VER>.tar.gz
+RUN set -eux; \
+    PROXY="http://10.42.1.2:7890"; \
+    CURL_PROXY=""; \
+    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://www.tinc-vpn.org/ >/dev/null; then \
+      CURL_PROXY="--proxy ${PROXY}"; \
+    fi; \
+    ASSET="tinc-${TINC_VERSION}.tar.gz"; \
+    URL="https://www.tinc-vpn.org/packages/${ASSET}"; \
+    curl -fL ${CURL_PROXY} "$URL" -o /tmp/tinc.tar.gz; \
+    tar -xzf /tmp/tinc.tar.gz -C /tmp; \
+    cd "/tmp/tinc-${TINC_VERSION}"; \
+    ./configure; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /; \
+    rm -rf "/tmp/tinc-${TINC_VERSION}" /tmp/tinc.tar.gz
 
 RUN pip3 install --no-cache-dir --break-system-packages \
     "protobuf<=3.20.3" \

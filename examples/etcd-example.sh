@@ -7,7 +7,7 @@ etcdctl put /nodes/${NODE_ID}/router_id 10.42.1.1
 etcdctl put /nodes/${NODE_ID}/roles/is_edge true
 
 # Local LANs (sites merged into nodes 1:1)
-etcdctl put /nodes/${NODE_ID}/lan/10.42.10.0_24 true
+etcdctl put /nodes/${NODE_ID}/lan $'10.42.10.0/24'
 
 # EasyTier
 etcdctl put /nodes/${NODE_ID}/easytier/enable true
@@ -20,7 +20,7 @@ tcp://0.0.0.0:11010'
 # OSPF
 etcdctl put /nodes/${NODE_ID}/ospf/enable true
 etcdctl put /nodes/${NODE_ID}/ospf/area 0
-etcdctl put /nodes/${NODE_ID}/ospf/active_ifaces/et0 true
+etcdctl put /nodes/${NODE_ID}/ospf/active_ifaces $'et0'
 etcdctl put /nodes/${NODE_ID}/ospf/inject_site_lan true
 etcdctl put /nodes/${NODE_ID}/ospf/redistribute_bgp true
 
@@ -52,6 +52,7 @@ etcdctl put /global/bgp/filter/in  $'deny 0.0.0.0/0\npermit 0.0.0.0/0 le 32'
 etcdctl put /global/bgp/filter/out $'permit 0.0.0.0/0 le 32'
 
 # Global EasyTier identity
+etcdctl put /global/mesh_type easytier
 etcdctl put /global/easytier/network_name my-net
 etcdctl put /global/easytier/network_secret my-secret
 etcdctl put /global/easytier/private_mode true
@@ -63,3 +64,26 @@ etcdctl put /global/clash/subscriptions/main/url "https://example.com/sub.yaml"
 # EasyTier mapped listeners (optional)
 # Public mapped address must correspond to a local listener port.
 etcdctl put /nodes/${NODE_ID}/easytier/mapped_listeners $'tcp://203.0.113.10:443'
+
+# ---- Tinc example (optional) ----
+# Switch mesh to tinc:
+# etcdctl put /global/mesh_type tinc
+# etcdctl put /global/tinc/netname mesh
+# etcdctl put /global/tinc/cipher blowfish
+# etcdctl put /global/tinc/digest sha1
+# etcdctl put /nodes/${NODE_ID}/tinc/enable true
+# etcdctl put /nodes/${NODE_ID}/tinc/name ${NODE_ID}
+# etcdctl put /nodes/${NODE_ID}/tinc/dev_name tnc0
+# etcdctl put /nodes/${NODE_ID}/tinc/port 655
+# etcdctl put /nodes/${NODE_ID}/tinc/address 203.0.113.10
+# etcdctl put /nodes/${NODE_ID}/tinc/address_family ipv4
+# etcdctl put /nodes/${NODE_ID}/tinc/ipv4 10.42.2.1/24
+# etcdctl put /nodes/${NODE_ID}/tinc/subnet $'10.42.2.0/24'
+# etcdctl put /nodes/${NODE_ID}/tinc/host_mode switch
+# etcdctl put /nodes/${NODE_ID}/tinc/host_cipher blowfish
+# etcdctl put /nodes/${NODE_ID}/tinc/host_digest sha1
+# etcdctl put /nodes/${NODE_ID}/tinc/mode Switch
+# etcdctl put /nodes/${NODE_ID}/tinc/public_key "$(cat ./tinc.pub)"
+# etcdctl put /nodes/${NODE_ID}/tinc/ed25519_public_key "$(cat ./tinc.ed25519.pub)"
+# etcdctl put /nodes/${NODE_ID}/tinc/private_key "$(cat ./tinc.priv)"
+# etcdctl put /nodes/${NODE_ID}/tinc/ed25519_private_key "$(cat ./tinc.ed25519.priv)"

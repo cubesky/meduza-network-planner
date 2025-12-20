@@ -3,8 +3,8 @@ set -euo pipefail
 
 : "${NODE_ID:?NODE_ID required}"
 
-mkdir -p /run/openvpn /run/easytier /run/clash
-mkdir -p /etc/openvpn/generated /etc/clash
+mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc
+mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc
 
 chown -R frr:frr /etc/frr
 chmod 640 /etc/frr/* || true

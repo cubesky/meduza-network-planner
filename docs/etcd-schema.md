@@ -1,4 +1,4 @@
-# etcd schema (nodes + sites merged 1:1)
+﻿# etcd schema (nodes + sites merged 1:1)
 
 Top level:
 
@@ -6,12 +6,10 @@ Top level:
 - /nodes/<NODE_ID>/...
 - /commit  (single trigger)
 
-`sites` is removed. LANs are now owned per-node:
+`sites` is removed. LANs are now owned per-node (single key, newline-separated):
 
 ```
-/nodes/<NODE_ID>/lan/10.42.10.0_24 = true
-/nodes/<NODE_ID>/lan/10.42.11.0_24 = true
-...
+/nodes/<NODE_ID>/lan = "10.42.10.0/24\n10.42.11.0/24\n..."
 ```
 
 These prefixes are treated as **Local segments**:
@@ -21,31 +19,18 @@ These prefixes are treated as **Local segments**:
 All other keys remain under `/nodes/<NODE_ID>/...`.
 
 
-## Online monitoring key (/update/<NODE_ID>)
-
-The gateway can write a heartbeat/update marker:
-
-- Key: `/update/<NODE_ID>`
-- Value: UTC epoch timestamp (seconds)
-- Uses an etcd **lease/TTL** (default 60s)
-
-Behavior:
-- Write once at startup
-- Write again whenever any module applies changes (config-applied)
-- Lease is refreshed periodically so the key disappears automatically if the container stops
-
-ENV:
-- `UPDATE_TTL_SECONDS` (optional, default `60`)
-
 ## Online status & last update
 
 ```
-/updated/<NODE_ID>/last    = "<UTC epoch seconds>"   # persistent
-/updated/<NODE_ID>/online  = "1"                     # TTL/lease based
+/updated/<NODE_ID>/last    = "<YYYY-MM-DDTHH:mm:ss+0000>"   # persistent
+/updated/<NODE_ID>/online  = "1"                           # TTL/lease based
 ```
 
 - `online` disappears automatically when the node is offline
 - `last` always preserves the last successful update time
+
+ENV:
+- `UPDATE_TTL_SECONDS` (optional, default `60`)
 
 
 ## OpenVPN
@@ -138,6 +123,51 @@ Notes:
 - `network_name` and `network_secret` are required globally.
 - `listeners` and `peers` are strict single-key multiline (no legacy `*/0` keys).
 
+## Mesh type
+
+Select overlay implementation:
+
+```
+/global/mesh_type = "easytier" | "tinc"
+```
+
+## Tinc (when /global/mesh_type = "tinc")
+
+Global:
+
+```
+/global/tinc/netname    # default: "mesh"
+/global/tinc/cipher     # optional, writes Cipher= in tinc.conf
+/global/tinc/digest     # optional, writes Digest= in tinc.conf
+```
+
+Node-specific Tinc settings:
+
+```
+/nodes/<NODE_ID>/tinc/enable
+/nodes/<NODE_ID>/tinc/name         # default: NODE_ID
+/nodes/<NODE_ID>/tinc/dev_name     # default: tnc0
+/nodes/<NODE_ID>/tinc/port         # default: 655
+/nodes/<NODE_ID>/tinc/address      # public address for peers to connect
+/nodes/<NODE_ID>/tinc/address_family  # default: ipv4
+/nodes/<NODE_ID>/tinc/ipv4         # optional, CIDR assigned to the tinc interface
+/nodes/<NODE_ID>/tinc/subnet       # optional, newline-separated Subnet entries for host file
+/nodes/<NODE_ID>/tinc/host_mode    # optional, writes Mode= in hosts file
+/nodes/<NODE_ID>/tinc/host_cipher  # optional, writes Cipher= in hosts file
+/nodes/<NODE_ID>/tinc/host_digest  # optional, writes Digest= in hosts file
+/nodes/<NODE_ID>/tinc/mode         # default: Switch
+/nodes/<NODE_ID>/tinc/public_key
+/nodes/<NODE_ID>/tinc/ed25519_public_key
+/nodes/<NODE_ID>/tinc/private_key
+/nodes/<NODE_ID>/tinc/ed25519_private_key
+```
+
+Behavior:
+- Uses `Mode = switch` (tinc 1.1).
+- Automatically pulls all enabled nodes' public keys under `/nodes/*/tinc/public_key`.
+- Public key can be `Ed25519PublicKey` or RSA (multi-line); value is stored verbatim in hosts file.
+- Connects to peers with `address` set.
+
 ## Clash
 
 Global subscriptions (shared, so updates are consistent):
@@ -162,4 +192,4 @@ Mapped listeners usage:
 - Local listener (example): `tcp://0.0.0.0:11010`
 - Public mapped listener:   `tcp://203.0.113.10:443`
 
-When set, the gateway starts EasyTier with one or more `--mapped-listeners <addr>` arguments. citeturn0search0turn0search3
+When set, the gateway starts EasyTier with one or more `--mapped-listeners <addr>` arguments.
