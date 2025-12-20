@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y \
     curl jq git python3 python3-pip \
     ca-certificates \
     unzip gzip \
-    build-essential autoconf automake libtool pkg-config \
+    build-essential autoconf automake libtool pkg-config meson ninja-build \
     libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -79,10 +79,9 @@ RUN set -eux; \
       git clone --depth 1 -b 1.1 https://github.com/gsliepen/tinc.git /tmp/tinc; \
     fi; \
     cd /tmp/tinc; \
-    if [ -x ./bootstrap ]; then ./bootstrap; else autoreconf -fi; fi; \
-    ./configure; \
-    make -j"$(nproc)"; \
-    make install; \
+    meson setup build; \
+    ninja -C build; \
+    ninja -C build install; \
     cd /; \
     rm -rf /tmp/tinc
 
