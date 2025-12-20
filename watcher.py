@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import yaml
 import requests
 import etcd3
+from urllib.parse import urlparse
 
 NODE_ID = os.environ["NODE_ID"]
 TAG_NO_REINJECT = 65000
@@ -40,8 +41,22 @@ def now_utc_epoch() -> str:
     return str(int(time.time()))
 
 
+def _parse_etcd_endpoint(raw: str) -> Dict[str, Any]:
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("empty ETCD_ENDPOINTS entry")
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    u = urlparse(raw)
+    if not u.hostname or not u.port:
+        raise ValueError(f"invalid ETCD_ENDPOINTS entry: {raw!r}")
+    return {"host": u.hostname, "port": u.port}
+
+
+_first_endpoint = _parse_etcd_endpoint(os.environ["ETCD_ENDPOINTS"].split(",")[0])
 etcd = etcd3.client(
-    endpoints=os.environ["ETCD_ENDPOINTS"].split(","),
+    host=_first_endpoint["host"],
+    port=_first_endpoint["port"],
     ca_cert=os.environ["ETCD_CA"],
     cert_cert=os.environ["ETCD_CERT"],
     cert_key=os.environ["ETCD_KEY"],
