@@ -59,7 +59,7 @@ RUN set -eux; \
     chmod +x /usr/local/bin/mihomo; \
     rm -f /tmp/mihomo.gz
 
-RUN pip3 install --no-cache-dir etcd3 pyyaml requests
+RUN pip3 install --no-cache-dir --break-system-packages etcd3 pyyaml requests
 
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
