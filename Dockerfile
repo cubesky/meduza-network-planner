@@ -7,7 +7,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG EASYTIER_VERSION=2.4.5
 ARG MIHOMO_VERSION=1.19.17
 
-RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list; \
+    elif [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources; \
+    else \
+      echo "No apt sources file found" >&2; \
+      exit 1; \
+    fi
 
 RUN apt-get update && apt-get install -y \
     frr frr-pythontools \
