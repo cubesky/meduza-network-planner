@@ -347,6 +347,9 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
     if not netname:
         raise RuntimeError("missing /global/tinc/netname")
     name = node.get(f"/nodes/{NODE_ID}/tinc/name", NODE_ID)
+    name = "".join(ch for ch in name if ch.isalnum())
+    if not name:
+        raise RuntimeError("invalid /nodes/<NODE_ID>/tinc/name (must be alphanumeric)")
     dev_name = node.get(f"/nodes/{NODE_ID}/tinc/dev_name", "tnc0")
     port = node.get(f"/nodes/{NODE_ID}/tinc/port", "655")
     address = node.get(f"/nodes/{NODE_ID}/tinc/address", "")
