@@ -316,7 +316,9 @@ def openvpn_status_loop():
 
 def node_lans(node: Dict[str, str]) -> List[str]:
     base = f"/nodes/{NODE_ID}/lan/"
-    return sorted({k[len(base):].replace("_", "/") for k in node if k.startswith(base)})
+    base_key = base.rstrip("/")
+    raw = node.get(base_key, "")
+    return sorted(set(_split_ml(raw)))
 
 
 # ---------- FRR smooth reload ----------
