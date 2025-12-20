@@ -7,6 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG EASYTIER_VERSION=2.4.5
 ARG MIHOMO_VERSION=1.19.17
 
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
 RUN set -eux; \
     if [ -f /etc/apt/sources.list ]; then \
       sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.debian.org|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list; \
