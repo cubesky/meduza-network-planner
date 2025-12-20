@@ -11,6 +11,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import yaml
 import requests
 import etcd3
+import grpc
+from grpc import StatusCode
 from urllib.parse import urlparse
 
 NODE_ID = os.environ["NODE_ID"]
@@ -59,21 +61,49 @@ def _parse_etcd_endpoint(raw: str) -> Dict[str, Any]:
 
 
 _first_endpoint = _parse_etcd_endpoint(os.environ["ETCD_ENDPOINTS"].split(",")[0])
-etcd = etcd3.client(
-    host=_first_endpoint["host"],
-    port=_first_endpoint["port"],
-    ca_cert=os.environ["ETCD_CA"],
-    cert_cert=os.environ["ETCD_CERT"],
-    cert_key=os.environ["ETCD_KEY"],
-    user=os.environ["ETCD_USER"],
-    password=os.environ["ETCD_PASS"],
-    timeout=5,
-)
+_etcd_lock = threading.Lock()
+etcd = None
+
+
+def _new_etcd_client():
+    return etcd3.client(
+        host=_first_endpoint["host"],
+        port=_first_endpoint["port"],
+        ca_cert=os.environ["ETCD_CA"],
+        cert_cert=os.environ["ETCD_CERT"],
+        cert_key=os.environ["ETCD_KEY"],
+        user=os.environ["ETCD_USER"],
+        password=os.environ["ETCD_PASS"],
+        timeout=5,
+    )
+
+
+def _reset_etcd() -> None:
+    global etcd
+    with _etcd_lock:
+        etcd = _new_etcd_client()
+
+
+def _ensure_etcd() -> None:
+    global etcd
+    if etcd is None:
+        _reset_etcd()
+
+
+def _etcd_call(fn):
+    _ensure_etcd()
+    try:
+        return fn()
+    except grpc.RpcError as e:
+        if e.code() == StatusCode.UNAUTHENTICATED:
+            _reset_etcd()
+            return fn()
+        raise
 
 
 def load_prefix(prefix: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    for value, meta in etcd.get_prefix(prefix):
+    for value, meta in _etcd_call(lambda: list(etcd.get_prefix(prefix))):
         key = getattr(meta, "key", None)
         if key is None:
             continue
@@ -122,11 +152,11 @@ def ensure_online_lease():
 def publish_update(reason: str) -> None:
     """Write last timestamp (persistent) and online TTL key."""
     try:
-        ts = now_utc_iso()
-        etcd.put(UPDATE_LAST_KEY, ts)
-        lease = ensure_online_lease()
-        etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease)
-        print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
+            ts = now_utc_iso()
+            _etcd_call(lambda: etcd.put(UPDATE_LAST_KEY, ts))
+            lease = ensure_online_lease()
+            _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+            print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
     except Exception as e:
         with _lease_lock:
             _online_lease = None
@@ -141,7 +171,13 @@ def keepalive_loop():
             with _lease_lock:
                 lease = _online_lease
             if lease:
-                lease.refresh()
+                    try:
+                        lease.refresh()
+                    except grpc.RpcError as e:
+                        if e.code() == StatusCode.UNAUTHENTICATED:
+                            _reset_etcd()
+                        else:
+                            raise
         except Exception:
             with _lease_lock:
                 _online_lease = None
@@ -267,7 +303,7 @@ def _compute_openvpn_status(name: str, proc: Optional[subprocess.Popen]) -> str:
 def _write_openvpn_status(name: str, status: str) -> None:
     # Best-effort. Value format: "<status> <utc_epoch>"
     try:
-        etcd.put(_ovpn_status_key(name), f"{status} {now_utc_epoch()}")
+        _etcd_call(lambda: etcd.put(_ovpn_status_key(name), f"{status} {now_utc_epoch()}"))
     except Exception as e:
         print(f"[openvpn-status] failed to write {name}: {e}", flush=True)
 
@@ -687,7 +723,7 @@ def watch_loop() -> None:
                 print(f"[reconcile] error: {e}", flush=True)
 
             backoff.reset()
-            events, cancel = etcd.watch("/commit")
+                events, cancel = _etcd_call(lambda: etcd.watch("/commit"))
             for _ in events:
                 try:
                     handle_commit()
