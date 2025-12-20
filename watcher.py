@@ -388,6 +388,7 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
         if cfg.get("enable") != "true":
             continue
         peer_name = cfg.get("name", peer_id)
+        peer_name = "".join(ch for ch in peer_name if ch.isalnum())
         if peer_name == name:
             continue
         peer_addr = cfg.get("address", "")
