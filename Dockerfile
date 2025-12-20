@@ -63,6 +63,7 @@ RUN set -eux; \
     rm -f /tmp/mihomo.gz
 
 RUN pip3 install --no-cache-dir --break-system-packages \
+    "grpcio==1.44.0" \
     "protobuf<=3.20.3" \
     etcd3 pyyaml requests
 

@@ -1,4 +1,4 @@
-﻿# easytier-frr-gateway
+﻿# Meduza Gateway Planner
 
 Single-container **edge gateway** controlled by **etcd** (single source of truth), coordinating:
 
@@ -41,22 +41,18 @@ Then update etcd keys and bump `/commit`.
 - Local-originated traffic (**OUTPUT**) is **not** proxied; only forwarded/inbound traffic is intercepted.
 
 
-## Online monitoring (/update/<NODE_ID>)
+## Online monitoring (/updated/<NODE_ID>)
 
-If etcd ACL grants write permission to `/update/<NODE_ID>`, the watcher will:
-
-- put `/update/<NODE_ID>` = UTC epoch timestamp
-- attach a lease with TTL (default 60s) and refresh it periodically
-
-This enables simple online monitoring: if the key disappears, the node is offline (or cannot reach etcd).
-
-ENV:
-- `UPDATE_TTL_SECONDS` (optional, default `60`)
-
-## Online monitoring (last + online)
+If etcd ACL grants write permission to `/updated/<NODE_ID>`, the watcher will:
 
 - `/updated/<NODE_ID>/online` (TTL): presence = online
 - `/updated/<NODE_ID>/last` (persistent): last successful apply time
+- attach a lease with TTL (default 60s) and refresh it periodically
+
+This enables simple online monitoring: if the TTL key disappears, the node is offline (or cannot reach etcd).
+
+ENV:
+- `UPDATE_TTL_SECONDS` (optional, default `60`)
 
 ## OpenVPN status reporting
 
