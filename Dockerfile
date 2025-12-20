@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     openvpn \
     iproute2 iptables \
     procps \
-    curl jq python3 python3-pip \
+    curl jq git python3 python3-pip \
     ca-certificates \
     unzip gzip \
     build-essential autoconf automake libtool pkg-config \
@@ -66,23 +66,25 @@ RUN set -eux; \
     rm -f /tmp/mihomo.gz
 
 # --- Tinc 1.1 ---
-# Release asset name: tinc-<VER>.tar.gz
+# Build from source (git branch 1.1)
 RUN set -eux; \
     PROXY="http://10.42.1.2:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://www.tinc-vpn.org/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
-    ASSET="tinc-${TINC_VERSION}.tar.gz"; \
-    URL="https://www.tinc-vpn.org/packages/${ASSET}"; \
-    curl -fL ${CURL_PROXY} "$URL" -o /tmp/tinc.tar.gz; \
-    tar -xzf /tmp/tinc.tar.gz -C /tmp; \
-    cd "/tmp/tinc-${TINC_VERSION}"; \
+    if [ -n "${CURL_PROXY}" ]; then \
+      git -c http.proxy="${PROXY}" clone --depth 1 -b 1.1 https://github.com/gsliepen/tinc.git /tmp/tinc; \
+    else \
+      git clone --depth 1 -b 1.1 https://github.com/gsliepen/tinc.git /tmp/tinc; \
+    fi; \
+    cd /tmp/tinc; \
+    if [ -x ./bootstrap ]; then ./bootstrap; else autoreconf -fi; fi; \
     ./configure; \
     make -j"$(nproc)"; \
     make install; \
     cd /; \
-    rm -rf "/tmp/tinc-${TINC_VERSION}" /tmp/tinc.tar.gz
+    rm -rf /tmp/tinc
 
 RUN pip3 install --no-cache-dir --break-system-packages \
     "protobuf<=3.20.3" \
