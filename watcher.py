@@ -462,7 +462,7 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
         tinc_down.append(f"ip addr del {ipv4} dev \"$INTERFACE\" || true")
     _write_text(f"/etc/tinc/{netname}/tinc-down", "\n".join(tinc_down) + "\n", mode=0o755)
 
-    tinc_proc = pspawn(["tincd", "-n", netname, "-D", "--pidfile", "/run/tincd.pid"])
+    tinc_proc = pspawn(["tincd", "-c", "/etc/tinc", "-n", netname, "-D", "--pidfile", "/run/tincd.pid"])
 
 # ---------- OpenVPN (new schema: /nodes/<ID>/openvpn/<name>/...) ----------
 
