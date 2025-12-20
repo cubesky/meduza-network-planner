@@ -445,11 +445,15 @@ def generate_frr(node: Dict[str, str], global_cfg: Dict[str, str]) -> str:
         ("permit", "0.0.0.0/0 le 32"),
     ]
 
-    active_ifaces = sorted({
-        k.split("/")[-1]
-        for k in node
-        if k.startswith(f"/nodes/{NODE_ID}/ospf/active_ifaces/")
-    })
+    active_key = f"/nodes/{NODE_ID}/ospf/active_ifaces"
+    if active_key in node:
+        active_ifaces = sorted(set(_split_ml(node.get(active_key, ""))))
+    else:
+        active_ifaces = sorted({
+            k.split("/")[-1]
+            for k in node
+            if k.startswith(f"/nodes/{NODE_ID}/ospf/active_ifaces/")
+        })
 
     lans = node_lans(node)
 
@@ -501,8 +505,10 @@ def generate_frr(node: Dict[str, str], global_cfg: Dict[str, str]) -> str:
     ]
 
     if ospf_enable:
+        ospf_area = node.get(f"/nodes/{NODE_ID}/ospf/area", "0")
         for i in active_ifaces:
             lines.append(f"interface {i}")
+            lines.append(f" ip ospf area {ospf_area}")
             lines.append(" no ip ospf passive")
             lines.append("!")
         lines.append("router ospf")
