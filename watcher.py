@@ -723,7 +723,7 @@ def watch_loop() -> None:
                 print(f"[reconcile] error: {e}", flush=True)
 
             backoff.reset()
-                events, cancel = _etcd_call(lambda: etcd.watch("/commit"))
+            events, cancel = _etcd_call(lambda: etcd.watch("/commit"))
             for _ in events:
                 try:
                     handle_commit()
