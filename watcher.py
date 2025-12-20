@@ -5,6 +5,7 @@ import subprocess
 import threading
 import random
 import signal
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import yaml
@@ -39,6 +40,10 @@ def pspawn(args: List[str]) -> subprocess.Popen:
 
 def now_utc_epoch() -> str:
     return str(int(time.time()))
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
 
 
 def _parse_etcd_endpoint(raw: str) -> Dict[str, Any]:
@@ -117,8 +122,8 @@ def ensure_online_lease():
 def publish_update(reason: str) -> None:
     """Write last timestamp (persistent) and online TTL key."""
     try:
-        ts = now_utc_epoch()
-        etcd.put(UPDATE_LAST_KEY, ts)
+            ts = now_utc_iso()
+            etcd.put(UPDATE_LAST_KEY, ts)
         lease = ensure_online_lease()
         etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease)
         print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
