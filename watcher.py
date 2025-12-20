@@ -122,8 +122,8 @@ def ensure_online_lease():
 def publish_update(reason: str) -> None:
     """Write last timestamp (persistent) and online TTL key."""
     try:
-            ts = now_utc_iso()
-            etcd.put(UPDATE_LAST_KEY, ts)
+        ts = now_utc_iso()
+        etcd.put(UPDATE_LAST_KEY, ts)
         lease = ensure_online_lease()
         etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease)
         print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
