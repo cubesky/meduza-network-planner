@@ -49,6 +49,12 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     merged = dict(base)
     merged.update(sub_conf)
 
+    dns_cfg = merged.get("dns")
+    if not isinstance(dns_cfg, dict):
+        dns_cfg = {}
+    dns_cfg["enhanced-mode"] = "redir-host"
+    merged["dns"] = dns_cfg
+
     merged["socks-port"] = SOCKS_PORT
     if mode == "mixed":
         merged["mixed-port"] = HTTP_PORT
