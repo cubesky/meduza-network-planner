@@ -1,23 +1,26 @@
 ﻿import os
 import time
 import hashlib
+import glob
 import subprocess
+import json
+import shutil
 import threading
 import random
 import signal
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
-import yaml
-import requests
 import etcd3
 import grpc
 from grpc import StatusCode
 from urllib.parse import urlparse
 
 NODE_ID = os.environ["NODE_ID"]
-TAG_NO_REINJECT = 65000
 TPROXY_PORT = 7893
+MOSDNS_SOCKS_PORT = 7891
+CLASH_HTTP_PORT = 7890
+GEN_DIR = "/generators"
 
 # /updated/<NODE_ID>/...
 UPDATE_BASE = f"/updated/{NODE_ID}"
@@ -34,14 +37,6 @@ def sha(obj: Any) -> str:
 
 def run(cmd: str) -> None:
     subprocess.run(cmd, shell=True, check=True)
-
-
-def pspawn(args: List[str]) -> subprocess.Popen:
-    return subprocess.Popen(args)
-
-
-def now_utc_epoch() -> str:
-    return str(int(time.time()))
 
 
 def now_utc_iso() -> str:
@@ -131,11 +126,14 @@ class Backoff:
 
 # state
 last_hash: Dict[str, str] = {}
-easytier_proc: Optional[subprocess.Popen] = None
-tinc_proc: Optional[subprocess.Popen] = None
-openvpn_procs: Dict[str, subprocess.Popen] = {}
 tproxy_enabled = False
 reconcile_force = False
+
+# Clash refresh state
+_clash_refresh_lock = threading.Lock()
+_clash_refresh_enable = False
+_clash_refresh_interval = 0
+_clash_refresh_next = 0.0
 
 # online lease
 _lease_lock = threading.Lock()
@@ -182,18 +180,20 @@ def keepalive_loop():
     while True:
         time.sleep(interval)
         try:
-                with _lease_lock:
-                    lease = _online_lease
-                if lease:
-                    try:
-                        lease.refresh()
-                    except grpc.RpcError as e:
-                        if e.code() in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
-                            _reset_etcd()
-                            with _lease_lock:
-                                _online_lease = None
-                        else:
-                            raise
+            with _lease_lock:
+                lease = _online_lease
+            if lease:
+                try:
+                    _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+                except grpc.RpcError as e:
+                    if e.code() in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
+                        _reset_etcd()
+                        with _lease_lock:
+                            _online_lease = None
+                        lease = ensure_online_lease()
+                        _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+                    else:
+                        raise
         except Exception:
             with _lease_lock:
                 _online_lease = None
@@ -208,83 +208,20 @@ def sigusr1_handler(signum, frame):
 signal.signal(signal.SIGUSR1, sigusr1_handler)
 
 # ---------- EasyTier (NO legacy compat) ----------
-
-def _split_ml(val: str) -> List[str]:
-    if not val:
-        return []
-    return [x.strip() for x in val.replace("\r\n", "\n").replace("\r", "\n").split("\n") if x.strip()]
-
-
-def reload_easytier(domain: Dict[str, str], global_cfg: Dict[str, str]) -> None:
-    global easytier_proc
-    run("pkill easytier-core || true; pkill easytier || true")
-
-    # Node-level knobs
-    def ng(k, d=None):
-        return domain.get(f"/nodes/{NODE_ID}/easytier/{k}", d)
-
-    # Global network identity (must be consistent across nodes)
-    def gg(k, d=None):
-        return global_cfg.get(f"/global/easytier/{k}", d)
-
-    network_name = gg("network_name", "")
-    network_secret = gg("network_secret", "")
-    if not network_name or not network_secret:
-        raise RuntimeError("missing /global/easytier/network_name or /global/easytier/network_secret")
-
-    args = [
-        "easytier-core",
-        "--network-name", network_name,
-        "--network-secret", network_secret,
-        "--dev-name", ng("dev_name", "et0"),
-    ]
-
-    # Global private_mode (default false)
-    if gg("private_mode", "false") == "true":
-        args.append("--private-mode=true")
-
-    # Node ipv4 is still node-specific (per-node address within overlay)
-    ipv4 = ng("ipv4", "")
-    if ipv4:
-        args += ["--ipv4", ipv4]
-
-    # Global DHCP enable (default false)
-    if gg("dhcp", "false") == "true":
-        args.append("--dhcp")
-
-    # Node-level mapped-listeners: manually specify public address of listener(s)
-    # See EasyTier docs: --mapped-listeners tcp://PUBLIC_IP:PUBLIC_PORT with -l tcp://0.0.0.0:LOCAL_PORT
-    for v in _split_ml(ng("mapped_listeners", "")):
-        args += ["--mapped-listeners", v]
-
-    # Strict schema: newline-separated single keys (node-level)
-    for v in _split_ml(ng("listeners", "")):
-        args += ["-l", v]
-    for v in _split_ml(ng("peers", "")):
-        args += ["-p", v]
-
-    easytier_proc = pspawn(args)
+def reload_easytier(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
+    payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+    out = _run_generator("gen_easytier", payload)
+    os.makedirs("/etc/easytier", exist_ok=True)
+    _write_if_changed("/etc/easytier/config.yaml", out["config_yaml"], mode=0o644)
+    _write_if_changed("/run/easytier/args", "\n".join(out["args"]) + "\n", mode=0o644)
+    if _supervisor_is_running("easytier"):
+        if not _easytier_cli_reload():
+            _supervisor_restart("easytier")
+    else:
+        _supervisor_start("easytier")
 
 
 # ---------- Tinc (switch mode) ----------
-def _parse_tinc_nodes(nodes: Dict[str, str]) -> Dict[str, Dict[str, str]]:
-    base = "/nodes/"
-    out: Dict[str, Dict[str, str]] = {}
-    for k, v in nodes.items():
-        if not k.startswith(base):
-            continue
-        rest = k[len(base):]
-        if "/tinc/" not in rest:
-            continue
-        node_id, tail = rest.split("/", 1)
-        if not tail.startswith("tinc/"):
-            continue
-        key = tail[len("tinc/"):]
-        out.setdefault(node_id, {})
-        out[node_id][key] = v
-    return out
-
-
 def _write_text(path: str, text: str, mode: Optional[int] = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -293,203 +230,49 @@ def _write_text(path: str, text: str, mode: Optional[int] = None) -> None:
         os.chmod(path, mode)
 
 
-def _normalize_tinc_pubkey(pubkey: str, ed25519: str) -> str:
-    lines = []
-    for line in pubkey.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        lines.append(s)
-    ed = ed25519.strip()
-    if ed:
-        if not ed.lower().startswith("ed25519publickey"):
-            lines.append(f"Ed25519PublicKey = {ed}")
-        else:
-            lines.append(ed)
-    return "\n".join(lines)
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def _write_tinc_host(
-    netname: str,
-    name: str,
-    address: str,
-    port: str,
-    subnets: List[str],
-    mode: str,
-    cipher: str,
-    digest: str,
-    pubkey: str,
-    ed25519: str,
-) -> None:
-    lines = []
-    if address:
-        lines.append(f"Address={address}")
-    if mode:
-        lines.append(f"Mode={mode}")
-    if port:
-        lines.append(f"Port={port}")
-    if cipher:
-        lines.append(f"Cipher={cipher}")
-    if digest:
-        lines.append(f"Digest={digest}")
-    for s in subnets:
-        lines.append(f"Subnet={s}")
-    key_text = _normalize_tinc_pubkey(pubkey, ed25519)
-    host_text = "\n".join(lines + ["", key_text, ""])
-    _write_text(f"/etc/tinc/{netname}/hosts/{name}", host_text, mode=0o644)
+def _write_if_changed(path: str, text: str, mode: Optional[int] = None) -> bool:
+    try:
+        if _read_text(path) == text:
+            return False
+    except FileNotFoundError:
+        pass
+    _write_text(path, text, mode=mode)
+    return True
+
+
+def _run_generator(name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    cmd = ["python3", f"{GEN_DIR}/{name}.py"]
+    cp = subprocess.run(
+        cmd,
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError(f"generator {name} failed: {cp.stderr.strip() or cp.stdout.strip()}")
+    try:
+        return json.loads(cp.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"generator {name} invalid JSON: {e}") from e
 
 
 def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dict[str, str]) -> None:
-    global tinc_proc
-    run("pkill tincd || true")
+    payload = {"node_id": NODE_ID, "node": node, "all_nodes": all_nodes, "global": global_cfg}
+    out = _run_generator("gen_tinc", payload)
+    for entry in out["files"]:
+        _write_if_changed(entry["path"], entry["content"], mode=entry.get("mode"))
+    if _supervisor_is_running("tinc"):
+        if not _tinc_reload(out["netname"]):
+            _supervisor_restart("tinc")
+    else:
+        _supervisor_start("tinc")
 
-    netname = global_cfg.get("/global/tinc/netname", "mesh")
-    if not netname:
-        raise RuntimeError("missing /global/tinc/netname")
-    name = node.get(f"/nodes/{NODE_ID}/tinc/name", NODE_ID)
-    name = "".join(ch for ch in name if ch.isalnum())
-    if not name:
-        raise RuntimeError("invalid /nodes/<NODE_ID>/tinc/name (must be alphanumeric)")
-    dev_name = node.get(f"/nodes/{NODE_ID}/tinc/dev_name", "tnc0")
-    port = node.get(f"/nodes/{NODE_ID}/tinc/port", "655")
-    address = node.get(f"/nodes/{NODE_ID}/tinc/address", "")
-    address_family = node.get(f"/nodes/{NODE_ID}/tinc/address_family", "ipv4")
-    ipv4 = node.get(f"/nodes/{NODE_ID}/tinc/ipv4", "")
-    subnet = node.get(f"/nodes/{NODE_ID}/tinc/subnet", "")
-    host_mode = node.get(f"/nodes/{NODE_ID}/tinc/host_mode", "")
-    host_cipher = node.get(f"/nodes/{NODE_ID}/tinc/host_cipher", "")
-    host_digest = node.get(f"/nodes/{NODE_ID}/tinc/host_digest", "")
-    conf_mode = node.get(f"/nodes/{NODE_ID}/tinc/mode", "Switch")
-    conf_cipher = global_cfg.get("/global/tinc/cipher", "")
-    conf_digest = global_cfg.get("/global/tinc/digest", "")
-    pubkey = node.get(f"/nodes/{NODE_ID}/tinc/public_key", "")
-    ed25519 = node.get(f"/nodes/{NODE_ID}/tinc/ed25519_public_key", "")
-    privkey = node.get(f"/nodes/{NODE_ID}/tinc/private_key", "")
-    ed25519_priv = node.get(f"/nodes/{NODE_ID}/tinc/ed25519_private_key", "")
-
-    if not (pubkey or ed25519):
-        raise RuntimeError("missing /nodes/<NODE_ID>/tinc/public_key or /nodes/<NODE_ID>/tinc/ed25519_public_key")
-    if not (privkey or ed25519_priv):
-        raise RuntimeError("missing /nodes/<NODE_ID>/tinc/private_key or /nodes/<NODE_ID>/tinc/ed25519_private_key")
-
-    base_dir = f"/etc/tinc/{netname}"
-    os.makedirs(base_dir, exist_ok=True)
-    hosts_dir = f"{base_dir}/hosts"
-    os.makedirs(hosts_dir, exist_ok=True)
-    for f in os.listdir(hosts_dir):
-        try:
-            os.remove(os.path.join(hosts_dir, f))
-        except Exception:
-            pass
-
-    nodes = _parse_tinc_nodes(all_nodes)
-    connect_to: List[str] = []
-    for peer_id, cfg in nodes.items():
-        if cfg.get("enable") != "true":
-            continue
-        peer_name = cfg.get("name", peer_id)
-        peer_name = "".join(ch for ch in peer_name if ch.isalnum())
-        if peer_name == name:
-            continue
-        peer_addr = cfg.get("address", "")
-        peer_port = cfg.get("port", "")
-        peer_subnet = cfg.get("subnet", "")
-        peer_host_mode = cfg.get("host_mode", "")
-        peer_host_cipher = cfg.get("host_cipher", "")
-        peer_host_digest = cfg.get("host_digest", "")
-        peer_pub = cfg.get("public_key", "")
-        peer_ed25519 = cfg.get("ed25519_public_key", "")
-        if not (peer_pub or peer_ed25519):
-            continue
-        _write_tinc_host(
-            netname,
-            peer_name,
-            peer_addr,
-            peer_port,
-            _split_ml(peer_subnet),
-            peer_host_mode,
-            peer_host_cipher,
-            peer_host_digest,
-            peer_pub,
-            peer_ed25519,
-        )
-        if peer_addr:
-            connect_to.append(peer_name)
-
-    _write_tinc_host(
-        netname,
-        name,
-        address,
-        port,
-        _split_ml(subnet),
-        host_mode,
-        host_cipher,
-        host_digest,
-        pubkey,
-        ed25519,
-    )
-    if privkey.strip():
-        _write_text(f"/etc/tinc/{netname}/rsa_key.priv", f"{privkey.strip()}\n", mode=0o600)
-    if ed25519_priv.strip():
-        _write_text(f"/etc/tinc/{netname}/ed25519_key.priv", f"{ed25519_priv.strip()}\n", mode=0o600)
-
-    tinc_conf = [
-        f"Name={name}",
-        f"AddressFamily={address_family}",
-        f"Mode={conf_mode}",
-        "DeviceType=tap",
-        f"Interface={dev_name}",
-        f"Port={port}",
-    ]
-    if conf_cipher:
-        tinc_conf.append(f"Cipher={conf_cipher}")
-    if conf_digest:
-        tinc_conf.append(f"Digest={conf_digest}")
-    for peer in sorted(set(connect_to)):
-        tinc_conf.append(f"ConnectTo = {peer}")
-    _write_text(f"/etc/tinc/{netname}/tinc.conf", "\n".join(tinc_conf) + "\n", mode=0o644)
-
-    tinc_up = [
-        "#!/bin/sh",
-        "set -e",
-        "ip link set \"$INTERFACE\" up",
-    ]
-    if ipv4:
-        tinc_up.append(f"ip addr add {ipv4} dev \"$INTERFACE\" || true")
-    _write_text(f"/etc/tinc/{netname}/tinc-up", "\n".join(tinc_up) + "\n", mode=0o755)
-
-    tinc_down = [
-        "#!/bin/sh",
-        "set -e",
-    ]
-    if ipv4:
-        tinc_down.append(f"ip addr del {ipv4} dev \"$INTERFACE\" || true")
-    _write_text(f"/etc/tinc/{netname}/tinc-down", "\n".join(tinc_down) + "\n", mode=0o755)
-
-    tinc_proc = pspawn(["tincd", "-c", f"/etc/tinc/{netname}", "-D", "--pidfile", "/run/tincd.pid"])
-
-# ---------- OpenVPN (new schema: /nodes/<ID>/openvpn/<name>/...) ----------
-
-def parse_openvpn(node: Dict[str, str]) -> Dict[str, Dict[str, str]]:
-    base = f"/nodes/{NODE_ID}/openvpn/"
-    out: Dict[str, Dict[str, str]] = {}
-    for k, v in node.items():
-        if not k.startswith(base):
-            continue
-        rest = k[len(base):]
-        parts = rest.split("/", 1)
-        if len(parts) != 2:
-            continue
-        name, tail = parts
-        out.setdefault(name, {})
-        out[name][tail] = v
-    return out
-
-
-def _ovpn_dev_name(name: str) -> str:
-    # Keep existing convention: name ends with digit => tun<digit>, else tun-<name>
-    return f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
-
+# ---------- OpenVPN (supervisord-managed) ----------
 
 def _ovpn_status_key(name: str) -> str:
     return f"{UPDATE_BASE}/openvpn/{name}/status"
@@ -503,15 +286,65 @@ def _iface_exists(dev: str) -> bool:
         return False
 
 
-def _proc_alive(p: subprocess.Popen) -> bool:
-    return p.poll() is None
+def _supervisorctl(args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["supervisorctl", *args], capture_output=True, text=True)
 
 
-def _compute_openvpn_status(name: str, proc: Optional[subprocess.Popen]) -> str:
-    dev = _ovpn_dev_name(name)
-    if proc is None:
-        return "down"
-    if not _proc_alive(proc):
+def _supervisor_status(name: str) -> str:
+    cp = _supervisorctl(["status", name])
+    if cp.returncode != 0:
+        return ""
+    parts = cp.stdout.strip().split()
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
+def _supervisor_start(name: str) -> None:
+    _supervisorctl(["start", name])
+
+
+def _supervisor_stop(name: str) -> None:
+    _supervisorctl(["stop", name])
+
+
+def _supervisor_restart(name: str) -> None:
+    _supervisorctl(["restart", name])
+
+
+def _supervisor_is_running(name: str) -> bool:
+    return _supervisor_status(name) == "RUNNING"
+
+
+def _easytier_cli_reload() -> bool:
+    if not shutil.which("easytier-cli"):
+        return False
+    cp = subprocess.run(["easytier-cli", "reload"], capture_output=True, text=True)
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        print(f"[easytier] easytier-cli reload failed: {err}", flush=True)
+        return False
+    return True
+
+
+def _tinc_reload(netname: str) -> bool:
+    if not shutil.which("tinc"):
+        return False
+    cp = subprocess.run(
+        ["tinc", "--pidfile=/run/tincd.pid", "reload"],
+        capture_output=True,
+        text=True,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        print(f"[tinc] reload failed: {err}", flush=True)
+        return False
+    return True
+
+
+def _compute_openvpn_status(name: str, dev: str) -> str:
+    state = _supervisor_status(f"openvpn-{name}")
+    if state != "RUNNING":
         return "down"
     if _iface_exists(dev):
         return "up"
@@ -519,61 +352,67 @@ def _compute_openvpn_status(name: str, proc: Optional[subprocess.Popen]) -> str:
 
 
 def _write_openvpn_status(name: str, status: str) -> None:
-    # Best-effort. Value format: "<status> <utc_epoch>"
     try:
-        _etcd_call(lambda: etcd.put(_ovpn_status_key(name), f"{status} {now_utc_epoch()}"))
+        _etcd_call(lambda: etcd.put(_ovpn_status_key(name), f"{status} {now_utc_iso()}"))
     except Exception as e:
         print(f"[openvpn-status] failed to write {name}: {e}", flush=True)
 
 
-def openvpn_start(name: str, cfg: str) -> subprocess.Popen:
-    p = f"/etc/openvpn/generated/{name}.conf"
-    with open(p, "w", encoding="utf-8") as f:
-        f.write(cfg)
-    dev = _ovpn_dev_name(name)
-    # Use --dev, config may also specify dev; we enforce by CLI for predictability
-    return pspawn(["openvpn", "--config", p, "--dev", dev])
+def _openvpn_program_conf(name: str, dev: str) -> str:
+    return "\n".join([
+        f"[program:openvpn-{name}]",
+        f"command=openvpn --config /etc/openvpn/generated/{name}.conf --dev {dev}",
+        "autostart=true",
+        "autorestart=true",
+        f"stdout_logfile=/var/log/openvpn.{name}.out.log",
+        f"stderr_logfile=/var/log/openvpn.{name}.err.log",
+        "stdout_logfile_maxbytes=10MB",
+        "stdout_logfile_backups=5",
+        "stderr_logfile_maxbytes=10MB",
+        "stderr_logfile_backups=5",
+        "",
+    ])
 
 
 def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
-    ovpn = parse_openvpn(node)
+    payload = {"node_id": NODE_ID, "node": node, "global": {}, "all_nodes": {}}
+    out = _run_generator("gen_openvpn", payload)
+    instances = out.get("instances", [])
     enabled: List[str] = []
     changed = False
 
     with _ovpn_lock:
-        # cache names for status loop (only those enabled)
         _ovpn_cfg_names.clear()
 
     active = set()
-    for name, cfg in ovpn.items():
-        if cfg.get("enable") != "true":
-            continue
-        if "config" not in cfg:
-            continue
+    for inst in instances:
+        name = inst["name"]
+        dev = inst["dev"]
+        cfg = inst["config"]
         active.add(name)
         enabled.append(name)
+        if _write_if_changed(f"/etc/openvpn/generated/{name}.conf", cfg):
+            changed = True
+        if _write_if_changed(f"/etc/supervisor/conf.d/openvpn-{name}.conf", _openvpn_program_conf(name, dev)):
+            changed = True
 
     with _ovpn_lock:
         _ovpn_cfg_names.extend(sorted(enabled))
 
-    # start
-    for name in enabled:
-        cfg = ovpn[name]["config"]
-        if name not in openvpn_procs:
-            openvpn_procs[name] = openvpn_start(name, cfg)
-            changed = True
-            _write_openvpn_status(name, "connecting")
-
-    # stop removed/disabled
-    for name in list(openvpn_procs.keys()):
+    for path in glob.glob("/etc/supervisor/conf.d/openvpn-*.conf"):
+        name = os.path.basename(path).split("openvpn-")[-1].split(".conf")[0]
         if name not in active:
             try:
-                openvpn_procs[name].terminate()
+                os.remove(path)
+                changed = True
             except Exception:
                 pass
-            openvpn_procs.pop(name, None)
-            changed = True
-            _write_openvpn_status(name, "down")
+
+    _supervisorctl(["reread"])
+    _supervisorctl(["update"])
+
+    for name in enabled:
+        _write_openvpn_status(name, "connecting")
 
     return changed, sorted(enabled)
 
@@ -584,8 +423,8 @@ def openvpn_status_loop():
         with _ovpn_lock:
             names = list(_ovpn_cfg_names)
         for name in names:
-            proc = openvpn_procs.get(name)
-            status = _compute_openvpn_status(name, proc)
+            dev = f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
+            status = _compute_openvpn_status(name, dev)
             _write_openvpn_status(name, status)
 
 
@@ -614,7 +453,7 @@ def monitor_children_loop():
 
             if mesh_type == "tinc":
                 if node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true":
-                    if tinc_proc is None or not _proc_alive(tinc_proc):
+                    if _supervisor_status("tinc") != "RUNNING":
                         key = "tinc"
                         if should_try(key):
                             try:
@@ -624,215 +463,57 @@ def monitor_children_loop():
                                 on_fail(key)
             else:
                 if node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true":
-                    if easytier_proc is None or not _proc_alive(easytier_proc):
+                    if _supervisor_status("easytier") != "RUNNING":
                         key = "easytier"
                         if should_try(key):
                             try:
-                                easytier_domain = {k: v for k, v in node.items() if "/easytier/" in k}
-                                reload_easytier(easytier_domain, global_cfg)
+                                reload_easytier(node, global_cfg)
                                 on_ok(key)
                             except Exception:
                                 on_fail(key)
 
-            ovpn = parse_openvpn(node)
-            for name, cfg in ovpn.items():
-                if cfg.get("enable") != "true":
-                    continue
-                if "config" not in cfg:
-                    continue
-                proc = openvpn_procs.get(name)
-                if proc is None or not _proc_alive(proc):
-                    key = f"openvpn:{name}"
-                    if should_try(key):
-                        try:
-                            openvpn_procs[name] = openvpn_start(name, cfg["config"])
-                            on_ok(key)
-                        except Exception:
-                            on_fail(key)
+            # OpenVPN instances are managed by supervisord now.
         except Exception:
             continue
 
 
-# ---------- LANs ----------
-
-def node_lans(node: Dict[str, str]) -> List[str]:
-    base = f"/nodes/{NODE_ID}/lan/"
-    base_key = base.rstrip("/")
-    raw = node.get(base_key, "")
-    return sorted(set(_split_ml(raw)))
+def clash_refresh_loop():
+    global tproxy_enabled
+    while True:
+        time.sleep(5)
+        with _clash_refresh_lock:
+            enabled = _clash_refresh_enable
+            interval = _clash_refresh_interval
+            next_ts = _clash_refresh_next
+        if not enabled or interval <= 0:
+            continue
+        if time.time() < next_ts:
+            continue
+        try:
+            node = load_prefix(f"/nodes/{NODE_ID}/")
+            if node.get(f"/nodes/{NODE_ID}/clash/enable") != "true":
+                with _clash_refresh_lock:
+                    _clash_refresh_enable = False
+                continue
+            global_cfg = load_prefix("/global/")
+            payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+            out = _run_generator("gen_clash", payload)
+            reload_clash(out["config_yaml"])
+            if out["mode"] == "tproxy":
+                tproxy_apply(out["tproxy_exclude"])
+                tproxy_enabled = True
+            else:
+                if tproxy_enabled:
+                    tproxy_remove()
+                    tproxy_enabled = False
+        except Exception as e:
+            print(f"[clash-refresh] error: {e}", flush=True)
+        finally:
+            with _clash_refresh_lock:
+                _clash_refresh_next = time.time() + (interval * 60)
 
 
 # ---------- FRR smooth reload ----------
-
-def _parse_prefix_list_rules(multiline: str) -> List[Tuple[str, str]]:
-    """Parse lines like: 'permit 10.0.0.0/8 le 32' or 'deny 0.0.0.0/0'."""
-    rules: List[Tuple[str, str]] = []
-    if not multiline:
-        return rules
-    s = multiline.replace("\r\n", "\n").replace("\r", "\n")
-    for line in s.split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(None, 1)
-        if len(parts) != 2:
-            raise ValueError(f"invalid prefix-list rule line: {line!r}")
-        action, rest = parts[0].lower(), parts[1].strip()
-        if action not in ("permit", "deny"):
-            raise ValueError(f"invalid action in prefix-list rule: {line!r}")
-        rules.append((action, rest))
-    return rules
-
-
-def generate_frr(node: Dict[str, str], global_cfg: Dict[str, str]) -> str:
-    router_id = node.get(f"/nodes/{NODE_ID}/router_id", "")
-    ospf_enable = node.get(f"/nodes/{NODE_ID}/ospf/enable") == "true"
-    bgp_enable = node.get(f"/nodes/{NODE_ID}/bgp/enable") == "true"
-
-    local_as = node.get(f"/nodes/{NODE_ID}/bgp/local_asn", "")
-    max_paths = node.get(f"/nodes/{NODE_ID}/bgp/max_paths", "1")
-    to_ospf_default_only = node.get(f"/nodes/{NODE_ID}/bgp/to_ospf/default_only") == "true"
-    ospf_redistribute_bgp = node.get(f"/nodes/{NODE_ID}/ospf/redistribute_bgp") == "true"
-    inject_site_lan = node.get(f"/nodes/{NODE_ID}/ospf/inject_site_lan") == "true"
-
-    # Global shared BGP filter rules (applied to ALL neighbors)
-    # Keys (multiline, supports \n/\r/\r\n):
-    #   /global/bgp/filter/in
-    #   /global/bgp/filter/out
-    # Line format:
-    #   permit <prefix> [ge N] [le N]
-    #   deny   <prefix> [ge N] [le N]
-    # If missing:
-    #   IN  defaults to: deny 0.0.0.0/0 ; permit 0.0.0.0/0 le 32
-    #   OUT defaults to: permit 0.0.0.0/0 le 32
-    in_rules_ml = global_cfg.get("/global/bgp/filter/in", "")
-    out_rules_ml = global_cfg.get("/global/bgp/filter/out", "")
-
-    in_rules = _parse_prefix_list_rules(in_rules_ml) if in_rules_ml else [
-        ("deny", "0.0.0.0/0"),
-        ("permit", "0.0.0.0/0 le 32"),
-    ]
-    out_rules = _parse_prefix_list_rules(out_rules_ml) if out_rules_ml else [
-        ("permit", "0.0.0.0/0 le 32"),
-    ]
-
-    active_key = f"/nodes/{NODE_ID}/ospf/active_ifaces"
-    if active_key in node:
-        active_ifaces = sorted(set(_split_ml(node.get(active_key, ""))))
-    else:
-        active_ifaces = sorted({
-            k.split("/")[-1]
-            for k in node
-            if k.startswith(f"/nodes/{NODE_ID}/ospf/active_ifaces/")
-        })
-
-    lans = node_lans(node)
-
-    lines: List[str] = [
-        "frr defaults traditional",
-        "service integrated-vtysh-config",
-        f"hostname {NODE_ID}",
-    ]
-    if router_id:
-        lines.append(f"ip router-id {router_id}")
-
-    # Prefix-lists and route-maps
-    lines += ["", "ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0", ""]
-
-    if inject_site_lan and lans:
-        seq = 10
-        for pfx in lans:
-            lines.append(f"ip prefix-list PL-OSPF-LAN seq {seq} permit {pfx}")
-            seq += 10
-        lines.append("")
-        lines.append("route-map RM-OSPF-CONN permit 10")
-        lines.append(" match ip address prefix-list PL-OSPF-LAN")
-        lines.append("!")
-        lines.append("")
-
-    # Shared inbound policy
-    seq = 10
-    for action, rest in in_rules:
-        lines.append(f"ip prefix-list PL-BGP-IN seq {seq} {action} {rest}")
-        seq += 10
-    lines.append("")
-    lines.append("route-map RM-BGP-IN permit 10")
-    lines.append(" match ip address prefix-list PL-BGP-IN")
-    lines.append("!")
-    lines.append("")
-
-    # Shared outbound policy
-    seq = 10
-    for action, rest in out_rules:
-        lines.append(f"ip prefix-list PL-BGP-OUT seq {seq} {action} {rest}")
-        seq += 10
-    lines.append("route-map RM-BGP-OUT permit 10")
-    lines.append(" match ip address prefix-list PL-BGP-OUT")
-    lines.append("!")
-    lines.append("")
-
-    # OSPF/BGP controlled redistribute (tag-based anti-loop)
-    lines += ["route-map RM-BGP-TO-OSPF permit 10"]
-    if to_ospf_default_only:
-        lines.append(" match ip address prefix-list PL-DEFAULT")
-    lines += [f" set tag {TAG_NO_REINJECT}", "!", ""]
-
-    lines += [
-        "route-map RM-OSPF-TO-BGP deny 10",
-        f" match tag {TAG_NO_REINJECT}",
-        "!",
-        "route-map RM-OSPF-TO-BGP permit 20",
-        "!",
-        "",
-    ]
-
-    if ospf_enable:
-        ospf_area = node.get(f"/nodes/{NODE_ID}/ospf/area", "0")
-        for i in active_ifaces:
-            lines.append(f"interface {i}")
-            lines.append(f" ip ospf area {ospf_area}")
-            lines.append(" no ip ospf passive")
-            lines.append("!")
-        lines.append("router ospf")
-        if router_id:
-            lines.append(f" ospf router-id {router_id}")
-        lines.append(" passive-interface default")
-        if inject_site_lan and lans:
-            lines.append(" redistribute connected route-map RM-OSPF-CONN")
-        if ospf_redistribute_bgp and bgp_enable:
-            lines.append(" redistribute bgp route-map RM-BGP-TO-OSPF")
-        lines += ["!", ""]
-
-    if bgp_enable and local_as:
-        lines.append(f"router bgp {local_as}")
-        if router_id:
-            lines.append(f" bgp router-id {router_id}")
-        lines.append(f" maximum-paths {max_paths}")
-
-        for pfx in lans:
-            lines.append(f" network {pfx}")
-        lines.append(" redistribute ospf route-map RM-OSPF-TO-BGP")
-
-        # OpenVPN neighbors for BGP transport
-        ovpn = parse_openvpn(node)
-        for name, cfg in ovpn.items():
-            if cfg.get("enable") != "true":
-                continue
-            peer_ip = cfg.get("bgp/peer_ip", "")
-            peer_asn = cfg.get("bgp/peer_asn", "")
-            update_source = cfg.get("bgp/update_source", "")
-            if peer_ip and peer_asn and update_source:
-                lines.append(f" neighbor {peer_ip} remote-as {peer_asn}")
-                lines.append(f" neighbor {peer_ip} update-source {update_source}")
-                # Per-neighbor policy required by FRR: shared route-maps
-                lines.append(f" neighbor {peer_ip} route-map RM-BGP-IN in")
-                lines.append(f" neighbor {peer_ip} route-map RM-BGP-OUT out")
-
-        lines += ["!", ""]
-
-    return "\n".join(lines).strip() + "\n"
-
-
 def _find_frr_reload() -> Optional[str]:
     for c in ["/usr/lib/frr/frr-reload.py", "/usr/lib/frr/frr-reload", "/usr/sbin/frr-reload.py", "/usr/sbin/frr-reload"]:
         if os.path.exists(c):
@@ -871,61 +552,10 @@ def clash_pid() -> int:
         return int(subprocess.check_output("pidof mihomo", shell=True).decode().split()[0])
 
 
-def reload_clash(conf: Dict[str, Any]) -> None:
+def reload_clash(conf_text: str) -> None:
     with open("/etc/clash/config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(conf, f, sort_keys=False, allow_unicode=True)
+        f.write(conf_text)
     run(f"kill -HUP {clash_pid()}")
-
-
-def generate_clash(node: Dict[str, str], global_cfg: Dict[str, str]) -> Dict[str, Any]:
-    base = yaml.safe_load(open("/clash/base.yaml", encoding="utf-8")) or {}
-    mode = node.get(f"/nodes/{NODE_ID}/clash/mode", "mixed")
-
-    # Subscriptions are global to keep consistent updates across nodes
-    subs: Dict[str, str] = {}
-    for k, v in global_cfg.items():
-        if k.startswith("/global/clash/subscriptions/") and k.endswith("/url"):
-            name = k.split("/global/clash/subscriptions/")[1].split("/url")[0]
-            subs[name] = v
-
-    active = node.get(f"/nodes/{NODE_ID}/clash/active_subscription")
-    if not active:
-        raise RuntimeError("missing /nodes/<NODE_ID>/clash/active_subscription")
-    if active not in subs:
-        raise RuntimeError(f"active_subscription {active!r} not found under /global/clash/subscriptions/")
-
-    resp = requests.get(subs[active], timeout=15)
-    resp.raise_for_status()
-    sub_conf = yaml.safe_load(resp.text) or {}
-
-    merged = dict(base)
-    merged.update(sub_conf)
-
-    if mode == "mixed":
-        merged["mixed-port"] = 7890
-    elif mode == "tproxy":
-        merged["tproxy-port"] = TPROXY_PORT
-        merged["tun"] = {
-            "enable": True,
-            "stack": "system",
-            "auto-route": True,
-            "auto-detect-interface": True,
-        }
-    else:
-        raise RuntimeError(f"unsupported clash mode: {mode}")
-
-    return merged
-
-
-def node_lans_for_exclude(node: Dict[str, str]) -> List[str]:
-    cidrs = [
-        "127.0.0.0/8", "0.0.0.0/8", "10.0.0.0/8",
-        "172.16.0.0/12", "192.168.0.0/16",
-        "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
-        "10.42.1.0/24",
-    ]
-    cidrs.extend(node_lans(node))
-    return sorted(set(cidrs))
 
 
 def tproxy_apply(exclude: List[str]) -> None:
@@ -940,10 +570,65 @@ def tproxy_remove() -> None:
     run(f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 /usr/local/bin/tproxy.sh remove")
 
 
+# ---------- MosDNS ----------
+def _write_resolv_conf(nameservers: List[str]) -> None:
+    lines = [f"nameserver {ip}" for ip in nameservers if ip]
+    if not lines:
+        return
+    _write_text("/etc/resolv.conf", "\n".join(lines) + "\n", mode=0o644)
+
+
+def _write_mosdns_rules_json(rules: Dict[str, str]) -> Optional[str]:
+    if not rules:
+        return None
+    path = "/etc/mosdns/rule_files.json"
+    _write_text(path, json.dumps(rules, ensure_ascii=True, indent=2) + "\n", mode=0o644)
+    return path
+
+
+def _mosdns_rules_stamp_path() -> str:
+    return "/etc/mosdns/.rules_updated"
+
+
+def _should_refresh_rules(refresh_minutes: int) -> bool:
+    path = _mosdns_rules_stamp_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except FileNotFoundError:
+        return True
+    age = time.time() - mtime
+    return age >= (refresh_minutes * 60)
+
+
+def _touch_rules_stamp() -> None:
+    path = _mosdns_rules_stamp_path()
+    _write_text(path, now_utc_iso() + "\n", mode=0o644)
+
+
+def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
+    payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+    out = _run_generator("gen_mosdns", payload)
+    with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
+        f.write(out["config_text"])
+
+    refresh_minutes = out["refresh_minutes"]
+    if _should_refresh_rules(refresh_minutes):
+        rules_json = _write_mosdns_rules_json(out.get("rules", {}))
+        env = f"MOSDNS_RULES_DIR=/etc/mosdns MOSDNS_SOCKS_PORT={MOSDNS_SOCKS_PORT} MOSDNS_HTTP_PROXY=http://127.0.0.1:{CLASH_HTTP_PORT}"
+        if rules_json:
+            env += f" MOSDNS_RULES_JSON={rules_json}"
+        run(f"{env} /mosdns/update-rules.sh")
+        _touch_rules_stamp()
+
+    _supervisor_restart("mosdns")
+    _write_resolv_conf(["127.0.0.1"])
+
+
 # ---------- reconcile ----------
 
 def handle_commit() -> None:
     global reconcile_force, tproxy_enabled
+    global _clash_refresh_enable, _clash_refresh_interval, _clash_refresh_next
 
     node = load_prefix(f"/nodes/{NODE_ID}/")
     global_cfg = load_prefix("/global/")
@@ -965,20 +650,19 @@ def handle_commit() -> None:
         tinc_domain = {k: v for k, v in all_nodes.items() if "/tinc/" in k}
         global_tinc = {k: v for k, v in global_cfg.items() if k == "/global/mesh_type" or k.startswith("/global/tinc/")}
         if changed("tinc", {"nodes": tinc_domain, "global": global_tinc}):
-            run("pkill easytier-core || true; pkill easytier || true")
             if node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true":
                 reload_tinc(node, all_nodes, global_cfg)
             else:
-                run("pkill tincd || true")
+                _supervisor_stop("tinc")
             did_apply = True
     else:
         easytier_domain = {k: v for k, v in node.items() if "/easytier/" in k}
-        if changed("easytier", easytier_domain):
-            run("pkill tincd || true")
+        global_easy = {k: v for k, v in global_cfg.items() if k.startswith("/global/easytier/")}
+        if changed("easytier", {"node": easytier_domain, "global": global_easy}):
             if node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true":
-                reload_easytier(easytier_domain, global_cfg)
+                reload_easytier(node, global_cfg)
             else:
-                run("pkill easytier-core || true; pkill easytier || true")
+                _supervisor_stop("easytier")
             did_apply = True
 
     openvpn_domain = {k: v for k, v in node.items() if "/openvpn/" in k}
@@ -994,27 +678,51 @@ def handle_commit() -> None:
     )}
     global_bgp_filter = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/filter/")}
     if changed("frr", {"node": frr_material, "global_bgp_filter": global_bgp_filter}):
-        reload_frr_smooth(generate_frr(node, global_cfg))
+        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+        out = _run_generator("gen_frr", payload)
+        reload_frr_smooth(out["frr_conf"])
         did_apply = True
 
     clash_domain = {k: v for k, v in node.items() if "/clash/" in k}
-    if changed("clash", clash_domain):
+    global_clash = {k: v for k, v in global_cfg.items() if k.startswith("/global/clash/")}
+    if changed("clash", {"node": clash_domain, "global": global_clash}):
         if node.get(f"/nodes/{NODE_ID}/clash/enable") != "true":
             try:
                 tproxy_remove()
             except Exception:
                 pass
             tproxy_enabled = False
+            with _clash_refresh_lock:
+                _clash_refresh_enable = False
         else:
-            reload_clash(generate_clash(node, global_cfg))
-            mode = node.get(f"/nodes/{NODE_ID}/clash/mode", "mixed")
+            payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+            out = _run_generator("gen_clash", payload)
+            reload_clash(out["config_yaml"])
+            mode = out["mode"]
             if mode == "tproxy":
-                tproxy_apply(node_lans_for_exclude(node))
+                tproxy_apply(out["tproxy_exclude"])
                 tproxy_enabled = True
             else:
                 if tproxy_enabled:
                     tproxy_remove()
                     tproxy_enabled = False
+            with _clash_refresh_lock:
+                _clash_refresh_enable = out["refresh_enable"]
+                _clash_refresh_interval = max(0, int(out["refresh_interval_minutes"]))
+                _clash_refresh_next = time.time() + (_clash_refresh_interval * 60)
+        did_apply = True
+
+    mosdns_enabled = node.get(f"/nodes/{NODE_ID}/mosdns/enable") == "true"
+    mosdns_material = {
+        "enabled": mosdns_enabled,
+        "refresh": node.get(f"/nodes/{NODE_ID}/mosdns/refresh", ""),
+        "global": {k: v for k, v in global_cfg.items() if k.startswith("/global/mosdns/")},
+    }
+    if changed("mosdns", mosdns_material):
+        if mosdns_enabled:
+            reload_mosdns(node, global_cfg)
+        else:
+            _supervisor_stop("mosdns")
         did_apply = True
 
     reconcile_force = False
@@ -1059,6 +767,7 @@ def main() -> None:
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
     threading.Thread(target=monitor_children_loop, daemon=True).start()
+    threading.Thread(target=clash_refresh_loop, daemon=True).start()
 
     publish_update("startup")
     watch_loop()

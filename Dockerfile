@@ -3,10 +3,11 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Versions can be overridden at build time:
-#   docker build --build-arg EASYTIER_VERSION=2.4.5 --build-arg MIHOMO_VERSION=1.19.17 --build-arg TINC_VERSION=1.1pre18 .
+#   docker build --build-arg EASYTIER_VERSION=2.4.5 --build-arg MIHOMO_VERSION=1.19.17 --build-arg TINC_VERSION=1.1pre18 --build-arg MOSDNS_VERSION=5.3.3 .
 ARG EASYTIER_VERSION=2.4.5
 ARG MIHOMO_VERSION=1.19.17
 ARG TINC_VERSION=1.1pre18
+ARG MOSDNS_VERSION=5.3.3
 
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -24,9 +25,11 @@ RUN apt-get update && apt-get install -y \
     frr frr-pythontools \
     openvpn \
     iproute2 iptables \
+    iputils-ping dnsutils \
     procps \
     curl jq git python3 python3-pip \
     ca-certificates \
+    supervisor \
     unzip gzip \
     build-essential autoconf automake libtool pkg-config meson ninja-build \
     libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
@@ -85,17 +88,41 @@ RUN set -eux; \
     cd /; \
     rm -rf /tmp/tinc
 
+# --- MosDNS ---
+# Release asset name: mosdns-linux-amd64-v<VERSION>.zip
+RUN set -eux; \
+    PROXY="http://10.42.1.2:7890"; \
+    CURL_PROXY=""; \
+    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
+      CURL_PROXY="--proxy ${PROXY}"; \
+    fi; \
+    ASSET="mosdns-linux-amd64-v${MOSDNS_VERSION}.zip"; \
+    URL="https://github.com/IrineSistiana/mosdns/releases/download/v${MOSDNS_VERSION}/${ASSET}"; \
+    curl -fL ${CURL_PROXY} "$URL" -o /tmp/mosdns.zip; \
+    unzip -q /tmp/mosdns.zip -d /tmp/mosdns; \
+    install -m 0755 /tmp/mosdns/mosdns /usr/local/bin/mosdns; \
+    rm -rf /tmp/mosdns /tmp/mosdns.zip
+
 RUN pip3 install --no-cache-dir --break-system-packages \
     "protobuf<=3.20.3" \
     etcd3 pyyaml requests
 
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
+COPY generators/ /generators/
+COPY mosdns/ /mosdns/
+COPY supervisord.conf /etc/supervisor/supervisord.conf
+COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
+COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
+COPY scripts/run-tinc.sh /usr/local/bin/run-tinc.sh
+COPY scripts/run-mosdns.sh /usr/local/bin/run-mosdns.sh
 
 COPY frr/ /etc/frr/
 COPY clash/ /clash/
 COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
-RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh /mosdns/update-rules.sh \
+    /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-easytier.sh \
+    /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

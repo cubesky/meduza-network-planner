@@ -1,0 +1,234 @@
+log:
+  level: info
+
+api:
+  http: :13688
+
+plugins:
+  - tag: cache
+    type: cache
+    args:
+      size: 4194304
+      lazy_cache_ttl: 86400
+      dump_file: cache.dat
+      dump_interval: 600
+
+  - tag: hosts
+    type: hosts
+    args:
+      files:
+        - /etc/mosdns/hosts.txt
+
+  - tag: upstream@cn
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: 114.114.114.114
+          tag: 114DNS (1)
+        - addr: 114.114.115.115
+          tag: 114DNS (2)
+        - addr: 119.29.29.29
+          tag: Tencent (1)
+        - addr: 119.28.28.28
+          tag: Tencent (2)
+        - addr: 180.76.76.76
+          tag: Baidu
+        - addr: 180.184.1.1
+          tag: ByteDance (1)
+        - addr: 180.184.2.2
+          tag: ByteDance (2)
+        - addr: 223.5.5.5
+          tag: Alibaba (1)
+        - addr: 223.6.6.6
+          tag: Alibaba (2)
+
+  - tag: upstream@!cn
+    type: forward
+    args:
+      concurrent: 3
+      upstreams:
+        - tag: AdGuard (DoT)
+          addr: tls://dns.adguard-dns.com
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: AdGuard (DoH)
+          addr: https://dns.adguard-dns.com/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Cloudflare
+          addr: https://cloudflare-dns.com/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Cloudflare (DoT)
+          addr: tls://one.one.one.one
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Google (DoH)
+          addr: https://dns.google/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Google (DoT)
+          addr: tls://dns.google
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: NextDNS (DoH)
+          addr: https://dns.nextdns.io
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: NextDNS (DoT)
+          addr: tls://dns.nextdns.io
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: OpenDNS
+          addr: https://doh.opendns.com/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Quad9 (DoT)
+          addr: tls://dns.quad9.net
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Quad9 (DoH)
+          addr: https://dns.quad9.net/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: DNS.SB
+          addr: https://doh.dns.sb/dns-query
+          socks5: "127.0.0.1:{{SOCKS_PORT}}"
+        - tag: Apple (DoH)
+          addr: https://doh.dns.apple.com/dns-query
+
+  - tag: resolve@alibaba
+    type: sequence
+    args:
+      - exec: forward 223.5.5.5 223.6.6.6
+      - exec: ttl 300-7200
+
+  - tag: resolve@baidu
+    type: sequence
+    args:
+      - exec: forward 180.76.76.76
+      - exec: ttl 300-7200
+
+  - tag: resolve@bytedance
+    type: sequence
+    args:
+      - exec: forward 180.184.1.1 180.184.2.2
+      - exec: ttl 300-7200
+
+  - tag: resolve@tencent
+    type: sequence
+    args:
+      - exec: forward 119.29.29.29 119.28.28.28
+      - exec: ttl 300-7200
+
+  - tag: resolve@cn
+    type: sequence
+    args:
+      - exec: query_summary cn
+      - exec: $upstream@cn
+      - exec: ttl 300-7200
+
+  - tag: resolve@!cn
+    type: sequence
+    args:
+      - exec: query_summary !cn
+      - exec: $upstream@!cn
+      - exec: ttl 300-7200
+
+  - tag: resolve@ddns
+    type: sequence
+    args:
+      - exec: $upstream@cn
+
+  - tag: try-resolve@!cn
+    type: fallback
+    args:
+      primary: resolve@!cn
+      secondary: resolve@cn
+      threshold: 1000
+
+  - tag: default
+    type: sequence
+    args:
+      # Hosts match
+      - exec: $hosts
+      - matches: has_resp
+        exec: accept
+
+      # Non-gTLD reject (.lan / .local / .arpa)
+      - matches: "!qname &/etc/mosdns/tld/tlds-alpha-by-domain.txt"
+        exec: reject
+
+      # Reject private
+      - matches: qname &/etc/mosdns/geosite/private.txt
+        exec: reject
+
+      # Force CN resolver
+      - matches: qname &/etc/mosdns/local.txt
+        exec: goto resolve@cn
+
+      # Block HTTP DNS
+      - matches: qname &/etc/mosdns/geosite/category-httpdns-cn.txt
+        exec: reject 3
+
+      # Ads
+      - matches: qname &/etc/mosdns/ad/hagezi.light.txt
+        exec: reject 3
+      - matches: qname &/etc/mosdns/ad/oisd.big.txt
+        exec: reject 3
+      - matches: qname &/etc/mosdns/geosite/category-ads.txt
+        exec: reject 3
+      - matches: qname &/etc/mosdns/geosite/qihoo360.txt
+        exec: reject
+
+      # Block list
+      - matches: qname &/etc/mosdns/block.txt
+        exec: reject 3
+
+      # Prefer IPv4
+      - exec: prefer_ipv4
+
+      # Cache
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+
+      # TTL by DDNS
+      - matches: qname &/etc/mosdns/ddns.txt
+        exec: goto resolve@ddns
+
+      # Vendor DNS
+      - matches: qname &/etc/mosdns/geosite/alibaba.txt
+        exec: goto resolve@alibaba
+      - matches: qname &/etc/mosdns/geosite/baidu.txt
+        exec: goto resolve@baidu
+      - matches: qname &/etc/mosdns/geosite/bytedance.txt
+        exec: goto resolve@bytedance
+      - matches: qname &/etc/mosdns/geosite/tencent.txt
+        exec: goto resolve@tencent
+
+      # CN domains
+      - matches: qname &/etc/mosdns/geosite/apple@cn.txt
+        exec: goto resolve@cn
+      - matches: qname &/etc/mosdns/geosite/cloudflare-cn.txt
+        exec: goto resolve@cn
+      - matches: qname &/etc/mosdns/geosite/microsoft@cn.txt
+        exec: goto resolve@cn
+      - matches: qname &/etc/mosdns/geosite/steam@cn.txt
+        exec: goto resolve@cn
+      - matches: qname &/etc/mosdns/geosite/cn.txt
+        exec: goto resolve@cn
+      - matches: qname &/etc/mosdns/geosite/geolocation-cn.txt
+        exec: goto resolve@cn
+
+      # Non-CN domains
+      - matches: qname &/etc/mosdns/geosite/geolocation-!cn.txt
+        exec: goto resolve@!cn
+
+      # Non A/AAAA to CN
+      - matches: qtype 1 28
+        exec: goto resolve@cn
+
+      # CN first, accept if CN IP
+      - exec: jump resolve@cn
+      - matches: "resp_ip &/etc/mosdns/geoip/cn.txt"
+        exec: accept
+
+      # Fallback
+      - exec: $try-resolve@!cn
+
+  - tag: server
+    type: udp_server
+    args:
+      entry: default
+      listen: :53

@@ -48,7 +48,7 @@ Schema (per instance):
 Status reporting:
 
 ```
-/updated/<NODE_ID>/openvpn/<NAME>/status = "<state> <utc_epoch>"
+/updated/<NODE_ID>/openvpn/<NAME>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
 ```
 
 States: `up` | `connecting` | `down`

@@ -6,6 +6,7 @@ Single-container **edge gateway** controlled by **etcd** (single source of truth
 - FRR (OSPF + BGP)
 - OpenVPN (BGP transport only)
 - Clash Meta (mihomo) (mixed / tproxy fallback)
+- MosDNS (local DNS)
 
 ## Quick start
 
@@ -53,10 +54,22 @@ ENV:
 
 When OpenVPN is enabled, the gateway writes:
 
-- `/updated/<NODE_ID>/openvpn/<name>/status` = `"<state> <utc_epoch>"`
+- `/updated/<NODE_ID>/openvpn/<name>/status` = `"<state> <YYYY-MM-DDTHH:mm:ss+0000>"`
 
 ENV:
 - `OPENVPN_STATUS_INTERVAL` (default `10`)
+
+## MosDNS
+
+MosDNS is optional and controlled per node.
+
+- Enable: `/nodes/<NODE_ID>/mosdns/enable` = `true`
+- Refresh (minutes): `/nodes/<NODE_ID>/mosdns/refresh` (default `1440`)
+- Rules: `/global/mosdns/rule_files` (JSON map of file -> URL)
+- Plugins: `/global/mosdns/plugins` (YAML list)
+- SOCKS port: fixed `7891`
+
+Details in `docs/mosdns.md`.
 
 ## Build notes (EasyTier / Tinc / mihomo assets)
 
@@ -83,7 +96,7 @@ This deployment uses **only** single keys with newline-separated values:
 
 ## OpenVPN status reporting
 
-- `/updated/<NODE_ID>/openvpn/<NAME>/status` = `"<state> <utc_epoch>"`
+- `/updated/<NODE_ID>/openvpn/<NAME>/status` = `"<state> <YYYY-MM-DDTHH:mm:ss+0000>"`
 - Node config prefix: `/nodes/<NODE_ID>/openvpn/<NAME>/...`
 
 
