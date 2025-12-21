@@ -7,6 +7,13 @@ mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc
 mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns
 mkdir -p /etc/supervisor/conf.d
 
+# Ensure stable DNS before services start.
+cat >/etc/resolv.conf <<'EOF'
+nameserver 88.88.88.88
+nameserver 223.5.5.5
+nameserver 223.6.6.6
+EOF
+
 chown -R frr:frr /etc/frr
 chmod 640 /etc/frr/* || true
 

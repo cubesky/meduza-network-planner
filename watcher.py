@@ -572,13 +572,6 @@ def tproxy_remove() -> None:
 
 
 # ---------- MosDNS ----------
-def _write_resolv_conf(nameservers: List[str]) -> None:
-    lines = [f"nameserver {ip}" for ip in nameservers if ip]
-    if not lines:
-        return
-    _write_text("/etc/resolv.conf", "\n".join(lines) + "\n", mode=0o644)
-
-
 def _write_mosdns_rules_json(rules: Dict[str, str]) -> Optional[str]:
     if not rules:
         return None
@@ -640,7 +633,6 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
         _touch_rules_stamp()
 
     _supervisor_restart("mosdns")
-    _write_resolv_conf(["127.0.0.1"])
 
 
 # ---------- reconcile ----------

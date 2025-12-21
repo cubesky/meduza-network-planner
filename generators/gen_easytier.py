@@ -43,6 +43,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
 
     config["flags"]["dev_name"] = ng("dev_name", "et0")
     config["flags"]["multi_thread"] = True
+    config["flags"]["manual_routes"] = True
 
     if gg("private_mode", "false") == "true":
         config["flags"]["private_mode"] = True
