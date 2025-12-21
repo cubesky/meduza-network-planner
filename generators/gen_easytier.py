@@ -3,6 +3,17 @@ from typing import Any, Dict, List
 from common import read_input, write_output, split_ml
 
 
+def _normalize_listener(val: str) -> str:
+    v = val.strip()
+    if "://" in v:
+        return v
+    if v.startswith("tcp:") or v.startswith("udp:") or v.startswith("wg:"):
+        scheme, rest = v.split(":", 1)
+        rest = rest.strip("/")
+        return f"{scheme}://0.0.0.0:{rest}"
+    return v
+
+
 def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
