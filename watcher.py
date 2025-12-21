@@ -158,16 +158,17 @@ def publish_update(reason: str) -> None:
     try:
         ts = now_utc_iso()
         _etcd_call(lambda: etcd.put(UPDATE_LAST_KEY, ts))
-        lease = ensure_online_lease()
-        try:
-            _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
-        except grpc.RpcError as e:
-            if e.code() == StatusCode.NOT_FOUND:
-                with _lease_lock:
-                    _online_lease = None
+        for _ in range(2):
+            try:
                 lease = ensure_online_lease()
                 _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
-            else:
+                break
+            except grpc.RpcError as e:
+                if e.code() in (StatusCode.NOT_FOUND, StatusCode.UNAUTHENTICATED):
+                    with _lease_lock:
+                        _online_lease = None
+                    _reset_etcd()
+                    continue
                 raise
         print(f"[updated] {reason} last={ts} ttl={UPDATE_TTL_SECONDS}s", flush=True)
     except Exception as e:
@@ -657,6 +658,7 @@ def handle_commit() -> None:
 
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
     if mesh_type == "tinc":
+        _supervisor_stop("easytier")
         all_nodes = load_all_nodes()
         tinc_domain = {k: v for k, v in all_nodes.items() if "/tinc/" in k}
         global_tinc = {k: v for k, v in global_cfg.items() if k == "/global/mesh_type" or k.startswith("/global/tinc/")}
@@ -667,6 +669,7 @@ def handle_commit() -> None:
                 _supervisor_stop("tinc")
             did_apply = True
     else:
+        _supervisor_stop("tinc")
         easytier_domain = {k: v for k, v in node.items() if "/easytier/" in k}
         global_easy = {k: v for k, v in global_cfg.items() if k.startswith("/global/easytier/")}
         if changed("easytier", {"node": easytier_domain, "global": global_easy}):
