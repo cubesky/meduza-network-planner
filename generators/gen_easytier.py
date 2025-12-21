@@ -47,7 +47,6 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     config["proxy_forward_by_system"] = True
 
     args = [
-        "easytier-core",
         "--config-file", "/etc/easytier/config.yaml",
     ]
 
