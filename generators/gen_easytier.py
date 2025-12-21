@@ -90,7 +90,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     if listeners:
         config["listeners"] = listeners
     if peers:
-        config["peers"] = peers
+        config["peer"] = peers
     if mapped_listeners:
         config["mapped_listeners"] = mapped_listeners
 
