@@ -107,7 +107,7 @@ RUN set -eux; \
 
 RUN pip3 install --no-cache-dir --break-system-packages \
     "protobuf<=3.20.3" \
-    etcd3 pyyaml requests
+    etcd3 pyyaml requests toml
 
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py

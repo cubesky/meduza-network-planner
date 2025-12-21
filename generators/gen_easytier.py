@@ -1,4 +1,6 @@
-from typing import Any, Dict, List
+from typing import Any, Dict
+
+import toml
 
 from common import read_input, write_output, split_ml
 
@@ -12,57 +14,6 @@ def _normalize_listener(val: str) -> str:
         rest = rest.strip("/")
         return f"{scheme}://0.0.0.0:{rest}"
     return v
-
-
-def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _toml_kv(key: str, value: Any) -> str:
-    if isinstance(value, bool):
-        return f"{key} = {'true' if value else 'false'}"
-    if isinstance(value, list):
-        items = ", ".join(f"\"{_toml_escape(v)}\"" for v in value)
-        return f"{key} = [{items}]"
-    return f"{key} = \"{_toml_escape(str(value))}\""
-
-
-def _dump_toml(config: Dict[str, Any]) -> str:
-    root_order = [
-        "instance_name",
-        "ipv4",
-        "dhcp",
-        "listeners",
-        "peer",
-        "mapped_listeners",
-        "rpc_portal",
-    ]
-    lines: List[str] = []
-    for key in root_order:
-        if key not in config:
-            continue
-        val = config[key]
-        if isinstance(val, list) and not val:
-            continue
-        if val == "":
-            continue
-        lines.append(_toml_kv(key, val))
-
-    def dump_section(name: str, section: Dict[str, Any]) -> None:
-        keys = [k for k in section.keys() if section.get(k) not in ("", [], None)]
-        if not keys:
-            return
-        lines.append("")
-        lines.append(f"[{name}]")
-        for key in keys:
-            lines.append(_toml_kv(key, section[key]))
-
-    if "network_identity" in config:
-        dump_section("network_identity", config["network_identity"])
-    if "flags" in config:
-        dump_section("flags", config["flags"])
-
-    return "\n".join(lines).strip() + "\n"
 
 
 def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str]) -> Dict[str, Any]:
@@ -104,7 +55,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     if listeners:
         config["listeners"] = [_normalize_listener(x) for x in listeners]
     if peers:
-        config["peer"] = peers
+        config["peer"] = [{"uri": v} for v in peers]
     if mapped_listeners:
         config["mapped_listeners"] = mapped_listeners
     config["rpc_portal"] = "0.0.0.0:0"
@@ -117,7 +68,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     ]
 
     return {
-        "config_text": _dump_toml(config),
+        "config_text": toml.dumps(config),
         "args": args,
     }
 
