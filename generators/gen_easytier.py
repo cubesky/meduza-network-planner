@@ -43,11 +43,12 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     if mapped_listeners:
         config["mapped_listeners"] = mapped_listeners
 
+    config["enable_exit_node"] = True
+    config["proxy_forward_by_system"] = True
+
     args = [
         "easytier-core",
-        "--config", "/etc/easytier/config.yaml",
-        "--enable-exit-node",
-        "--proxy-forward-by-system",
+        "--config-file", "/etc/easytier/config.yaml",
     ]
 
     return {

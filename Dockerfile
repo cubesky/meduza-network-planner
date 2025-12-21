@@ -114,6 +114,7 @@ COPY watcher.py /watcher.py
 COPY generators/ /generators/
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
+COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
 COPY scripts/run-tinc.sh /usr/local/bin/run-tinc.sh
 COPY scripts/run-mosdns.sh /usr/local/bin/run-mosdns.sh
@@ -123,7 +124,7 @@ COPY clash/ /clash/
 COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
-    /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-easytier.sh \
+    /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-easytier.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
