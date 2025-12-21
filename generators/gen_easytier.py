@@ -17,21 +17,14 @@ def _toml_kv(key: str, value: Any) -> str:
 
 
 def _dump_toml(config: Dict[str, Any]) -> str:
-    order = [
-        "network_name",
-        "network_secret",
-        "dev_name",
-        "private_mode",
+    root_order = [
         "ipv4",
         "listeners",
         "peers",
         "mapped_listeners",
-        "dhcp",
-        "enable_exit_node",
-        "proxy_forward_by_system",
     ]
     lines: List[str] = []
-    for key in order:
+    for key in root_order:
         if key not in config:
             continue
         val = config[key]
@@ -40,7 +33,22 @@ def _dump_toml(config: Dict[str, Any]) -> str:
         if val == "":
             continue
         lines.append(_toml_kv(key, val))
-    return "\n".join(lines) + "\n"
+
+    def dump_section(name: str, section: Dict[str, Any]) -> None:
+        keys = [k for k in section.keys() if section.get(k) not in ("", [], None)]
+        if not keys:
+            return
+        lines.append("")
+        lines.append(f"[{name}]")
+        for key in keys:
+            lines.append(_toml_kv(key, section[key]))
+
+    if "network_identity" in config:
+        dump_section("network_identity", config["network_identity"])
+    if "flags" in config:
+        dump_section("flags", config["flags"])
+
+    return "\n".join(lines).strip() + "\n"
 
 
 def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str]) -> Dict[str, Any]:
@@ -60,20 +68,25 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     mapped_listeners = split_ml(ng("mapped_listeners", ""))
 
     config: Dict[str, Any] = {
-        "network_name": network_name,
-        "network_secret": network_secret,
-        "dev_name": ng("dev_name", "et0"),
+        "network_identity": {
+            "network_name": network_name,
+            "network_secret": network_secret,
+        },
+        "flags": {},
     }
 
+    config["flags"]["dev_name"] = ng("dev_name", "et0")
+    config["flags"]["multi_thread"] = True
+
     if gg("private_mode", "false") == "true":
-        config["private_mode"] = True
+        config["flags"]["private_mode"] = True
 
     ipv4 = ng("ipv4", "")
     if ipv4:
         config["ipv4"] = ipv4
 
     if gg("dhcp", "false") == "true":
-        config["dhcp"] = True
+        config["flags"]["dhcp"] = True
     if listeners:
         config["listeners"] = listeners
     if peers:
@@ -81,8 +94,8 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     if mapped_listeners:
         config["mapped_listeners"] = mapped_listeners
 
-    config["enable_exit_node"] = True
-    config["proxy_forward_by_system"] = True
+    config["flags"]["enable_exit_node"] = True
+    config["flags"]["proxy_forward_by_system"] = True
 
     args = [
         "--config-file", "/etc/easytier/config.yaml",
