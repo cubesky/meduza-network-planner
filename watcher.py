@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import etcd3
+import requests
 import grpc
 from grpc import StatusCode
 from urllib.parse import urlparse
@@ -600,6 +601,28 @@ def _should_refresh_rules(refresh_minutes: int) -> bool:
     return age >= (refresh_minutes * 60)
 
 
+def _safe_rule_path(rel: str) -> str:
+    rel = rel.lstrip("/").replace("\\", "/")
+    if ".." in rel.split("/"):
+        raise ValueError(f"invalid rule file path: {rel}")
+    return rel
+
+
+def _download_rules(rules: Dict[str, str]) -> None:
+    if not rules:
+        return
+    proxy = os.environ.get("MOSDNS_HTTP_PROXY", f"http://127.0.0.1:{CLASH_HTTP_PORT}")
+    proxies = {"http": proxy, "https": proxy}
+    base_dir = "/etc/mosdns"
+    for rel, url in rules.items():
+        safe_rel = _safe_rule_path(rel)
+        out_path = os.path.join(base_dir, safe_rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        resp = requests.get(url, timeout=30, proxies=proxies)
+        resp.raise_for_status()
+        _write_text(out_path, resp.text, mode=0o644)
+
+
 def _touch_rules_stamp() -> None:
     path = _mosdns_rules_stamp_path()
     _write_text(path, now_utc_iso() + "\n", mode=0o644)
@@ -613,11 +636,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
-        rules_json = _write_mosdns_rules_json(out.get("rules", {}))
-        env = f"MOSDNS_RULES_DIR=/etc/mosdns MOSDNS_SOCKS_PORT={MOSDNS_SOCKS_PORT} MOSDNS_HTTP_PROXY=http://127.0.0.1:{CLASH_HTTP_PORT}"
-        if rules_json:
-            env += f" MOSDNS_RULES_JSON={rules_json}"
-        run(f"{env} /mosdns/update-rules.sh")
+        _download_rules(out.get("rules", {}))
         _touch_rules_stamp()
 
     _supervisor_restart("mosdns")

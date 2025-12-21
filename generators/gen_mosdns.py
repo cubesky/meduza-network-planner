@@ -38,7 +38,7 @@ def _build_config_text(global_cfg: Dict[str, str]) -> str:
     plugins_raw = global_cfg.get("/global/mosdns/plugins", "")
     plugins = _parse_plugins(plugins_raw)
     if not plugins:
-        base = open("/mosdns/config.yaml", encoding="utf-8").read()
+        base = open("/usr/local/share/mosdns/config.yaml", encoding="utf-8").read()
         return base.replace("{{SOCKS_PORT}}", str(SOCKS_PORT))
     conf = {
         "log": {"level": "info"},

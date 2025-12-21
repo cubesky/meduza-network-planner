@@ -89,18 +89,20 @@ RUN set -eux; \
     rm -rf /tmp/tinc
 
 # --- MosDNS ---
-# Release asset name: mosdns-linux-amd64-v<VERSION>.zip
+# Release asset name: mosdns-linux-amd64.zip (no nested folder)
 RUN set -eux; \
     PROXY="http://10.42.1.2:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
-    ASSET="mosdns-linux-amd64-v${MOSDNS_VERSION}.zip"; \
+    ASSET="mosdns-linux-amd64.zip"; \
     URL="https://github.com/IrineSistiana/mosdns/releases/download/v${MOSDNS_VERSION}/${ASSET}"; \
     curl -fL ${CURL_PROXY} "$URL" -o /tmp/mosdns.zip; \
     unzip -q /tmp/mosdns.zip -d /tmp/mosdns; \
     install -m 0755 /tmp/mosdns/mosdns /usr/local/bin/mosdns; \
+    install -d /usr/local/share/mosdns; \
+    install -m 0644 /tmp/mosdns/config.yaml /usr/local/share/mosdns/config.yaml; \
     rm -rf /tmp/mosdns /tmp/mosdns.zip
 
 RUN pip3 install --no-cache-dir --break-system-packages \
@@ -110,7 +112,6 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
 COPY generators/ /generators/
-COPY mosdns/ /mosdns/
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
@@ -121,7 +122,7 @@ COPY frr/ /etc/frr/
 COPY clash/ /clash/
 COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
-RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh /mosdns/update-rules.sh \
+RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-easytier.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh
 
