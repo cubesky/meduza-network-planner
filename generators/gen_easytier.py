@@ -1,8 +1,46 @@
 from typing import Any, Dict, List
 
-import yaml
-
 from common import read_input, write_output, split_ml
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _toml_kv(key: str, value: Any) -> str:
+    if isinstance(value, bool):
+        return f"{key} = {'true' if value else 'false'}"
+    if isinstance(value, list):
+        items = ", ".join(f"\"{_toml_escape(v)}\"" for v in value)
+        return f"{key} = [{items}]"
+    return f"{key} = \"{_toml_escape(str(value))}\""
+
+
+def _dump_toml(config: Dict[str, Any]) -> str:
+    order = [
+        "network_name",
+        "network_secret",
+        "dev_name",
+        "private_mode",
+        "ipv4",
+        "listeners",
+        "peers",
+        "mapped_listeners",
+        "dhcp",
+        "enable_exit_node",
+        "proxy_forward_by_system",
+    ]
+    lines: List[str] = []
+    for key in order:
+        if key not in config:
+            continue
+        val = config[key]
+        if isinstance(val, list) and not val:
+            continue
+        if val == "":
+            continue
+        lines.append(_toml_kv(key, val))
+    return "\n".join(lines) + "\n"
 
 
 def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str]) -> Dict[str, Any]:
@@ -51,7 +89,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     ]
 
     return {
-        "config_yaml": yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+        "config_text": _dump_toml(config),
         "args": args,
     }
 

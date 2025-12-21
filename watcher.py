@@ -213,7 +213,7 @@ def reload_easytier(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
     out = _run_generator("gen_easytier", payload)
     os.makedirs("/etc/easytier", exist_ok=True)
-    _write_if_changed("/etc/easytier/config.yaml", out["config_yaml"], mode=0o644)
+    _write_if_changed("/etc/easytier/config.yaml", out["config_text"], mode=0o644)
     _write_if_changed("/run/easytier/args", "\n".join(out["args"]) + "\n", mode=0o644)
     if _supervisor_is_running("easytier"):
         if not _easytier_cli_reload():
