@@ -9,7 +9,6 @@ mkdir -p /etc/supervisor/conf.d
 
 # Ensure stable DNS before services start.
 cat >/etc/resolv.conf <<'EOF'
-nameserver 88.88.88.88
 nameserver 223.5.5.5
 nameserver 223.6.6.6
 EOF

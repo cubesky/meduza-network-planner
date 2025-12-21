@@ -170,6 +170,7 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         "DeviceType=tap",
         f"Interface={dev_name}",
         f"Port={port}",
+        "TCPOnly=yes",
     ]
     if conf_cipher:
         tinc_conf.append(f"Cipher={conf_cipher}")
