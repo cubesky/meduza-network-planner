@@ -111,6 +111,13 @@ def load_all_nodes() -> Dict[str, str]:
     return load_prefix("/nodes/")
 
 
+def load_key(key: str) -> str:
+    value, _meta = _etcd_call(lambda: etcd.get(key))
+    if value is None:
+        return ""
+    return value.decode("utf-8")
+
+
 class Backoff:
     def __init__(self, base=1.0, cap=60.0):
         self.base = base
@@ -502,7 +509,12 @@ def clash_refresh_loop():
             out = _run_generator("gen_clash", payload)
             reload_clash(out["config_yaml"])
             if out["mode"] == "tproxy":
-                tproxy_apply(out["tproxy_exclude"])
+                tproxy_apply(
+                    out["tproxy_exclude"],
+                    _clash_exclude_src(node),
+                    _clash_exclude_ifaces(node),
+                    _clash_exclude_ports(),
+                )
                 tproxy_enabled = True
             else:
                 if tproxy_enabled:
@@ -560,9 +572,63 @@ def reload_clash(conf_text: str) -> None:
     run(f"kill -HUP {clash_pid()}")
 
 
-def tproxy_apply(exclude: List[str]) -> None:
+def _split_ml(val: str) -> List[str]:
+    if not val:
+        return []
+    return [x.strip() for x in val.replace("\r\n", "\n").replace("\r", "\n").split("\n") if x.strip()]
+
+
+def _ovpn_dev_name(name: str) -> str:
+    return f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
+
+
+def _clash_exclude_ifaces(node: Dict[str, str]) -> List[str]:
+    out: List[str] = []
+    et_dev = node.get(f"/nodes/{NODE_ID}/easytier/dev_name", "")
+    if et_dev:
+        out.append(et_dev)
+    tinc_dev = node.get(f"/nodes/{NODE_ID}/tinc/dev_name", "")
+    if tinc_dev:
+        out.append(tinc_dev)
+    base = f"/nodes/{NODE_ID}/openvpn/"
+    names = set()
+    for k, v in node.items():
+        if not k.startswith(base) or not k.endswith("/enable"):
+            continue
+        if v != "true":
+            continue
+        name = k[len(base):].split("/", 1)[0]
+        names.add(name)
+    out.extend(_ovpn_dev_name(n) for n in sorted(names))
+    return sorted(set(out))
+
+
+def _clash_exclude_src(node: Dict[str, str]) -> List[str]:
+    cidrs: List[str] = []
+    gw_ip = os.environ.get("DEFAULT_GW", "").strip()
+    if gw_ip:
+        if "/" not in gw_ip:
+            gw_ip = f"{gw_ip}/32"
+        cidrs.append(gw_ip)
+    return sorted(set(cidrs))
+
+
+def _clash_exclude_ports() -> List[str]:
+    raw = load_key(f"/nodes/{NODE_ID}/clash/exclude_tproxy_port")
+    return sorted(set(_split_ml(raw)))
+
+
+def tproxy_apply(
+    exclude_dst: List[str],
+    exclude_src: List[str],
+    exclude_ifaces: List[str],
+    exclude_ports: List[str],
+) -> None:
     run(
-        f"EXCLUDE_CIDRS='{ ' '.join(exclude) }' "
+        f"EXCLUDE_CIDRS='{ ' '.join(exclude_dst) }' "
+        f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
+        f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
+        f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
         f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
         f"/usr/local/bin/tproxy.sh apply"
     )
@@ -714,7 +780,12 @@ def handle_commit() -> None:
             reload_clash(out["config_yaml"])
             mode = out["mode"]
             if mode == "tproxy":
-                tproxy_apply(out["tproxy_exclude"])
+                tproxy_apply(
+                    out["tproxy_exclude"],
+                    _clash_exclude_src(node),
+                    _clash_exclude_ifaces(node),
+                    _clash_exclude_ports(),
+                )
                 tproxy_enabled = True
             else:
                 if tproxy_enabled:

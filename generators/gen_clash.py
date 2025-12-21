@@ -60,12 +60,6 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
         merged["mixed-port"] = HTTP_PORT
     elif mode == "tproxy":
         merged["tproxy-port"] = TPROXY_PORT
-        merged["tun"] = {
-            "enable": True,
-            "stack": "system",
-            "auto-route": True,
-            "auto-detect-interface": True,
-        }
     else:
         raise RuntimeError(f"unsupported clash mode: {mode}")
 

@@ -23,6 +23,27 @@ else
   )
 fi
 
+# Optional source CIDRs to bypass.
+if [[ -n "${EXCLUDE_SRC_CIDRS:-}" ]]; then
+  read -r -a EXCLUDE_SRC_ARR <<< "${EXCLUDE_SRC_CIDRS}"
+else
+  EXCLUDE_SRC_ARR=()
+fi
+
+# Optional ingress interfaces to bypass.
+if [[ -n "${EXCLUDE_IFACES:-}" ]]; then
+  read -r -a EXCLUDE_IFACES_ARR <<< "${EXCLUDE_IFACES}"
+else
+  EXCLUDE_IFACES_ARR=()
+fi
+
+# Optional destination ports to bypass.
+if [[ -n "${EXCLUDE_PORTS:-}" ]]; then
+  read -r -a EXCLUDE_PORTS_ARR <<< "${EXCLUDE_PORTS}"
+else
+  EXCLUDE_PORTS_ARR=()
+fi
+
 ensure_sysctl() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null
@@ -49,8 +70,18 @@ apply_rules() {
 
   # PREROUTING only: proxy forwarded/inbound traffic.
   # Intentionally DO NOT hook OUTPUT, so local-originated traffic is not proxied.
+  for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
+  done
+  for cidr in "${EXCLUDE_SRC_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -j RETURN
+  done
   for cidr in "${EXCLUDE_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
+  done
+  for port in "${EXCLUDE_PORTS_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p udp --dport "${port}" -j RETURN
   done
   iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
   iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
