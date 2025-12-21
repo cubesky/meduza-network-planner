@@ -1,4 +1,4 @@
 #!/bin/bash
 set -euo pipefail
 
-exec mosdns run -c /etc/mosdns/config.yaml
+exec mosdns start --config /etc/mosdns/config.yaml -d /etc/mosdns/
