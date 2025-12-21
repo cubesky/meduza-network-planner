@@ -18,10 +18,13 @@ def _toml_kv(key: str, value: Any) -> str:
 
 def _dump_toml(config: Dict[str, Any]) -> str:
     root_order = [
+        "instance_name",
         "ipv4",
+        "dhcp",
         "listeners",
-        "peers",
+        "peer",
         "mapped_listeners",
+        "rpc_portal",
     ]
     lines: List[str] = []
     for key in root_order:
@@ -68,6 +71,7 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     mapped_listeners = split_ml(ng("mapped_listeners", ""))
 
     config: Dict[str, Any] = {
+        "instance_name": node_id,
         "network_identity": {
             "network_name": network_name,
             "network_secret": network_secret,
@@ -85,14 +89,14 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
     if ipv4:
         config["ipv4"] = ipv4
 
-    if gg("dhcp", "false") == "true":
-        config["flags"]["dhcp"] = True
+    config["dhcp"] = False
     if listeners:
-        config["listeners"] = listeners
+        config["listeners"] = [_normalize_listener(x) for x in listeners]
     if peers:
         config["peer"] = peers
     if mapped_listeners:
         config["mapped_listeners"] = mapped_listeners
+    config["rpc_portal"] = "0.0.0.0:0"
 
     config["flags"]["enable_exit_node"] = True
     config["flags"]["proxy_forward_by_system"] = True
