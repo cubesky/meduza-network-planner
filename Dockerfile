@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
     openvpn \
     iproute2 iptables \
     iputils-ping dnsutils \
+    mtr tcpdump nano \
     procps \
     curl jq git python3 python3-pip \
     ca-certificates \
