@@ -479,7 +479,7 @@ def monitor_children_loop():
 
 
 def clash_refresh_loop():
-    global tproxy_enabled
+    global tproxy_enabled, _clash_refresh_enable, _clash_refresh_interval, _clash_refresh_next
     while True:
         time.sleep(5)
         with _clash_refresh_lock:
