@@ -41,19 +41,18 @@ etcdctl put /nodes/${NODE_ID}/clash/refresh/interval_minutes 60
 etcdctl put /commit "$(date +%s)"
 
 # OpenVPN (new schema)
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/enable true
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/dev tun0
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/proto tcp-client
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/port 1194
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/remote "vpn.example.com"
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/ifconfig "10.8.0.2 10.8.0.1"
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/keepalive "10 60"
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/cipher AES-256-CBC
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/auth SHA256
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/secret "INLINE_SECRET"
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/peer_asn 65001
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/peer_ip 10.8.0.1
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/update_source tun0
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/enable true
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/dev tun0
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/proto tcp-client
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/port 1194
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/remote "vpn.example.com"
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/ifconfig "10.8.0.2 10.8.0.1"
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/keepalive "10 60"
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/cipher AES-256-CBC
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/auth SHA256
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/secret "INLINE_SECRET"
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_asn 65001
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_ip 10.8.0.1
 
 # Global BGP filter policy (shared for all neighbors)
 etcdctl put /global/bgp/filter/in  $'deny 0.0.0.0/0\npermit 0.0.0.0/0 le 32'

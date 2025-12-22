@@ -81,6 +81,7 @@ def _internal_bgp_neighbors(
         out[nid] = {
             "router_id": router_id,
             "is_exit": "true" if _node_is_exit(ovpn) else "false",
+            "name": nid,
         }
     return out
 
@@ -207,13 +208,23 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             update_source = cfg.get("bgp/update_source", "") or cfg.get("dev", "") or _ovpn_dev_name(name)
             if peer_ip and peer_asn and update_source:
                 lines.append(f" neighbor {peer_ip} remote-as {peer_asn}")
+                lines.append(f" neighbor {peer_ip} description {name}")
                 lines.append(f" neighbor {peer_ip} update-source {update_source}")
-        lines.append(" !")
+        ibgp_neighbors: List[Dict[str, str]] = []
+        if internal_routing == "bgp":
+            neighbors = _internal_bgp_neighbors(node_id, all_nodes)
+            for _nid, info in neighbors.items():
+                peer_ip = info["router_id"]
+                lines.append(f" neighbor {peer_ip} remote-as internal")
+                lines.append(f" neighbor {peer_ip} description {info['name']}")
+                lines.append(f" neighbor {peer_ip} update-source {router_id}")
+                ibgp_neighbors.append(info)
         lines.append(" address-family ipv4 unicast")
         lines.append(f"  maximum-paths {max_paths}")
         for pfx in lans:
             lines.append(f"  network {pfx}")
-        lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
+        if ospf_enable:
+            lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
         for name, cfg in ovpn.items():
             if cfg.get("enable") != "true":
                 continue
@@ -225,20 +236,13 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
 
-        if internal_routing == "bgp":
-            neighbors = _internal_bgp_neighbors(node_id, all_nodes)
-            for _nid, info in neighbors.items():
-                peer_ip = info["router_id"]
-                lines.append(f" neighbor {peer_ip} remote-as {local_as}")
-                lines.append(f" neighbor {peer_ip} update-source {router_id}")
-            lines.append(" !")
-            for _nid, info in neighbors.items():
-                peer_ip = info["router_id"]
-                lines.append(f"  neighbor {peer_ip} activate")
-                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
-                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
-                if info.get("is_exit") != "true":
-                    lines.append(f"  neighbor {peer_ip} next-hop-self")
+        for info in ibgp_neighbors:
+            peer_ip = info["router_id"]
+            lines.append(f"  neighbor {peer_ip} activate")
+            lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+            lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+            if info.get("is_exit") != "true":
+                lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]
 
