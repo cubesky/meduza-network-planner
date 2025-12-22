@@ -417,6 +417,7 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
     _supervisorctl(["update"])
 
     for name in enabled:
+        _supervisor_restart(f"openvpn-{name}")
         _write_openvpn_status(name, "connecting")
 
     return changed, sorted(enabled)
