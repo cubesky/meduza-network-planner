@@ -200,6 +200,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             lines.append(f" bgp router-id {router_id}")
 
         ovpn = _parse_openvpn(node_id, node)
+        self_is_exit = _node_is_exit(ovpn)
         for name, cfg in ovpn.items():
             if cfg.get("enable") != "true":
                 continue
@@ -241,7 +242,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             lines.append(f"  neighbor {peer_ip} activate")
             lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
             lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
-            if info.get("is_exit") != "true":
+            if self_is_exit and info.get("is_exit") != "true":
                 lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]
