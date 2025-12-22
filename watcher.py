@@ -264,11 +264,41 @@ def _run_generator(name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     payload = {"node_id": NODE_ID, "node": node, "all_nodes": all_nodes, "global": global_cfg}
     out = _run_generator("gen_tinc", payload)
+    netname = out["netname"]
+    hosts_dir = f"/etc/tinc/{netname}/hosts"
+    expected_hosts: List[str] = []
+    changed_non_host = False
+    changed_host_existing = False
+    new_host_files = False
+    removed_hosts = False
     for entry in out["files"]:
-        _write_if_changed(entry["path"], entry["content"], mode=entry.get("mode"))
+        path = entry["path"]
+        is_host = path.startswith(f"{hosts_dir}/")
+        if is_host:
+            expected_hosts.append(os.path.basename(path))
+        existed = os.path.exists(path)
+        if _write_if_changed(path, entry["content"], mode=entry.get("mode")):
+            if is_host:
+                if existed:
+                    changed_host_existing = True
+                else:
+                    new_host_files = True
+            else:
+                changed_non_host = True
+    if os.path.isdir(hosts_dir):
+        for fname in os.listdir(hosts_dir):
+            if fname not in expected_hosts:
+                try:
+                    os.remove(os.path.join(hosts_dir, fname))
+                    removed_hosts = True
+                except Exception:
+                    pass
     if _supervisor_is_running("tinc"):
-        if not _tinc_reload(out["netname"]):
+        if changed_non_host or changed_host_existing or removed_hosts:
             _supervisor_restart("tinc")
+        elif new_host_files:
+            if not _tinc_reload(netname):
+                _supervisor_restart("tinc")
     else:
         _supervisor_start("tinc")
 
