@@ -161,6 +161,17 @@ Select overlay implementation:
 /global/mesh_type = "easytier" | "tinc"
 ```
 
+## Internal routing system
+
+Select routing exchange protocol across the mesh:
+
+```
+/global/internal_routing_system = "ospf" | "bgp"
+```
+
+- `ospf`: current default, OSPF distributes internal routes.
+- `bgp`: iBGP between nodes, neighbors are built from `/nodes/*/router_id`.
+
 ## Tinc (when /global/mesh_type = "tinc")
 
 Global:

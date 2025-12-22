@@ -29,8 +29,65 @@ def _parse_prefix_list_rules(multiline: str) -> List[Tuple[str, str]]:
     return rules
 
 
-def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str]) -> str:
+def _parse_openvpn(node_id: str, node: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    base = f"/nodes/{node_id}/openvpn/"
+    out: Dict[str, Dict[str, str]] = {}
+    for k, v in node.items():
+        if not k.startswith(base):
+            continue
+        rest = k[len(base):]
+        parts = rest.split("/", 1)
+        if len(parts) != 2:
+            continue
+        name, tail = parts
+        out.setdefault(name, {})
+        out[name][tail] = v
+    return out
+
+
+def _node_is_exit(ovpn: Dict[str, Dict[str, str]]) -> bool:
+    for cfg in ovpn.values():
+        if cfg.get("enable") != "true":
+            continue
+        if cfg.get("bgp/peer_ip") and cfg.get("bgp/peer_asn"):
+            return True
+    return False
+
+
+def _internal_bgp_neighbors(
+    node_id: str,
+    all_nodes: Dict[str, str],
+) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    base = "/nodes/"
+    per_node: Dict[str, Dict[str, str]] = {}
+    for k, v in all_nodes.items():
+        if not k.startswith(base):
+            continue
+        rest = k[len(base):]
+        parts = rest.split("/", 1)
+        if len(parts) != 2:
+            continue
+        nid, tail = parts
+        per_node.setdefault(nid, {})
+        per_node[nid][f"/nodes/{nid}/{tail}"] = v
+    for nid, data in per_node.items():
+        if nid == node_id:
+            continue
+        router_id = data.get(f"/nodes/{nid}/router_id", "")
+        if not router_id:
+            continue
+        ovpn = _parse_openvpn(nid, data)
+        out[nid] = {
+            "router_id": router_id,
+            "is_exit": "true" if _node_is_exit(ovpn) else "false",
+        }
+    return out
+
+
+def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str], all_nodes: Dict[str, str]) -> str:
     router_id = node.get(f"/nodes/{node_id}/router_id", "")
+    internal_routing = global_cfg.get("/global/internal_routing_system", "ospf")
     ospf_enable = node.get(f"/nodes/{node_id}/ospf/enable") == "true"
     bgp_enable = node.get(f"/nodes/{node_id}/bgp/enable") == "true"
 
@@ -39,6 +96,8 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str])
     to_ospf_default_only = node.get(f"/nodes/{node_id}/bgp/to_ospf/default_only") == "true"
     ospf_redistribute_bgp = node.get(f"/nodes/{node_id}/ospf/redistribute_bgp") == "true"
     inject_site_lan = node.get(f"/nodes/{node_id}/ospf/inject_site_lan") == "true"
+    if internal_routing == "bgp":
+        ospf_enable = False
 
     in_rules_ml = global_cfg.get("/global/bgp/filter/in", "")
     out_rules_ml = global_cfg.get("/global/bgp/filter/out", "")
@@ -139,18 +198,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str])
         if router_id:
             lines.append(f" bgp router-id {router_id}")
 
-        base = f"/nodes/{node_id}/openvpn/"
-        ovpn: Dict[str, Dict[str, str]] = {}
-        for k, v in node.items():
-            if not k.startswith(base):
-                continue
-            rest = k[len(base):]
-            parts = rest.split("/", 1)
-            if len(parts) != 2:
-                continue
-            name, tail = parts
-            ovpn.setdefault(name, {})
-            ovpn[name][tail] = v
+        ovpn = _parse_openvpn(node_id, node)
         for name, cfg in ovpn.items():
             if cfg.get("enable") != "true":
                 continue
@@ -176,6 +224,21 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str])
                 lines.append(f"  neighbor {peer_ip} activate")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+
+        if internal_routing == "bgp":
+            neighbors = _internal_bgp_neighbors(node_id, all_nodes)
+            for _nid, info in neighbors.items():
+                peer_ip = info["router_id"]
+                lines.append(f" neighbor {peer_ip} remote-as {local_as}")
+                lines.append(f" neighbor {peer_ip} update-source {router_id}")
+            lines.append(" !")
+            for _nid, info in neighbors.items():
+                peer_ip = info["router_id"]
+                lines.append(f"  neighbor {peer_ip} activate")
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                if info.get("is_exit") != "true":
+                    lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]
 
@@ -187,7 +250,7 @@ def main() -> None:
     node_id = payload["node_id"]
     node = payload["node"]
     global_cfg = payload["global"]
-    conf_text = generate_frr(node_id, node, global_cfg)
+    conf_text = generate_frr(node_id, node, global_cfg, payload.get("all_nodes", {}))
     write_output({"frr_conf": conf_text})
 
 

@@ -190,19 +190,10 @@ def keepalive_loop():
     while True:
         time.sleep(interval)
         try:
-            with _lease_lock:
-                lease = _online_lease
-            if lease:
-                try:
-                    _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
-                    continue
-                except grpc.RpcError as e:
-                    if e.code() not in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
-                        raise
-            with _lease_lock:
-                _online_lease = None
-            lease = ensure_online_lease()
+            lease = _etcd_call(lambda: etcd.lease(UPDATE_TTL_SECONDS))
             _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+            with _lease_lock:
+                _online_lease = lease
         except Exception:
             with _lease_lock:
                 _online_lease = None
@@ -766,7 +757,7 @@ def handle_commit() -> None:
     )}
     global_bgp_filter = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/filter/")}
     if changed("frr", {"node": frr_material, "global_bgp_filter": global_bgp_filter}):
-        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": load_all_nodes()}
         out = _run_generator("gen_frr", payload)
         reload_frr_smooth(out["frr_conf"])
         did_apply = True
