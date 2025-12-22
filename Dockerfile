@@ -69,6 +69,21 @@ RUN set -eux; \
     chmod +x /usr/local/bin/mihomo; \
     rm -f /tmp/mihomo.gz
 
+# --- MetaCubeXD (UI) ---
+RUN set -eux; \
+    PROXY="http://10.42.1.2:7890"; \
+    CURL_PROXY=""; \
+    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
+      CURL_PROXY="--proxy ${PROXY}"; \
+    fi; \
+    URL="https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"; \
+    curl -fL ${CURL_PROXY} "$URL" -o /tmp/metacubexd.zip; \
+    unzip -q /tmp/metacubexd.zip -d /tmp/metacubexd; \
+    rm -rf /etc/clash/ui; \
+    mkdir -p /etc/clash; \
+    cp -r /tmp/metacubexd/metacubexd-gh-pages /etc/clash/ui; \
+    rm -rf /tmp/metacubexd /tmp/metacubexd.zip
+
 # --- Tinc 1.1 ---
 # Build from source (git branch 1.1)
 RUN set -eux; \

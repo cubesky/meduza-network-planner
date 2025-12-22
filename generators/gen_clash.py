@@ -55,6 +55,8 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     dns_cfg["enhanced-mode"] = "redir-host"
     merged["dns"] = dns_cfg
 
+    merged["external-ui"] = "/etc/clash/ui"
+
     merged["socks-port"] = SOCKS_PORT
     if mode == "mixed":
         merged["mixed-port"] = HTTP_PORT
