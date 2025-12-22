@@ -39,7 +39,33 @@ Schema (per instance):
 
 ```
 /nodes/<NODE_ID>/openvpn/<NAME>/enable                # "true" | "false"
-/nodes/<NODE_ID>/openvpn/<NAME>/config                # inline .ovpn config text
+/nodes/<NODE_ID>/openvpn/<NAME>/dev                   # optional, default: tun-<NAME> or tun<digit>
+/nodes/<NODE_ID>/openvpn/<NAME>/dev_type              # e.g. tun
+/nodes/<NODE_ID>/openvpn/<NAME>/proto                 # tcp-server | tcp-client | udp | ...
+/nodes/<NODE_ID>/openvpn/<NAME>/port
+/nodes/<NODE_ID>/openvpn/<NAME>/remote                # newline-separated list
+/nodes/<NODE_ID>/openvpn/<NAME>/ifconfig              # "local remote"
+/nodes/<NODE_ID>/openvpn/<NAME>/keepalive             # "10 60"
+/nodes/<NODE_ID>/openvpn/<NAME>/verb
+/nodes/<NODE_ID>/openvpn/<NAME>/auth
+/nodes/<NODE_ID>/openvpn/<NAME>/cipher
+/nodes/<NODE_ID>/openvpn/<NAME>/comp_lzo              # yes | no | adaptive
+/nodes/<NODE_ID>/openvpn/<NAME>/allow_compression     # asym | yes | no
+/nodes/<NODE_ID>/openvpn/<NAME>/persist_tun           # "1" to enable
+/nodes/<NODE_ID>/openvpn/<NAME>/tls_client            # "1" to enable
+/nodes/<NODE_ID>/openvpn/<NAME>/remote_cert_tls       # e.g. server
+/nodes/<NODE_ID>/openvpn/<NAME>/key_direction
+/nodes/<NODE_ID>/openvpn/<NAME>/client                # "1" to enable
+
+# Inline-only secrets (stored directly in etcd, not file paths):
+/nodes/<NODE_ID>/openvpn/<NAME>/secret
+/nodes/<NODE_ID>/openvpn/<NAME>/ca
+/nodes/<NODE_ID>/openvpn/<NAME>/cert
+/nodes/<NODE_ID>/openvpn/<NAME>/key
+/nodes/<NODE_ID>/openvpn/<NAME>/tls_auth
+/nodes/<NODE_ID>/openvpn/<NAME>/tls_crypt
+
+# BGP transport over OpenVPN:
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/peer_asn
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/peer_ip
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/update_source     # e.g. tun0 / tun1 ...
@@ -55,6 +81,10 @@ States: `up` | `connecting` | `down`
 
 ENV:
 - `OPENVPN_STATUS_INTERVAL` (seconds, default `10`)
+
+Notes:
+- 不再支持直接下发 `config`，必须由上述结构化键生成。
+- `secret/ca/cert/key/tls_auth/tls_crypt` 只能使用 inline 内容。
 
 
 ## Global BGP filter (shared for all neighbors)

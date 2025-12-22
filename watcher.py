@@ -150,13 +150,14 @@ _online_lease: Optional[Any] = None
 # OpenVPN status
 _ovpn_lock = threading.Lock()
 _ovpn_cfg_names: List[str] = []
+_ovpn_devs: Dict[str, str] = {}
 
 
 def ensure_online_lease():
     global _online_lease
     with _lease_lock:
         if _online_lease is None:
-            _online_lease = etcd.lease(UPDATE_TTL_SECONDS)
+            _online_lease = _etcd_call(lambda: etcd.lease(UPDATE_TTL_SECONDS))
         return _online_lease
 
 
@@ -194,15 +195,14 @@ def keepalive_loop():
             if lease:
                 try:
                     _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
+                    continue
                 except grpc.RpcError as e:
-                    if e.code() in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
-                        _reset_etcd()
-                        with _lease_lock:
-                            _online_lease = None
-                        lease = ensure_online_lease()
-                        _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
-                    else:
+                    if e.code() not in (StatusCode.UNAUTHENTICATED, StatusCode.NOT_FOUND):
                         raise
+            with _lease_lock:
+                _online_lease = None
+            lease = ensure_online_lease()
+            _etcd_call(lambda: etcd.put(UPDATE_ONLINE_KEY, "1", lease=lease))
         except Exception:
             with _lease_lock:
                 _online_lease = None
@@ -370,7 +370,7 @@ def _write_openvpn_status(name: str, status: str) -> None:
 def _openvpn_program_conf(name: str, dev: str) -> str:
     return "\n".join([
         f"[program:openvpn-{name}]",
-        f"command=openvpn --config /etc/openvpn/generated/{name}.conf --dev {dev}",
+        f"command=openvpn --config /etc/openvpn/generated/{name}.conf",
         "autostart=true",
         "autorestart=true",
         f"stdout_logfile=/var/log/openvpn.{name}.out.log",
@@ -392,6 +392,7 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
 
     with _ovpn_lock:
         _ovpn_cfg_names.clear()
+        _ovpn_devs.clear()
 
     active = set()
     for inst in instances:
@@ -400,6 +401,10 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         cfg = inst["config"]
         active.add(name)
         enabled.append(name)
+        _ovpn_devs[name] = dev
+        for f in inst.get("files", []):
+            if _write_if_changed(f["path"], f["content"], mode=f.get("mode")):
+                changed = True
         if _write_if_changed(f"/etc/openvpn/generated/{name}.conf", cfg):
             changed = True
         if _write_if_changed(f"/etc/supervisor/conf.d/openvpn-{name}.conf", _openvpn_program_conf(name, dev)):
@@ -432,7 +437,8 @@ def openvpn_status_loop():
         with _ovpn_lock:
             names = list(_ovpn_cfg_names)
         for name in names:
-            dev = f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
+            with _ovpn_lock:
+                dev = _ovpn_devs.get(name) or (f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}")
             status = _compute_openvpn_status(name, dev)
             _write_openvpn_status(name, status)
 
@@ -598,8 +604,8 @@ def _clash_exclude_ifaces(node: Dict[str, str]) -> List[str]:
         if v != "true":
             continue
         name = k[len(base):].split("/", 1)[0]
-        names.add(name)
-    out.extend(_ovpn_dev_name(n) for n in sorted(names))
+        dev = node.get(f"{base}{name}/dev", "")
+        out.append(dev or _ovpn_dev_name(name))
     return sorted(set(out))
 
 

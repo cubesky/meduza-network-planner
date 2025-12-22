@@ -42,7 +42,15 @@ etcdctl put /commit "$(date +%s)"
 
 # OpenVPN (new schema)
 etcdctl put /nodes/${NODE_ID}/openvpn/tun0/enable true
-etcdctl put /nodes/${NODE_ID}/openvpn/tun0/config "$(cat ./client.ovpn)"
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/dev tun0
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/proto tcp-client
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/port 1194
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/remote "vpn.example.com"
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/ifconfig "10.8.0.2 10.8.0.1"
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/keepalive "10 60"
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/cipher AES-256-CBC
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/auth SHA256
+etcdctl put /nodes/${NODE_ID}/openvpn/tun0/secret "INLINE_SECRET"
 etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/peer_asn 65001
 etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/peer_ip 10.8.0.1
 etcdctl put /nodes/${NODE_ID}/openvpn/tun0/bgp/update_source tun0

@@ -6,6 +6,10 @@ from common import read_input, write_output, split_ml, node_lans
 TAG_NO_REINJECT = 65000
 
 
+def _ovpn_dev_name(name: str) -> str:
+    return f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
+
+
 def _parse_prefix_list_rules(multiline: str) -> List[Tuple[str, str]]:
     rules: List[Tuple[str, str]] = []
     if not multiline:
@@ -134,11 +138,6 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str])
         lines.append(f"router bgp {local_as}")
         if router_id:
             lines.append(f" bgp router-id {router_id}")
-        lines.append(f" maximum-paths {max_paths}")
-
-        for pfx in lans:
-            lines.append(f" network {pfx}")
-        lines.append(" redistribute ospf route-map RM-OSPF-TO-BGP")
 
         base = f"/nodes/{node_id}/openvpn/"
         ovpn: Dict[str, Dict[str, str]] = {}
@@ -157,12 +156,27 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str])
                 continue
             peer_ip = cfg.get("bgp/peer_ip", "")
             peer_asn = cfg.get("bgp/peer_asn", "")
-            update_source = cfg.get("bgp/update_source", "")
+            update_source = cfg.get("bgp/update_source", "") or cfg.get("dev", "") or _ovpn_dev_name(name)
             if peer_ip and peer_asn and update_source:
                 lines.append(f" neighbor {peer_ip} remote-as {peer_asn}")
                 lines.append(f" neighbor {peer_ip} update-source {update_source}")
-                lines.append(f" neighbor {peer_ip} route-map RM-BGP-IN in")
-                lines.append(f" neighbor {peer_ip} route-map RM-BGP-OUT out")
+        lines.append(" !")
+        lines.append(" address-family ipv4 unicast")
+        lines.append(f"  maximum-paths {max_paths}")
+        for pfx in lans:
+            lines.append(f"  network {pfx}")
+        lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
+        for name, cfg in ovpn.items():
+            if cfg.get("enable") != "true":
+                continue
+            peer_ip = cfg.get("bgp/peer_ip", "")
+            peer_asn = cfg.get("bgp/peer_asn", "")
+            update_source = cfg.get("bgp/update_source", "") or cfg.get("dev", "") or _ovpn_dev_name(name)
+            if peer_ip and peer_asn and update_source:
+                lines.append(f"  neighbor {peer_ip} activate")
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+        lines.append(" exit-address-family")
         lines += ["!", ""]
 
     return "\n".join(lines).strip() + "\n"
