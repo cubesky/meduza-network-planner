@@ -756,7 +756,9 @@ def handle_commit() -> None:
         changed_ovpn, enabled = reload_openvpn(node)
         did_apply = did_apply or changed_ovpn
         for name in enabled:
-            _write_openvpn_status(name, _compute_openvpn_status(name, openvpn_procs.get(name)))
+            with _ovpn_lock:
+                dev = _ovpn_devs.get(name) or (f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}")
+            _write_openvpn_status(name, _compute_openvpn_status(name, dev))
 
     # FRR depends on node routing config + global BGP filter policy
     frr_material = {k: v for k, v in node.items() if (
