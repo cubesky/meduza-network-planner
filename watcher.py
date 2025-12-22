@@ -711,6 +711,20 @@ def _download_rules(rules: Dict[str, str]) -> None:
         _write_text(out_path, resp.text, mode=0o644)
 
 
+def _download_rules_with_backoff(rules: Dict[str, str]) -> None:
+    if not rules:
+        return
+    backoff = Backoff()
+    while True:
+        try:
+            _download_rules(rules)
+            return
+        except Exception as e:
+            t = backoff.next_sleep()
+            print(f"[mosdns] rules download failed: {e}; retry in {t:.1f}s", flush=True)
+            time.sleep(t)
+
+
 def _touch_rules_stamp() -> None:
     path = _mosdns_rules_stamp_path()
     _write_text(path, now_utc_iso() + "\n", mode=0o644)
@@ -724,7 +738,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
-        _download_rules(out.get("rules", {}))
+        _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
 
     _supervisor_restart("mosdns")
