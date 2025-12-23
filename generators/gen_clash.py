@@ -17,6 +17,9 @@ def _node_lans_for_exclude(node: Dict[str, str], node_id: str) -> List[str]:
         "172.16.0.0/12", "192.168.0.0/16",
         "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
         "10.42.1.0/24",
+        "10.88.0.0/16",   # podman
+        "10.89.0.0/16",   # podman
+        "10.0.0.0/24",    # docker default
     ]
     cidrs.extend(node_lans(node, node_id))
     return sorted(set(cidrs))
