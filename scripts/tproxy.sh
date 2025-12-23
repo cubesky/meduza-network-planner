@@ -82,6 +82,8 @@ apply_rules() {
   for port in "${EXCLUDE_PORTS_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
     iptables -t mangle -A CLASH_TPROXY -p udp --dport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p tcp --sport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p udp --sport "${port}" -j RETURN
   done
   iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
   iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
