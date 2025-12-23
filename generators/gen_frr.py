@@ -122,6 +122,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         })
 
     lans = node_lans(node, node_id)
+    private_lans = sorted(set(split_ml(node.get(f"/nodes/{node_id}/private_lan", ""))))
 
     lines: List[str] = [
         "frr defaults traditional",
@@ -133,9 +134,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
     lines += ["", "ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0", ""]
 
-    if inject_site_lan and lans:
+    if inject_site_lan and (lans or private_lans):
         seq = 10
-        for pfx in lans:
+        for pfx in lans + private_lans:
             lines.append(f"ip prefix-list PL-OSPF-LAN seq {seq} permit {pfx}")
             seq += 10
         lines.append("")
@@ -162,6 +163,25 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
     lines.append(" match ip address prefix-list PL-BGP-OUT")
     lines.append("!")
     lines.append("")
+
+    if private_lans:
+        seq = 10
+        for pfx in private_lans:
+            lines.append(f"ip prefix-list PL-PRIVATE-LAN seq {seq} permit {pfx}")
+            seq += 10
+        lines.append("")
+        lines.append("route-map RM-BGP-OUT-EXTERNAL deny 5")
+        lines.append(" match ip address prefix-list PL-PRIVATE-LAN")
+        lines.append("route-map RM-BGP-OUT-EXTERNAL permit 10")
+        lines.append(" match ip address prefix-list PL-BGP-OUT")
+        lines.append("!")
+        lines.append("")
+        lines.append("route-map RM-BGP-OUT-INTERNAL permit 5")
+        lines.append(" match ip address prefix-list PL-PRIVATE-LAN")
+        lines.append("route-map RM-BGP-OUT-INTERNAL permit 10")
+        lines.append(" match ip address prefix-list PL-BGP-OUT")
+        lines.append("!")
+        lines.append("")
 
     lines += ["route-map RM-BGP-TO-OSPF permit 10"]
     if to_ospf_default_only:
@@ -224,6 +244,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         lines.append(f"  maximum-paths {max_paths}")
         for pfx in lans:
             lines.append(f"  network {pfx}")
+        if internal_routing == "bgp":
+            for pfx in private_lans:
+                lines.append(f"  network {pfx}")
         if ospf_enable:
             lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
         for name, cfg in ovpn.items():
@@ -235,13 +258,19 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             if peer_ip and peer_asn and update_source:
                 lines.append(f"  neighbor {peer_ip} activate")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
-                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                if private_lans:
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
+                else:
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
 
         for info in ibgp_neighbors:
             peer_ip = info["router_id"]
             lines.append(f"  neighbor {peer_ip} activate")
             lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
-            lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+            if private_lans:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-INTERNAL out")
+            else:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
             if self_is_exit and info.get("is_exit") != "true":
                 lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")

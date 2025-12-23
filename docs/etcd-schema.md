@@ -12,6 +12,14 @@ Top level:
 /nodes/<NODE_ID>/lan = "10.42.10.0/24\n10.42.11.0/24\n..."
 ```
 
+Private LANs (internal-only, newline-separated):
+
+```
+/nodes/<NODE_ID>/private_lan = "10.99.10.0/24\n10.99.11.0/24\n..."
+```
+
+- `private_lan` is distributed only via OSPF or iBGP (not exported to external BGP neighbors).
+
 These prefixes are treated as **Local segments**:
 - advertised by routing (OSPF via redistribute connected; BGP via network statements)
 - excluded from Clash TPROXY interception
