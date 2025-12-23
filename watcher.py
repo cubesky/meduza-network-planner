@@ -143,6 +143,9 @@ _clash_refresh_enable = False
 _clash_refresh_interval = 0
 _clash_refresh_next = 0.0
 
+# reconcile lock
+_reconcile_lock = threading.Lock()
+
 # online lease
 _lease_lock = threading.Lock()
 _online_lease: Optional[Any] = None
@@ -908,6 +911,15 @@ def handle_commit() -> None:
         publish_update("config-applied")
 
 
+def reconcile_once() -> None:
+    if not _reconcile_lock.acquire(blocking=False):
+        return
+    try:
+        handle_commit()
+    finally:
+        _reconcile_lock.release()
+
+
 # ---------- watch loop ----------
 
 def watch_loop() -> None:
@@ -916,7 +928,7 @@ def watch_loop() -> None:
         cancel = None
         try:
             try:
-                handle_commit()
+                reconcile_once()
             except Exception as e:
                 print(f"[reconcile] error: {e}", flush=True)
 
@@ -924,7 +936,7 @@ def watch_loop() -> None:
             events, cancel = _etcd_call(lambda: etcd.watch("/commit"))
             for _ in events:
                 try:
-                    handle_commit()
+                    reconcile_once()
                 except Exception as e:
                     print(f"[reconcile] error: {e}", flush=True)
 
@@ -940,11 +952,21 @@ def watch_loop() -> None:
                 pass
 
 
+def periodic_reconcile_loop() -> None:
+    while True:
+        time.sleep(300)
+        try:
+            reconcile_once()
+        except Exception as e:
+            print(f"[reconcile] periodic error: {e}", flush=True)
+
+
 def main() -> None:
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
     threading.Thread(target=monitor_children_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
+    threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
 
     publish_update("startup")
     watch_loop()
