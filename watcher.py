@@ -541,7 +541,7 @@ def clash_refresh_loop():
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
-                    _clash_exclude_ports(),
+                    _clash_exclude_ports(node, global_cfg),
                 )
                 tproxy_enabled = True
             else:
@@ -641,9 +641,57 @@ def _clash_exclude_src(node: Dict[str, str]) -> List[str]:
     return sorted(set(cidrs))
 
 
-def _clash_exclude_ports() -> List[str]:
+def _parse_port(val: str) -> Optional[str]:
+    v = val.strip()
+    if not v:
+        return None
+    if "://" in v:
+        try:
+            u = urlparse(v)
+            if u.port:
+                return str(u.port)
+        except Exception:
+            return None
+    if ":" in v:
+        parts = v.split(":")
+        tail = parts[-1]
+        if tail.isdigit():
+            return tail
+    if v.isdigit():
+        return v
+    return None
+
+
+def _clash_exclude_ports(node: Dict[str, str], global_cfg: Dict[str, str]) -> List[str]:
     raw = load_key(f"/nodes/{NODE_ID}/clash/exclude_tproxy_port")
-    return sorted(set(_split_ml(raw)))
+    ports = set(_split_ml(raw))
+
+    mesh_type = global_cfg.get("/global/mesh_type", "easytier")
+    if mesh_type == "tinc":
+        tinc_port = node.get(f"/nodes/{NODE_ID}/tinc/port", "")
+        p = _parse_port(tinc_port)
+        if p:
+            ports.add(p)
+    else:
+        listeners = _split_ml(node.get(f"/nodes/{NODE_ID}/easytier/listeners", ""))
+        mapped = _split_ml(node.get(f"/nodes/{NODE_ID}/easytier/mapped_listeners", ""))
+        for item in listeners + mapped:
+            p = _parse_port(item)
+            if p:
+                ports.add(p)
+
+    base = f"/nodes/{NODE_ID}/openvpn/"
+    for k, v in node.items():
+        if not k.startswith(base) or not k.endswith("/enable"):
+            continue
+        if v != "true":
+            continue
+        name = k[len(base):].split("/", 1)[0]
+        p = _parse_port(node.get(f"{base}{name}/port", ""))
+        if p:
+            ports.add(p)
+
+    return sorted(ports)
 
 
 def tproxy_apply(
@@ -828,7 +876,7 @@ def handle_commit() -> None:
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
-                    _clash_exclude_ports(),
+                    _clash_exclude_ports(node, global_cfg),
                 )
                 tproxy_enabled = True
             else:
