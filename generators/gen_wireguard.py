@@ -40,7 +40,13 @@ def _parse_peers(cfg: Dict[str, str]) -> Dict[str, Dict[str, str]]:
 
 def _add_kv(lines: List[str], key: str, value: str) -> None:
     if value:
-        lines.append(f"{key} = {value}")
+        lines.append(f"{key} = {value.strip()}")
+
+
+def _first_line(val: str) -> str:
+    for item in split_ml(val):
+        return item
+    return ""
 
 
 def build_config(name: str, cfg: Dict[str, str]) -> str:
@@ -73,7 +79,7 @@ def build_config(name: str, cfg: Dict[str, str]) -> str:
         if not allowed:
             allowed = ["0.0.0.0/0"]
         lines.append(f"AllowedIPs = {', '.join(allowed)}")
-        _add_kv(lines, "Endpoint", peer.get("endpoint", ""))
+        _add_kv(lines, "Endpoint", _first_line(peer.get("endpoint", "")))
         _add_kv(lines, "PersistentKeepalive", peer.get("persistent_keepalive", ""))
 
     return "\n".join(lines).strip() + "\n"

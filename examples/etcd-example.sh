@@ -53,6 +53,8 @@ etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/auth SHA256
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/secret "INLINE_SECRET"
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_asn 65001
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_ip 10.8.0.1
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/enable true
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/weight 200
 
 # WireGuard (new schema)
 etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/enable true
@@ -66,6 +68,8 @@ etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/endpoint "wg.example
 etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/persistent_keepalive 25
 etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/peer_asn 65002
 etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/peer_ip 10.9.0.1
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/enable true
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/weight 200
 
 # Global BGP filter policy (shared for all neighbors)
 etcdctl put /global/bgp/filter/in  $'deny 0.0.0.0/0\npermit 0.0.0.0/0 le 32'

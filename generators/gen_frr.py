@@ -65,14 +65,22 @@ def _parse_wireguard(node_id: str, node: Dict[str, str]) -> Dict[str, Dict[str, 
     return out
 
 
+def _bgp_enabled(cfg: Dict[str, str]) -> bool:
+    return cfg.get("bgp/enable", "true") == "true"
+
+
 def _node_is_exit(ovpn: Dict[str, Dict[str, str]], wg: Dict[str, Dict[str, str]]) -> bool:
     for cfg in ovpn.values():
         if cfg.get("enable") != "true":
+            continue
+        if not _bgp_enabled(cfg):
             continue
         if cfg.get("bgp/peer_ip") and cfg.get("bgp/peer_asn"):
             return True
     for cfg in wg.values():
         if cfg.get("enable") != "true":
+            continue
+        if not _bgp_enabled(cfg):
             continue
         if cfg.get("bgp/peer_ip") and cfg.get("bgp/peer_asn"):
             return True
@@ -265,6 +273,8 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         for kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
             if cfg.get("enable") != "true":
                 continue
+            if not _bgp_enabled(cfg):
+                continue
             peer_ip = cfg.get("bgp/peer_ip", "")
             peer_asn = cfg.get("bgp/peer_asn", "")
             update_source = dev if kind == "wireguard" else (cfg.get("bgp/update_source", "") or dev)
@@ -294,11 +304,16 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         for _kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
             if cfg.get("enable") != "true":
                 continue
+            if not _bgp_enabled(cfg):
+                continue
             peer_ip = cfg.get("bgp/peer_ip", "")
             peer_asn = cfg.get("bgp/peer_asn", "")
+            weight = cfg.get("bgp/weight", "").strip()
             update_source = dev if _kind == "wireguard" else (cfg.get("bgp/update_source", "") or dev)
             if peer_ip and peer_asn and update_source:
                 lines.append(f"  neighbor {peer_ip} activate")
+                if weight:
+                    lines.append(f"  neighbor {peer_ip} weight {weight}")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
                 if private_lans:
                     lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")

@@ -77,6 +77,8 @@ Schema (per instance):
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/peer_asn
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/peer_ip
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/update_source     # e.g. tun0 / tun1 ...
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/enable            # "true" | "false"
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/weight
 ```
 
 Status reporting:
@@ -120,6 +122,8 @@ Schema (per instance):
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_asn
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_ip
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/update_source     # ignored (auto from dev)
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/enable            # "true" | "false"
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/weight
 ```
 
 Status reporting:
@@ -138,6 +142,7 @@ Notes:
 - WireGuard `Table` is forced to `off`, and `PreUp/PostUp/PreDown/PostDown` are auto-generated to no-op.
 - WireGuard does not manage routes; routing is handled by FRR.
 - If `allowed_ips` is empty, it defaults to `0.0.0.0/0`.
+- `bgp/enable` defaults to `true` when omitted.
 
 
 ## Global BGP filter (shared for all neighbors)
@@ -179,6 +184,7 @@ The generator will build:
 - `ip prefix-list PL-BGP-IN ...`
 - `ip prefix-list PL-BGP-OUT ...`
 - and apply `RM-BGP-IN`/`RM-BGP-OUT` to every neighbor.
+
 
 ## EasyTier
 
