@@ -15,6 +15,7 @@
 
 - EasyTier: restart process
 - OpenVPN: start/stop per instance
+- WireGuard: start/stop per instance
 - FRR: generate config and apply via `vtysh -f`
 - Clash: pull subscription, write config, `SIGHUP`
   - When mode is `tproxy`, iptables/policy-routing are applied **after FRR is ready**.

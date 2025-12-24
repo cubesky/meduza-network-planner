@@ -95,6 +95,51 @@ Notes:
 - `secret/ca/cert/key/tls_auth/tls_crypt` 只能使用 inline 内容。
 
 
+## WireGuard
+
+Schema (per instance):
+
+```
+/nodes/<NODE_ID>/wireguard/<NAME>/enable                # "true" | "false"
+/nodes/<NODE_ID>/wireguard/<NAME>/dev                   # optional, default: wg-<NAME> or wg<digit>
+/nodes/<NODE_ID>/wireguard/<NAME>/private_key
+/nodes/<NODE_ID>/wireguard/<NAME>/listen_port
+
+# Optional interface settings:
+/nodes/<NODE_ID>/wireguard/<NAME>/address               # newline-separated
+/nodes/<NODE_ID>/wireguard/<NAME>/mtu
+/nodes/<NODE_ID>/wireguard/<NAME>/dns                   # newline-separated
+
+/nodes/<NODE_ID>/wireguard/<NAME>/peer/<PEER>/public_key
+/nodes/<NODE_ID>/wireguard/<NAME>/peer/<PEER>/allowed_ips      # newline-separated
+/nodes/<NODE_ID>/wireguard/<NAME>/peer/<PEER>/endpoint
+/nodes/<NODE_ID>/wireguard/<NAME>/peer/<PEER>/persistent_keepalive
+/nodes/<NODE_ID>/wireguard/<NAME>/peer/<PEER>/preshared_key
+
+# BGP transport over WireGuard:
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_asn
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_ip
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/update_source     # ignored (auto from dev)
+```
+
+Status reporting:
+
+```
+/updated/<NODE_ID>/wireguard/<NAME>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
+```
+
+States: `up` | `connecting` | `down`
+
+ENV:
+- `WIREGUARD_STATUS_INTERVAL` (seconds, default `10`)
+
+Notes:
+- `private_key/preshared_key` 只能使用 inline 内容。
+- WireGuard `Table` is forced to `off`, and `PreUp/PostUp/PreDown/PostDown` are auto-generated to no-op.
+- WireGuard does not manage routes; routing is handled by FRR.
+- If `allowed_ips` is empty, it defaults to `0.0.0.0/0`.
+
+
 ## Global BGP filter (shared for all neighbors)
 
 FRR requires per-neighbor policy to establish sessions. This project applies the **same** inbound/outbound policy

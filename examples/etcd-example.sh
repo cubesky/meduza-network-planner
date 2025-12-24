@@ -54,6 +54,19 @@ etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/secret "INLINE_SECRET"
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_asn 65001
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/bgp/peer_ip 10.8.0.1
 
+# WireGuard (new schema)
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/enable true
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/dev wg0
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/private_key "INLINE_PRIVATE_KEY"
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/address "10.9.0.2/32"
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/listen_port 51820
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/public_key "PEER_PUBLIC_KEY"
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/allowed_ips "10.9.0.1/32"
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/endpoint "wg.example.com:51820"
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/peer/peer-1/persistent_keepalive 25
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/peer_asn 65002
+etcdctl put /nodes/${NODE_ID}/wireguard/wg-name/bgp/peer_ip 10.9.0.1
+
 # Global BGP filter policy (shared for all neighbors)
 etcdctl put /global/bgp/filter/in  $'deny 0.0.0.0/0\npermit 0.0.0.0/0 le 32'
 etcdctl put /global/bgp/filter/out $'permit 0.0.0.0/0 le 32'

@@ -30,6 +30,7 @@ UPDATE_ONLINE_KEY = f"{UPDATE_BASE}/online"  # TTL key
 
 UPDATE_TTL_SECONDS = int(os.environ.get("UPDATE_TTL_SECONDS", "60"))
 OPENVPN_STATUS_INTERVAL = int(os.environ.get("OPENVPN_STATUS_INTERVAL", "10"))
+WIREGUARD_STATUS_INTERVAL = int(os.environ.get("WIREGUARD_STATUS_INTERVAL", "10"))
 
 
 def sha(obj: Any) -> str:
@@ -154,6 +155,11 @@ _online_lease: Optional[Any] = None
 _ovpn_lock = threading.Lock()
 _ovpn_cfg_names: List[str] = []
 _ovpn_devs: Dict[str, str] = {}
+
+# WireGuard status
+_wg_lock = threading.Lock()
+_wg_cfg_names: List[str] = []
+_wg_devs: Dict[str, str] = {}
 
 
 def ensure_online_lease():
@@ -468,6 +474,100 @@ def openvpn_status_loop():
             _write_openvpn_status(name, status)
 
 
+def _wg_status_key(name: str) -> str:
+    return f"{UPDATE_BASE}/wireguard/{name}/status"
+
+
+def _compute_wireguard_status(name: str, dev: str) -> str:
+    state = _supervisor_status(f"wireguard-{name}")
+    if state != "RUNNING":
+        return "down"
+    if _iface_exists(dev):
+        return "up"
+    return "connecting"
+
+
+def _write_wireguard_status(name: str, status: str) -> None:
+    try:
+        _etcd_call(lambda: etcd.put(_wg_status_key(name), f"{status} {now_utc_iso()}"))
+    except Exception as e:
+        print(f"[wireguard-status] failed to write {name}: {e}", flush=True)
+
+
+def _wireguard_program_conf(name: str, dev: str) -> str:
+    return "\n".join([
+        f"[program:wireguard-{name}]",
+        f"command=/usr/local/bin/run-wireguard.sh {dev}",
+        "autostart=true",
+        "autorestart=true",
+        f"stdout_logfile=/var/log/wireguard.{name}.out.log",
+        f"stderr_logfile=/var/log/wireguard.{name}.err.log",
+        "stdout_logfile_maxbytes=10MB",
+        "stdout_logfile_backups=5",
+        "stderr_logfile_maxbytes=10MB",
+        "stderr_logfile_backups=5",
+        "",
+    ])
+
+
+def reload_wireguard(node: Dict[str, str]) -> Tuple[bool, List[str]]:
+    payload = {"node_id": NODE_ID, "node": node, "global": {}, "all_nodes": {}}
+    out = _run_generator("gen_wireguard", payload)
+    instances = out.get("instances", [])
+    enabled: List[str] = []
+    changed = False
+
+    with _wg_lock:
+        _wg_cfg_names.clear()
+        _wg_devs.clear()
+
+    active = set()
+    for inst in instances:
+        name = inst["name"]
+        dev = inst["dev"]
+        cfg = inst["config"]
+        active.add(name)
+        enabled.append(name)
+        _wg_devs[name] = dev
+        if _write_if_changed(f"/etc/wireguard/{dev}.conf", cfg, mode=0o600):
+            changed = True
+        if _write_if_changed(f"/etc/supervisor/conf.d/wireguard-{name}.conf", _wireguard_program_conf(name, dev)):
+            changed = True
+
+    with _wg_lock:
+        _wg_cfg_names.extend(sorted(enabled))
+
+    for path in glob.glob("/etc/supervisor/conf.d/wireguard-*.conf"):
+        name = os.path.basename(path).split("wireguard-")[-1].split(".conf")[0]
+        if name not in active:
+            try:
+                os.remove(path)
+                changed = True
+            except Exception:
+                pass
+
+    _supervisorctl(["reread"])
+    _supervisorctl(["update"])
+
+    for name in enabled:
+        _supervisor_restart(f"wireguard-{name}")
+        _write_wireguard_status(name, "connecting")
+
+    return changed, sorted(enabled)
+
+
+def wireguard_status_loop():
+    while True:
+        time.sleep(max(3, WIREGUARD_STATUS_INTERVAL))
+        with _wg_lock:
+            names = list(_wg_cfg_names)
+        for name in names:
+            with _wg_lock:
+                dev = _wg_devs.get(name) or _wg_dev_name(name)
+            status = _compute_wireguard_status(name, dev)
+            _write_wireguard_status(name, status)
+
+
 def monitor_children_loop():
     backoffs: Dict[str, Backoff] = {}
     next_time: Dict[str, float] = {}
@@ -613,6 +713,10 @@ def _ovpn_dev_name(name: str) -> str:
     return f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
 
 
+def _wg_dev_name(name: str) -> str:
+    return f"wg{name[-1]}" if name and name[-1].isdigit() else f"wg-{name}"
+
+
 def _clash_exclude_ifaces(node: Dict[str, str]) -> List[str]:
     out: List[str] = []
     et_dev = node.get(f"/nodes/{NODE_ID}/easytier/dev_name", "")
@@ -631,6 +735,15 @@ def _clash_exclude_ifaces(node: Dict[str, str]) -> List[str]:
         name = k[len(base):].split("/", 1)[0]
         dev = node.get(f"{base}{name}/dev", "")
         out.append(dev or _ovpn_dev_name(name))
+    base = f"/nodes/{NODE_ID}/wireguard/"
+    for k, v in node.items():
+        if not k.startswith(base) or not k.endswith("/enable"):
+            continue
+        if v != "true":
+            continue
+        name = k[len(base):].split("/", 1)[0]
+        dev = node.get(f"{base}{name}/dev", "")
+        out.append(dev or _wg_dev_name(name))
     return sorted(set(out))
 
 
@@ -691,6 +804,16 @@ def _clash_exclude_ports(node: Dict[str, str], global_cfg: Dict[str, str]) -> Li
             continue
         name = k[len(base):].split("/", 1)[0]
         p = _parse_port(node.get(f"{base}{name}/port", ""))
+        if p:
+            ports.add(p)
+    base = f"/nodes/{NODE_ID}/wireguard/"
+    for k, v in node.items():
+        if not k.startswith(base) or not k.endswith("/enable"):
+            continue
+        if v != "true":
+            continue
+        name = k[len(base):].split("/", 1)[0]
+        p = _parse_port(node.get(f"{base}{name}/listen_port", ""))
         if p:
             ports.add(p)
 
@@ -847,9 +970,18 @@ def handle_commit() -> None:
                 dev = _ovpn_devs.get(name) or (f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}")
             _write_openvpn_status(name, _compute_openvpn_status(name, dev))
 
+    wireguard_domain = {k: v for k, v in node.items() if "/wireguard/" in k}
+    if changed("wireguard", wireguard_domain):
+        changed_wg, enabled = reload_wireguard(node)
+        did_apply = did_apply or changed_wg
+        for name in enabled:
+            with _wg_lock:
+                dev = _wg_devs.get(name) or _wg_dev_name(name)
+            _write_wireguard_status(name, _compute_wireguard_status(name, dev))
+
     # FRR depends on node routing config + global BGP filter policy
     frr_material = {k: v for k, v in node.items() if (
-        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k
+        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k or "/wireguard/" in k
     )}
     global_bgp_filter = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/filter/")}
     if changed("frr", {"node": frr_material, "global_bgp_filter": global_bgp_filter}):
@@ -964,6 +1096,7 @@ def periodic_reconcile_loop() -> None:
 def main() -> None:
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
+    threading.Thread(target=wireguard_status_loop, daemon=True).start()
     threading.Thread(target=monitor_children_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()

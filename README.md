@@ -4,7 +4,7 @@ Meduza 是一个单容器的边缘网关，使用 etcd 作为唯一配置源，�
 
 - EasyTier 或 Tinc（覆盖网络，二选一）
 - FRR（OSPF + BGP 路由分发）
-- OpenVPN（对外互联）
+- OpenVPN / WireGuard（对外互联）
 - Clash Meta（透明代理）
 - MosDNS（外部调用的 DNS 服务）
 
@@ -50,10 +50,11 @@ docker compose up -d
 /updated/<NODE_ID>/<tool>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
 ```
 
-OpenVPN 多实例状态：
+OpenVPN / WireGuard 多实例状态：
 
 ```
 /updated/<NODE_ID>/openvpn/<NAME>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
+/updated/<NODE_ID>/wireguard/<NAME>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
 ```
 
 ## 目录结构

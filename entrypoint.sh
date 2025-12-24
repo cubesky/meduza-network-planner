@@ -3,8 +3,8 @@ set -euo pipefail
 
 : "${NODE_ID:?NODE_ID required}"
 
-mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc
-mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns
+mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc /run/wireguard
+mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
 mkdir -p /etc/supervisor/conf.d
 
 # Ensure stable DNS before services start.

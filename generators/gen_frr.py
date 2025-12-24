@@ -10,6 +10,10 @@ def _ovpn_dev_name(name: str) -> str:
     return f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}"
 
 
+def _wg_dev_name(name: str) -> str:
+    return f"wg{name[-1]}" if name and name[-1].isdigit() else f"wg-{name}"
+
+
 def _parse_prefix_list_rules(multiline: str) -> List[Tuple[str, str]]:
     rules: List[Tuple[str, str]] = []
     if not multiline:
@@ -45,8 +49,29 @@ def _parse_openvpn(node_id: str, node: Dict[str, str]) -> Dict[str, Dict[str, st
     return out
 
 
-def _node_is_exit(ovpn: Dict[str, Dict[str, str]]) -> bool:
+def _parse_wireguard(node_id: str, node: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    base = f"/nodes/{node_id}/wireguard/"
+    out: Dict[str, Dict[str, str]] = {}
+    for k, v in node.items():
+        if not k.startswith(base):
+            continue
+        rest = k[len(base):]
+        parts = rest.split("/", 1)
+        if len(parts) != 2:
+            continue
+        name, tail = parts
+        out.setdefault(name, {})
+        out[name][tail] = v
+    return out
+
+
+def _node_is_exit(ovpn: Dict[str, Dict[str, str]], wg: Dict[str, Dict[str, str]]) -> bool:
     for cfg in ovpn.values():
+        if cfg.get("enable") != "true":
+            continue
+        if cfg.get("bgp/peer_ip") and cfg.get("bgp/peer_asn"):
+            return True
+    for cfg in wg.values():
         if cfg.get("enable") != "true":
             continue
         if cfg.get("bgp/peer_ip") and cfg.get("bgp/peer_asn"):
@@ -78,11 +103,26 @@ def _internal_bgp_neighbors(
         if not router_id:
             continue
         ovpn = _parse_openvpn(nid, data)
+        wg = _parse_wireguard(nid, data)
         out[nid] = {
             "router_id": router_id,
-            "is_exit": "true" if _node_is_exit(ovpn) else "false",
+            "is_exit": "true" if _node_is_exit(ovpn, wg) else "false",
             "name": nid,
         }
+    return out
+
+
+def _iter_bgp_transports(
+    ovpn: Dict[str, Dict[str, str]],
+    wg: Dict[str, Dict[str, str]],
+) -> List[Tuple[str, str, Dict[str, str], str]]:
+    out: List[Tuple[str, str, Dict[str, str], str]] = []
+    for name, cfg in ovpn.items():
+        dev = cfg.get("dev", "") or _ovpn_dev_name(name)
+        out.append(("openvpn", name, cfg, dev))
+    for name, cfg in wg.items():
+        dev = cfg.get("dev", "") or _wg_dev_name(name)
+        out.append(("wireguard", name, cfg, dev))
     return out
 
 
@@ -220,16 +260,18 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             lines.append(f" bgp router-id {router_id}")
 
         ovpn = _parse_openvpn(node_id, node)
-        self_is_exit = _node_is_exit(ovpn)
-        for name, cfg in ovpn.items():
+        wg = _parse_wireguard(node_id, node)
+        self_is_exit = _node_is_exit(ovpn, wg)
+        for kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
             if cfg.get("enable") != "true":
                 continue
             peer_ip = cfg.get("bgp/peer_ip", "")
             peer_asn = cfg.get("bgp/peer_asn", "")
-            update_source = cfg.get("bgp/update_source", "") or cfg.get("dev", "") or _ovpn_dev_name(name)
+            update_source = dev if kind == "wireguard" else (cfg.get("bgp/update_source", "") or dev)
             if peer_ip and peer_asn and update_source:
+                desc = name if kind == "openvpn" else f"wg-{name}"
                 lines.append(f" neighbor {peer_ip} remote-as {peer_asn}")
-                lines.append(f" neighbor {peer_ip} description {name}")
+                lines.append(f" neighbor {peer_ip} description {desc}")
                 lines.append(f" neighbor {peer_ip} update-source {update_source}")
         ibgp_neighbors: List[Dict[str, str]] = []
         if internal_routing == "bgp":
@@ -249,12 +291,12 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"  network {pfx}")
         if ospf_enable:
             lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
-        for name, cfg in ovpn.items():
+        for _kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
             if cfg.get("enable") != "true":
                 continue
             peer_ip = cfg.get("bgp/peer_ip", "")
             peer_asn = cfg.get("bgp/peer_asn", "")
-            update_source = cfg.get("bgp/update_source", "") or cfg.get("dev", "") or _ovpn_dev_name(name)
+            update_source = dev if _kind == "wireguard" else (cfg.get("bgp/update_source", "") or dev)
             if peer_ip and peer_asn and update_source:
                 lines.append(f"  neighbor {peer_ip} activate")
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
