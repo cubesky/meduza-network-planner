@@ -31,6 +31,7 @@ UPDATE_ONLINE_KEY = f"{UPDATE_BASE}/online"  # TTL key
 UPDATE_TTL_SECONDS = int(os.environ.get("UPDATE_TTL_SECONDS", "60"))
 OPENVPN_STATUS_INTERVAL = int(os.environ.get("OPENVPN_STATUS_INTERVAL", "10"))
 WIREGUARD_STATUS_INTERVAL = int(os.environ.get("WIREGUARD_STATUS_INTERVAL", "10"))
+SUPERVISOR_RETRY_INTERVAL = int(os.environ.get("SUPERVISOR_RETRY_INTERVAL", "30"))
 
 
 def sha(obj: Any) -> str:
@@ -339,6 +340,20 @@ def _supervisor_status(name: str) -> str:
     return parts[1]
 
 
+def _supervisor_status_all() -> Dict[str, str]:
+    cp = _supervisorctl(["status"])
+    if cp.returncode != 0:
+        return {}
+    out: Dict[str, str] = {}
+    for line in cp.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        name, state = parts[0], parts[1]
+        out[name] = state
+    return out
+
+
 def _supervisor_start(name: str) -> None:
     _supervisorctl(["start", name])
 
@@ -613,6 +628,36 @@ def monitor_children_loop():
                                 on_fail(key)
 
             # OpenVPN instances are managed by supervisord now.
+        except Exception:
+            continue
+
+
+def supervisor_retry_loop():
+    backoffs: Dict[str, Backoff] = {}
+    next_time: Dict[str, float] = {}
+    while True:
+        time.sleep(max(5, SUPERVISOR_RETRY_INTERVAL))
+        try:
+            statuses = _supervisor_status_all()
+            now = time.time()
+            for name, state in statuses.items():
+                if name == "watcher":
+                    continue
+                if state != "FATAL":
+                    if name in backoffs:
+                        backoffs[name].reset()
+                        next_time[name] = 0
+                    continue
+                if now < next_time.get(name, 0):
+                    continue
+                if name == "mosdns":
+                    _supervisor_stop(name)
+                    time.sleep(2)
+                    _supervisor_start(name)
+                else:
+                    _supervisor_restart(name)
+                b = backoffs.setdefault(name, Backoff())
+                next_time[name] = now + b.next_sleep()
         except Exception:
             continue
 
@@ -1098,6 +1143,7 @@ def main() -> None:
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
     threading.Thread(target=wireguard_status_loop, daemon=True).start()
     threading.Thread(target=monitor_children_loop, daemon=True).start()
+    threading.Thread(target=supervisor_retry_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
 
