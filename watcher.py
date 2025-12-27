@@ -145,6 +145,12 @@ _clash_refresh_enable = False
 _clash_refresh_interval = 0
 _clash_refresh_next = 0.0
 
+# tproxy iptables check state
+_tproxy_check_lock = threading.Lock()
+_tproxy_check_enabled = False
+_tproxy_check_interval = 60  # 1 minute default
+_cached_tproxy_exclude: List[str] = []
+
 # reconcile lock
 _reconcile_lock = threading.Lock()
 
@@ -420,10 +426,10 @@ def _openvpn_program_conf(name: str, dev: str) -> str:
         "autorestart=true",
         f"stdout_logfile=/var/log/openvpn.{name}.out.log",
         f"stderr_logfile=/var/log/openvpn.{name}.err.log",
-        "stdout_logfile_maxbytes=10MB",
-        "stdout_logfile_backups=5",
-        "stderr_logfile_maxbytes=10MB",
-        "stderr_logfile_backups=5",
+        "stdout_logfile_maxbytes=5MB",
+        "stdout_logfile_backups=2",
+        "stderr_logfile_maxbytes=5MB",
+        "stderr_logfile_backups=2",
         "",
     ])
 
@@ -517,10 +523,10 @@ def _wireguard_program_conf(name: str, dev: str) -> str:
         "autorestart=true",
         f"stdout_logfile=/var/log/wireguard.{name}.out.log",
         f"stderr_logfile=/var/log/wireguard.{name}.err.log",
-        "stdout_logfile_maxbytes=10MB",
-        "stdout_logfile_backups=5",
-        "stderr_logfile_maxbytes=10MB",
-        "stderr_logfile_backups=5",
+        "stdout_logfile_maxbytes=5MB",
+        "stdout_logfile_backups=2",
+        "stderr_logfile_maxbytes=5MB",
+        "stderr_logfile_backups=2",
         "",
     ])
 
@@ -683,7 +689,9 @@ def clash_refresh_loop():
             global_cfg = load_prefix("/global/")
             payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
             out = _run_generator("gen_clash", payload)
+            # Hot reload: update config and send HUP signal instead of restarting
             reload_clash(out["config_yaml"])
+            print(f"[clash-refresh] hot reload completed (HUP signal sent)", flush=True)
             if out["mode"] == "tproxy":
                 tproxy_apply(
                     out["tproxy_exclude"],
@@ -885,6 +893,104 @@ def tproxy_remove() -> None:
     run(f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 /usr/local/bin/tproxy.sh remove")
 
 
+def _get_cached_tproxy_exclude() -> List[str]:
+    """Get the cached tproxy exclude list."""
+    return list(_cached_tproxy_exclude)
+
+
+def _set_cached_tproxy_exclude(exclude: List[str]) -> None:
+    """Cache the tproxy exclude list."""
+    global _cached_tproxy_exclude
+    _cached_tproxy_exclude = list(exclude)
+
+
+def _check_tproxy_iptables() -> bool:
+    """Check if tproxy iptables rules are correctly applied."""
+    try:
+        # Check if CLASH_TPROXY chain exists in mangle table
+        cp = subprocess.run(
+            ["iptables", "-t", "mangle", "-L", "CLASH_TPROXY"],
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode != 0:
+            return False
+
+        # Check if PREROUTING chain jumps to CLASH_TPROXY
+        cp = subprocess.run(
+            ["iptables", "-t", "mangle", "-L", "PREROUTING"],
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode != 0:
+            return False
+
+        if "CLASH_TPROXY" not in cp.stdout:
+            return False
+
+        # Check ip rule
+        cp = subprocess.run(
+            ["ip", "rule", "list"],
+            capture_output=True,
+            text=True,
+        )
+        if "fwmark 0x1" not in cp.stdout:
+            return False
+
+        return True
+    except Exception as e:
+        print(f"[tproxy-check] error checking iptables: {e}", flush=True)
+        return False
+
+
+def _fix_tproxy_iptables(
+    exclude_dst: List[str],
+    exclude_src: List[str],
+    exclude_ifaces: List[str],
+    exclude_ports: List[str],
+) -> None:
+    """Fix tproxy iptables rules by reapplying them."""
+    try:
+        print(f"[tproxy-check] reapplying iptables rules", flush=True)
+        tproxy_apply(exclude_dst, exclude_src, exclude_ifaces, exclude_ports)
+        print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
+    except Exception as e:
+        print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
+
+
+def tproxy_check_loop() -> None:
+    """Periodically check tproxy iptables rules and fix if needed."""
+    global tproxy_enabled, _tproxy_check_enabled, _tproxy_check_interval
+
+    while True:
+        time.sleep(_tproxy_check_interval)
+        try:
+            with _tproxy_check_lock:
+                enabled = _tproxy_check_enabled
+            if not enabled or not tproxy_enabled:
+                continue
+
+            if _check_tproxy_iptables():
+                continue
+
+            # Rules are missing or incorrect, reapply them
+            print(f"[tproxy-check] tproxy iptables rules missing or incorrect, fixing...", flush=True)
+
+            # Load current configuration
+            node = load_prefix(f"/nodes/{NODE_ID}/")
+            global_cfg = load_prefix("/global/")
+
+            # Reapply tproxy rules
+            _fix_tproxy_iptables(
+                _get_cached_tproxy_exclude(),
+                _clash_exclude_src(node),
+                _clash_exclude_ifaces(node),
+                _clash_exclude_ports(node, global_cfg),
+            )
+        except Exception as e:
+            print(f"[tproxy-check] error: {e}", flush=True)
+
+
 # ---------- MosDNS ----------
 def _write_mosdns_rules_json(rules: Dict[str, str]) -> Optional[str]:
     if not rules:
@@ -968,6 +1074,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 def handle_commit() -> None:
     global reconcile_force, tproxy_enabled
     global _clash_refresh_enable, _clash_refresh_interval, _clash_refresh_next
+    global _tproxy_check_enabled
 
     node = load_prefix(f"/nodes/{NODE_ID}/")
     global_cfg = load_prefix("/global/")
@@ -1046,6 +1153,8 @@ def handle_commit() -> None:
             tproxy_enabled = False
             with _clash_refresh_lock:
                 _clash_refresh_enable = False
+            with _tproxy_check_lock:
+                _tproxy_check_enabled = False
         else:
             payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
             out = _run_generator("gen_clash", payload)
@@ -1058,11 +1167,16 @@ def handle_commit() -> None:
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
                 )
+                _set_cached_tproxy_exclude(out["tproxy_exclude"])
                 tproxy_enabled = True
+                with _tproxy_check_lock:
+                    _tproxy_check_enabled = True
             else:
                 if tproxy_enabled:
                     tproxy_remove()
                     tproxy_enabled = False
+                with _tproxy_check_lock:
+                    _tproxy_check_enabled = False
             with _clash_refresh_lock:
                 _clash_refresh_enable = out["refresh_enable"]
                 _clash_refresh_interval = max(0, int(out["refresh_interval_minutes"]))
@@ -1145,6 +1259,7 @@ def main() -> None:
     threading.Thread(target=monitor_children_loop, daemon=True).start()
     threading.Thread(target=supervisor_retry_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
+    threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
 
     publish_update("startup")
