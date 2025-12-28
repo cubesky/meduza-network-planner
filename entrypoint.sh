@@ -8,10 +8,7 @@ mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
 mkdir -p /etc/supervisor/conf.d
 
 # Ensure stable DNS before services start.
-cat >/etc/resolv.conf <<'EOF'
-nameserver 223.5.5.5
-nameserver 223.6.6.6
-EOF
+/usr/local/bin/run-dns-monitor.sh --once
 
 chown -R frr:frr /etc/frr
 chmod 640 /etc/frr/* || true
