@@ -107,7 +107,7 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
     host_mode = node.get(f"/nodes/{node_id}/tinc/host_mode", "")
     host_cipher = node.get(f"/nodes/{node_id}/tinc/host_cipher", "")
     host_digest = node.get(f"/nodes/{node_id}/tinc/host_digest", "")
-    conf_mode = node.get(f"/nodes/{node_id}/tinc/mode", "router")
+    conf_mode = node.get(f"/nodes/{node_id}/tinc/mode", "switch")
     conf_cipher = global_cfg.get("/global/tinc/cipher", "")
     conf_digest = global_cfg.get("/global/tinc/digest", "")
     pubkey = node.get(f"/nodes/{node_id}/tinc/public_key", "")
@@ -196,12 +196,10 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         f"Name={name}",
         f"AddressFamily={address_family}",
         f"Mode={conf_mode}",
-        "DeviceType=tun",
+        "DeviceType=tap",
         f"Interface={dev_name}",
         f"Port={port}",
         "TCPOnly=yes",
-        "Forwarding=kernel",
-        "MTU=1400",
     ]
     if conf_cipher:
         tinc_conf.append(f"Cipher={conf_cipher}")
