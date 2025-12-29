@@ -250,6 +250,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         for iface in active_ifaces:
             lines.append(f"interface {iface}")
             lines.append(f" ip ospf area {ospf_area}")
+            lines.append(" ip ospf network point-to-point")
             lines.append(" no ip ospf passive")
             lines.append("!")
         lines.append("router ospf")

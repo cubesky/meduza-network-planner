@@ -61,7 +61,6 @@ def generate_config(node_id: str, node: Dict[str, str], global_cfg: Dict[str, st
         config["mapped_listeners"] = mapped_listeners
     config["rpc_portal"] = "0.0.0.0:0"
 
-    config["flags"]["proxy_forward_by_system"] = True
     config["proxy_network"] = [{"cidr": "0.0.0.0/0"}]
 
     args = [
