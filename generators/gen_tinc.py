@@ -40,7 +40,6 @@ def _normalize_tinc_pubkey(pubkey: str, ed25519: str) -> str:
 def _tinc_host_content(
     address: str,
     port: str,
-    subnets: List[str],
     mode: str,
     cipher: str,
     digest: str,
@@ -58,8 +57,6 @@ def _tinc_host_content(
         lines.append(f"Cipher={cipher}")
     if digest:
         lines.append(f"Digest={digest}")
-    for s in subnets:
-        lines.append(f"Subnet={s}")
     key_text = _normalize_tinc_pubkey(pubkey, ed25519)
     host_text = "\n".join(lines + ["", key_text, ""])
     return host_text
@@ -83,7 +80,7 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
     host_mode = node.get(f"/nodes/{node_id}/tinc/host_mode", "")
     host_cipher = node.get(f"/nodes/{node_id}/tinc/host_cipher", "")
     host_digest = node.get(f"/nodes/{node_id}/tinc/host_digest", "")
-    conf_mode = node.get(f"/nodes/{node_id}/tinc/mode", "Switch")
+    conf_mode = node.get(f"/nodes/{node_id}/tinc/mode", "router")
     conf_cipher = global_cfg.get("/global/tinc/cipher", "")
     conf_digest = global_cfg.get("/global/tinc/digest", "")
     pubkey = node.get(f"/nodes/{node_id}/tinc/public_key", "")
@@ -120,7 +117,6 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         host_text = _tinc_host_content(
             peer_addr,
             peer_port,
-            split_ml(peer_subnet),
             peer_host_mode,
             peer_host_cipher,
             peer_host_digest,
@@ -138,7 +134,6 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
     self_host = _tinc_host_content(
         address,
         port,
-        split_ml(subnet),
         host_mode,
         host_cipher,
         host_digest,
@@ -167,10 +162,12 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         f"Name={name}",
         f"AddressFamily={address_family}",
         f"Mode={conf_mode}",
-        "DeviceType=tap",
+        "DeviceType=tun",
         f"Interface={dev_name}",
         f"Port={port}",
         "TCPOnly=yes",
+        "Forwarding=kernel",
+        "MTU=1400",
     ]
     if conf_cipher:
         tinc_conf.append(f"Cipher={conf_cipher}")
