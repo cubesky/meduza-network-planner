@@ -1,4 +1,4 @@
-FROM debian:12-slim
+FROM docker.utilapi.bid/library/debian:12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
