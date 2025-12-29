@@ -1,6 +1,26 @@
 from typing import Any, Dict, List
+import ipaddress
 
 from common import read_input, write_output, split_ml
+
+
+def _ipv4_to_subnet(ipv4: str) -> List[str]:
+    """Convert ipv4 CIDR to list of /32 host routes for tinc Subnet entries."""
+    if not ipv4:
+        return []
+    subnets = []
+    for line in split_ml(ipv4):
+        try:
+            network = ipaddress.ip_network(line, strict=False)
+            # For point-to-point links, use /32 for individual IPs
+            if network.prefixlen == 32:
+                subnets.append(str(network))
+            else:
+                # For larger subnets, advertise the whole network
+                subnets.append(str(network))
+        except ValueError:
+            continue
+    return subnets
 
 
 def _parse_tinc_nodes(nodes: Dict[str, str]) -> Dict[str, Dict[str, str]]:
@@ -40,6 +60,7 @@ def _normalize_tinc_pubkey(pubkey: str, ed25519: str) -> str:
 def _tinc_host_content(
     address: str,
     port: str,
+    subnets: List[str],
     mode: str,
     cipher: str,
     digest: str,
@@ -57,6 +78,8 @@ def _tinc_host_content(
         lines.append(f"Cipher={cipher}")
     if digest:
         lines.append(f"Digest={digest}")
+    for s in subnets:
+        lines.append(f"Subnet={s}")
     key_text = _normalize_tinc_pubkey(pubkey, ed25519)
     host_text = "\n".join(lines + ["", key_text, ""])
     return host_text
@@ -77,6 +100,10 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
     address_family = node.get(f"/nodes/{node_id}/tinc/address_family", "ipv4")
     ipv4 = node.get(f"/nodes/{node_id}/tinc/ipv4", "")
     subnet = node.get(f"/nodes/{node_id}/tinc/subnet", "")
+    # If subnet is not explicitly set, auto-generate from ipv4
+    if not subnet and ipv4:
+        auto_subnets = _ipv4_to_subnet(ipv4)
+        subnet = "\n".join(auto_subnets)
     host_mode = node.get(f"/nodes/{node_id}/tinc/host_mode", "")
     host_cipher = node.get(f"/nodes/{node_id}/tinc/host_cipher", "")
     host_digest = node.get(f"/nodes/{node_id}/tinc/host_digest", "")
@@ -107,6 +134,11 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         peer_addr = cfg.get("address", "")
         peer_port = cfg.get("port", "")
         peer_subnet = cfg.get("subnet", "")
+        peer_ipv4 = cfg.get("ipv4", "")
+        # If subnet is not explicitly set, auto-generate from ipv4
+        if not peer_subnet and peer_ipv4:
+            auto_subnets = _ipv4_to_subnet(peer_ipv4)
+            peer_subnet = "\n".join(auto_subnets)
         peer_host_mode = cfg.get("host_mode", "")
         peer_host_cipher = cfg.get("host_cipher", "")
         peer_host_digest = cfg.get("host_digest", "")
@@ -117,6 +149,7 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
         host_text = _tinc_host_content(
             peer_addr,
             peer_port,
+            split_ml(peer_subnet),
             peer_host_mode,
             peer_host_cipher,
             peer_host_digest,
@@ -134,6 +167,7 @@ def generate_tinc(node_id: str, node: Dict[str, str], all_nodes: Dict[str, str],
     self_host = _tinc_host_content(
         address,
         port,
+        split_ml(subnet),
         host_mode,
         host_cipher,
         host_digest,
