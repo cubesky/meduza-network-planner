@@ -288,13 +288,16 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         for iface in active_ifaces:
             lines.append(f"interface {iface}")
             lines.append(f" ip ospf area {ospf_area}")
-            lines.append(" ip ospf network point-to-point")
-            lines.append(" no ip ospf passive")
+            lines.append(" ip ospf network broadcast")
             lines.append("!")
         lines.append("router ospf")
         if router_id:
             lines.append(f" ospf router-id {router_id}")
-        lines.append(" passive-interface default")
+        # Passive all interfaces except active_ifaces
+        if active_ifaces:
+            lines.append(" passive-interface default")
+            for iface in active_ifaces:
+                lines.append(f" no passive-interface {iface}")
         # Redistribute connected routes and filter by prefix lists
         # FRR will only advertise routes that are actually in the routing table
         if lans:
