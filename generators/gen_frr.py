@@ -385,8 +385,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-INTERNAL out")
             else:
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
-            if self_is_exit and info.get("is_exit") != "true":
-                lines.append(f"  neighbor {peer_ip} next-hop-self")
+            # Always use next-hop-self for iBGP to ensure proper route propagation
+            # This ensures all routes learned from eBGP are properly redistributed within the mesh
+            lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]
 
