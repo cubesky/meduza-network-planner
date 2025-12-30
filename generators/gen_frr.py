@@ -159,6 +159,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             elif line:
                 bgp_transit_as_list.add(line)
 
+    # Parse BGP edge broadcast prefixes (newline-separated)
+    bgp_edge_broadcast = sorted(set(split_ml(global_cfg.get("/global/bgp/edge_broadcast", ""))))
+
     if internal_routing == "bgp":
         ospf_enable = False
 
@@ -345,6 +348,10 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             lines.append(f"  network {pfx}")
         if internal_routing == "bgp":
             for pfx in private_lans:
+                lines.append(f"  network {pfx}")
+        # Broadcast edge prefixes if this node is an exit node
+        if self_is_exit and bgp_edge_broadcast:
+            for pfx in bgp_edge_broadcast:
                 lines.append(f"  network {pfx}")
         if ospf_enable:
             lines.append("  redistribute ospf route-map RM-OSPF-TO-BGP")
