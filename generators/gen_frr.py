@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Set
 
 from common import read_input, write_output, split_ml, node_lans
 
@@ -143,8 +143,22 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
     local_as = node.get(f"/nodes/{node_id}/bgp/local_asn", "")
     max_paths = node.get(f"/nodes/{node_id}/bgp/max_paths", "1")
     to_ospf_default_only = node.get(f"/nodes/{node_id}/bgp/to_ospf/default_only") == "true"
-    ospf_redistribute_bgp = node.get(f"/nodes/{node_id}/ospf/redistribute_bgp") == "true"
-    inject_site_lan = node.get(f"/nodes/{node_id}/ospf/inject_site_lan") == "true"
+    ospf_redistribute_bgp = node.get(f"/nodes/{node_id}/ospf/redistribute_bgp", "true") == "true"
+    inject_site_lan = node.get(f"/nodes/{node_id}/ospf/inject_site_lan", "true") == "true"
+    inject_private_lan = node.get(f"/nodes/{node_id}/ospf/inject_private_lan", "true") == "true"
+
+    # Parse BGP transit AS list (newline-separated, '*' means allow all)
+    bgp_transit_raw = global_cfg.get("/global/bgp/transit", "")
+    bgp_transit_as_list: Set[str] = set()
+    bgp_transit_all = False
+    if bgp_transit_raw:
+        for line in split_ml(bgp_transit_raw):
+            line = line.strip()
+            if line == "*":
+                bgp_transit_all = True
+            elif line:
+                bgp_transit_as_list.add(line)
+
     if internal_routing == "bgp":
         ospf_enable = False
 
@@ -169,8 +183,8 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             if k.startswith(f"/nodes/{node_id}/ospf/active_ifaces/")
         })
 
-    lans = node_lans(node, node_id)
-    private_lans = sorted(set(split_ml(node.get(f"/nodes/{node_id}/private_lan", ""))))
+    lans = node_lans(node, node_id) if inject_site_lan else []
+    private_lans = sorted(set(split_ml(node.get(f"/nodes/{node_id}/private_lan", "")))) if inject_private_lan else []
 
     lines: List[str] = [
         "frr defaults traditional",
@@ -182,14 +196,28 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
     lines += ["", "ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0", ""]
 
-    if inject_site_lan and (lans or private_lans):
+    # Prefix lists for LAN and private LAN for OSPF redistribution
+    # FRR will redistribute connected routes and filter by these prefix lists
+    # Only routes that are actually connected (in routing table) will be advertised
+    if lans:
         seq = 10
-        for pfx in lans + private_lans:
+        for pfx in lans:
             lines.append(f"ip prefix-list PL-OSPF-LAN seq {seq} permit {pfx}")
             seq += 10
         lines.append("")
         lines.append("route-map RM-OSPF-CONN permit 10")
         lines.append(" match ip address prefix-list PL-OSPF-LAN")
+        lines.append("!")
+        lines.append("")
+
+    if private_lans:
+        seq = 10
+        for pfx in private_lans:
+            lines.append(f"ip prefix-list PL-OSPF-PRIVATE-LAN seq {seq} permit {pfx}")
+            seq += 10
+        lines.append("")
+        lines.append("route-map RM-OSPF-CONN-PRIVATE permit 10")
+        lines.append(" match ip address prefix-list PL-OSPF-PRIVATE-LAN")
         lines.append("!")
         lines.append("")
 
@@ -218,6 +246,10 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             lines.append(f"ip prefix-list PL-PRIVATE-LAN seq {seq} permit {pfx}")
             seq += 10
         lines.append("")
+
+    # Route maps to prevent private_lan from being advertised to external BGP
+    # Private LAN should only stay within the internal network (OSPF)
+    if private_lans:
         lines.append("route-map RM-BGP-OUT-EXTERNAL deny 5")
         lines.append(" match ip address prefix-list PL-PRIVATE-LAN")
         lines.append("route-map RM-BGP-OUT-EXTERNAL permit 10")
@@ -231,19 +263,25 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         lines.append("!")
         lines.append("")
 
+    # Route map for OSPF to BGP redistribution: exclude private LAN
+    if private_lans:
+        lines.append("route-map RM-OSPF-TO-BGP deny 10")
+        lines.append(" match ip address prefix-list PL-PRIVATE-LAN")
+        lines.append("!")
+
+    lines += [
+        "route-map RM-OSPF-TO-BGP deny 20",
+        f" match tag {TAG_NO_REINJECT}",
+        "!",
+        "route-map RM-OSPF-TO-BGP permit 30",
+        "!",
+        "",
+    ]
+
     lines += ["route-map RM-BGP-TO-OSPF permit 10"]
     if to_ospf_default_only:
         lines.append(" match ip address prefix-list PL-DEFAULT")
     lines += [f" set tag {TAG_NO_REINJECT}", "!", ""]
-
-    lines += [
-        "route-map RM-OSPF-TO-BGP deny 10",
-        f" match tag {TAG_NO_REINJECT}",
-        "!",
-        "route-map RM-OSPF-TO-BGP permit 20",
-        "!",
-        "",
-    ]
 
     if ospf_enable:
         ospf_area = node.get(f"/nodes/{node_id}/ospf/area", "0")
@@ -257,8 +295,13 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         if router_id:
             lines.append(f" ospf router-id {router_id}")
         lines.append(" passive-interface default")
-        if inject_site_lan and lans:
+        # Redistribute connected routes and filter by prefix lists
+        # FRR will only advertise routes that are actually in the routing table
+        if lans:
             lines.append(" redistribute connected route-map RM-OSPF-CONN")
+        if private_lans:
+            lines.append(" redistribute connected route-map RM-OSPF-CONN-PRIVATE")
+        # Redistribute BGP routes into OSPF (external routes from BGP peers)
         if ospf_redistribute_bgp and bgp_enable:
             lines.append(" redistribute bgp route-map RM-BGP-TO-OSPF")
         lines += ["!", ""]
@@ -320,6 +363,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                     lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
                 else:
                     lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                # Enable BGP transit if peer ASN is in the allowed list or '*' is set
+                if bgp_transit_all or (bgp_transit_as_list and peer_asn in bgp_transit_as_list):
+                    lines.append(f"  neighbor {peer_ip} next-hop-self")
 
         for info in ibgp_neighbors:
             peer_ip = info["router_id"]
