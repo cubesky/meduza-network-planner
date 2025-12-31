@@ -380,6 +380,28 @@ def _supervisor_is_running(name: str) -> bool:
     return _supervisor_status(name) == "RUNNING"
 
 
+def _wait_for_dbus(timeout_sec: int = 10) -> bool:
+    """Wait for D-Bus system bus to be ready."""
+    for attempt in range(timeout_sec):
+        try:
+            # Try to communicate with D-Bus
+            cp = subprocess.run(
+                ["dbus-send", "--system", "--dest=org.freedesktop.DBus", "--print-reply", "/org/freedesktop/DBus", "org.freedesktop.DBus.Peer.Ping"],
+                capture_output=True,
+                timeout=2
+            )
+            if cp.returncode == 0:
+                print("[dbus] D-Bus system bus is ready", flush=True)
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if attempt == 0:
+            print("[dbus] Waiting for D-Bus system bus to be ready...", flush=True)
+        time.sleep(1)
+    print("[dbus] WARNING: D-Bus system bus not ready after timeout", flush=True)
+    return False
+
+
 def _easytier_cli_reload() -> bool:
     if not shutil.which("easytier-cli"):
         return False
@@ -1250,6 +1272,10 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     # Check if Clash is enabled to configure dnsmasq accordingly
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
+
+    # Wait for D-Bus to be ready before starting Avahi
+    if not _wait_for_dbus(timeout_sec=10):
+        print("[mosdns] WARNING: D-Bus not ready, Avahi may not work properly", flush=True)
 
     # Start Avahi for mDNS support (D-Bus should already be running)
     _supervisor_restart("avahi")
