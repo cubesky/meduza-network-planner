@@ -116,13 +116,14 @@ def _download_rules(rules: Dict[str, str]) -> None:
 
 ## Frontend DNS with dnsmasq
 
-When MosDNS is enabled, dnsmasq automatically runs as a lightweight frontend DNS server on port 53.
+When MosDNS is enabled, dnsmasq automatically runs as a lightweight frontend DNS server on port 53 with mDNS support.
 
 ### Why dnsmasq?
 
 - **DNS availability during startup**: dnsmasq starts BEFORE MosDNS downloads rule files, ensuring DNS service is always available
 - **Sequential fallback**: Tries multiple DNS servers in order (MosDNS → public DNS)
 - **Hosts file integration**: Uses `/etc/etcd_hosts` for dynamic DNS from etcd
+- **mDNS support**: Integrates with Avahi for Multicast DNS (`.local` hostnames)
 - **Private network support**: Doesn't block private IP results (RFC 1918)
 
 ### Configuration
@@ -136,6 +137,8 @@ The watcher generates `/etc/dnsmasq.conf` with these settings:
   3. `223.5.5.5` (AliDNS public DNS)
   4. `119.29.29.29` (DNSPod public DNS)
 - **Hosts file**: `/etc/etcd_hosts` (dynamic DNS from etcd)
+- **mDNS support**: Enabled via Avahi D-Bus (`enable-dbus=org.freedesktop.Avahi`)
+- **Reverse DNS**: Supported for local networks (`local-ttl=1`)
 - **Private networks**: Not blocked (`bogus-priv`)
 - **No caching**: Cache is handled by upstream DNS servers
 - **Strict ordering**: Queries servers in sequence
@@ -151,17 +154,20 @@ The watcher generates `/etc/dnsmasq.conf` with these settings:
 ### Startup sequence
 
 1. MosDNS enable detected
-2. dnsmasq config written to `/etc/dnsmasq.conf`
-3. dnsmasq started on port 53 (DNS now available)
-4. MosDNS config written to `/etc/mosdns/config.yaml`
-5. Rule files downloaded (DNS available via dnsmasq)
-6. MosDNS started
+2. Avahi daemon started (for mDNS support via D-Bus)
+3. dnsmasq config written to `/etc/dnsmasq.conf`
+4. dnsmasq started on port 53 (DNS now available with mDNS)
+5. MosDNS config written to `/etc/mosdns/config.yaml`
+6. Rule files downloaded (DNS available via dnsmasq)
+7. MosDNS started
 
-This ensures DNS queries work even during MosDNS rule download phase.
+This ensures DNS queries work even during MosDNS rule download phase, with full mDNS support enabled.
+
+**Note**: D-Bus system service runs at all times (priority 100), Avahi runs only when MosDNS is enabled (priority 200).
 
 ### Implementation
 
-**Location**: [watcher.py:1125-1142](watcher.py#L1125-L1142)
+**Location**: [watcher.py:1125-1156](watcher.py#L1125-L1156)
 
 ```python
 def _write_dnsmasq_config(clash_enabled: bool = False) -> None:
@@ -187,17 +193,28 @@ bogus-priv
 strict-order
 keep-in-foreground
 log-queries=extra
+# Enable mDNS (Multicast DNS) via Avahi
+enable-dbus=org.freedesktop.Avahi
+# Enable reverse DNS (PTR records for local networks)
+# Allow RFC 1918 private IP reverse lookups
+bogus-priv
+# Enable DHCP reverse lookup for local names
+local-ttl=1
 """
     _write_text("/etc/dnsmasq.conf", config, mode=0o644)
 ```
 
-**Location**: [watcher.py:1145-1175](watcher.py#L1145-L1175)
+**Location**: [watcher.py:1159-1178](watcher.py#L1159-L1178)
 
 ```python
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     # Write MosDNS config...
+    # Start Avahi for mDNS support (D-Bus should already be running)
+    _supervisor_restart("avahi")
+    print("[mosdns] avahi-daemon started for mDNS support", flush=True)
+
     # Start dnsmasq FIRST (before downloading rules)
-    _write_dnsmasq_config()
+    _write_dnsmasq_config(clash_enabled=clash_enabled)
     _supervisor_restart("dnsmasq")
     print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
 
@@ -209,4 +226,4 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     _supervisor_restart("mosdns")
 ```
 
-When MosDNS is disabled, dnsmasq is automatically stopped.
+When MosDNS is disabled, both dnsmasq and Avahi are automatically stopped.

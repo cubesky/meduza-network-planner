@@ -1145,6 +1145,13 @@ bogus-priv
 strict-order
 keep-in-foreground
 log-queries=extra
+# Enable mDNS (Multicast DNS) via Avahi
+enable-dbus=org.freedesktop.Avahi
+# Enable reverse DNS (PTR records for local networks)
+# Allow RFC 1918 private IP reverse lookups
+bogus-priv
+# Enable DHCP reverse lookup for local names
+local-ttl=1
 """
     _write_text("/etc/dnsmasq.conf", config, mode=0o644)
 
@@ -1157,6 +1164,10 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     # Check if Clash is enabled to configure dnsmasq accordingly
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
+
+    # Start Avahi for mDNS support (D-Bus should already be running)
+    _supervisor_restart("avahi")
+    print("[mosdns] avahi-daemon started for mDNS support", flush=True)
 
     # Start dnsmasq first before downloading rules (so DNS is available during download)
     _write_dnsmasq_config(clash_enabled=clash_enabled)
@@ -1335,6 +1346,7 @@ def handle_commit() -> None:
         else:
             _supervisor_stop("mosdns")
             _supervisor_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
+            _supervisor_stop("avahi")  # Stop Avahi when MosDNS is disabled
         did_apply = True
 
     reconcile_force = False

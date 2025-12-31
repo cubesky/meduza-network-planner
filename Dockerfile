@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     supervisor \
     dnsmasq \
+    avahi-daemon dbus \
     unzip gzip \
     build-essential autoconf automake libtool pkg-config meson ninja-build \
     libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
