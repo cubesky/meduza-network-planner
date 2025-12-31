@@ -1062,19 +1062,34 @@ def _safe_rule_path(rel: str) -> str:
     return rel
 
 
-def _download_rules(rules: Dict[str, str]) -> None:
+def _download_rules(rules: Dict[str, str], skip: Optional[Set[str]] = None) -> Set[str]:
+    """
+    Download MosDNS rule files.
+
+    Args:
+        rules: Dictionary of {rel_path: url}
+        skip: Set of files to skip (already downloaded successfully)
+
+    Returns:
+        Set of successfully downloaded file paths
+
+    Raises:
+        Exception: If any download fails (after retries)
+    """
     if not rules:
-        return
+        return set()
+
+    skip = skip or set()
+    successful = set()
+    failed = []
 
     # Check if Clash is running and use its proxy if available
     proxy = None
     clash_pid_val = clash_pid()
     if clash_pid_val is not None:
-        # Clash is running, use its HTTP proxy
         proxy = os.environ.get("MOSDNS_HTTP_PROXY", f"http://127.0.0.1:{CLASH_HTTP_PORT}")
         print(f"[mosdns] Using Clash proxy for rule downloads: {proxy}", flush=True)
     else:
-        # Clash not running, check for explicit proxy setting or download direct
         proxy = os.environ.get("MOSDNS_HTTP_PROXY")
         if proxy:
             print(f"[mosdns] Using configured proxy: {proxy}", flush=True)
@@ -1085,36 +1100,100 @@ def _download_rules(rules: Dict[str, str]) -> None:
     base_dir = "/etc/mosdns"
 
     for rel, url in rules.items():
+        if rel in skip:
+            print(f"[mosdns] Skipping already downloaded: {rel}", flush=True)
+            successful.add(rel)
+            continue
+
         safe_rel = _safe_rule_path(rel)
         out_path = os.path.join(base_dir, safe_rel)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-        try:
-            if proxies:
+        downloaded = False
+        # Try proxy first if available
+        if proxies:
+            try:
                 resp = requests.get(url, timeout=30, proxies=proxies)
-            else:
+                resp.raise_for_status()
+                _write_text(out_path, resp.text, mode=0o644)
+                print(f"[mosdns] Downloaded rule (via proxy): {rel}", flush=True)
+                successful.add(rel)
+                downloaded = True
+            except Exception as e:
+                print(f"[mosdns] Proxy download failed for {rel}: {e}", flush=True)
+                print(f"[mosdns] Retrying with direct connection...", flush=True)
+                # Immediate direct retry without waiting
+                try:
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    _write_text(out_path, resp.text, mode=0o644)
+                    print(f"[mosdns] Downloaded rule (direct): {rel}", flush=True)
+                    successful.add(rel)
+                    downloaded = True
+                except Exception as e2:
+                    print(f"[mosdns] Direct download also failed for {rel}: {e2}", flush=True)
+
+        # If no proxy or proxy fallback failed, try direct (or no proxy case)
+        if not downloaded:
+            try:
                 resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            _write_text(out_path, resp.text, mode=0o644)
-            print(f"[mosdns] Downloaded rule: {rel}", flush=True)
-        except Exception as e:
-            print(f"[mosdns] Failed to download {rel}: {e}", flush=True)
-            raise
+                resp.raise_for_status()
+                _write_text(out_path, resp.text, mode=0o644)
+                print(f"[mosdns] Downloaded rule (direct): {rel}", flush=True)
+                successful.add(rel)
+            except Exception as e:
+                print(f"[mosdns] Failed to download {rel}: {e}", flush=True)
+                failed.append(rel)
+
+    if failed:
+        raise Exception(f"Failed to download {len(failed)} file(s): {', '.join(failed)}")
+
+    return successful
 
 
 def _download_rules_with_backoff(rules: Dict[str, str]) -> None:
+    """
+    Download MosDNS rule files with intelligent retry logic.
+
+    Strategy:
+    - First attempt: Download all files
+    - Retry attempts: Only retry failed files, skip successful ones
+    - Shorter retry intervals for faster recovery
+    - Only on next refresh trigger will all files be re-downloaded
+    """
     if not rules:
         return
-    backoff = Backoff()
-    while True:
+
+    successful: Set[str] = set()
+    attempt = 0
+    max_attempts = 5  # Reduced from infinite backoff to fixed attempts
+
+    while attempt < max_attempts:
+        attempt += 1
         try:
-            _download_rules(rules)
-            print(f"[mosdns] All rules downloaded successfully", flush=True)
-            return
+            # Download only files that haven't been successfully downloaded yet
+            newly_successful = _download_rules(rules, skip=successful)
+            successful.update(newly_successful)
+
+            if len(successful) == len(rules):
+                print(f"[mosdns] All {len(rules)} rule(s) downloaded successfully", flush=True)
+                return
+            else:
+                print(f"[mosdns] Downloaded {len(successful)}/{len(rules)} rules", flush=True)
+
         except Exception as e:
-            t = backoff.next_sleep()
-            print(f"[mosdns] Rules download failed: {e}; retry in {t:.1f}s", flush=True)
-            time.sleep(t)
+            failed_count = len(rules) - len(successful)
+            print(f"[mosdns] Attempt {attempt}/{max_attempts}: {failed_count} file(s) failed", flush=True)
+
+            if attempt >= max_attempts:
+                print(f"[mosdns] Giving up after {max_attempts} attempts. {failed_count} file(s) could not be downloaded.", flush=True)
+                raise
+
+            # Shorter retry times: 2s, 5s, 10s, 20s (instead of exponential backoff)
+            retry_delays = [2, 5, 10, 20]
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+            print(f"[mosdns] Retrying in {delay}s...", flush=True)
+            time.sleep(delay)
 
 
 def _touch_rules_stamp() -> None:
