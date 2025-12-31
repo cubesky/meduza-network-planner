@@ -143,6 +143,7 @@ COPY scripts/run-dns-monitor.sh /usr/local/bin/run-dns-monitor.sh
 
 COPY frr/ /etc/frr/
 COPY clash/ /clash/
+COPY avahi/avahi-daemon.conf /etc/avahi/avahi-daemon.conf
 COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
