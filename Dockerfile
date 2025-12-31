@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y \
 # Release asset name: easytier-linux-x86_64-v<VER>.zip
 # Zip structure: easytier-linux-x86_64/{easytier-core,easytier-cli,easytier-web,easytier-web-embed}
 RUN set -eux; \
-    PROXY="http://10.42.1.2:7890"; \
+    PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
@@ -59,7 +59,7 @@ RUN set -eux; \
 # Release asset name: mihomo-linux-amd64-v2-v<VER>.gz
 # Gzip contains binary: mihomo-linux-amd64-v2
 RUN set -eux; \
-    PROXY="http://10.42.1.2:7890"; \
+    PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
@@ -73,7 +73,7 @@ RUN set -eux; \
 
 # --- MetaCubeXD (UI) ---
 RUN set -eux; \
-    PROXY="http://10.42.1.2:7890"; \
+    PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
@@ -89,7 +89,7 @@ RUN set -eux; \
 # --- Tinc 1.1 ---
 # Build from source (git branch 1.1)
 RUN set -eux; \
-    PROXY="http://10.42.1.2:7890"; \
+    PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://www.tinc-vpn.org/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
@@ -109,7 +109,7 @@ RUN set -eux; \
 # --- MosDNS ---
 # Release asset name: mosdns-linux-amd64.zip (no nested folder)
 RUN set -eux; \
-    PROXY="http://10.42.1.2:7890"; \
+    PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
