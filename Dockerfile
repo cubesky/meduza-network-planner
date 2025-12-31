@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y \
     curl jq git python3 python3-pip \
     ca-certificates \
     supervisor \
+    dnsmasq \
     unzip gzip \
     build-essential autoconf automake libtool pkg-config meson ninja-build \
     libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
@@ -135,6 +136,7 @@ COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
 COPY scripts/run-tinc.sh /usr/local/bin/run-tinc.sh
 COPY scripts/run-mosdns.sh /usr/local/bin/run-mosdns.sh
+COPY scripts/run-dnsmasq.sh /usr/local/bin/run-dnsmasq.sh
 COPY scripts/run-wireguard.sh /usr/local/bin/run-wireguard.sh
 COPY scripts/run-dns-monitor.sh /usr/local/bin/run-dns-monitor.sh
 
@@ -144,7 +146,7 @@ COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-easytier.sh \
-    /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-wireguard.sh \
-    /usr/local/bin/run-dns-monitor.sh
+    /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
+    /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

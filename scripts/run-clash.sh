@@ -1,11 +1,13 @@
 #!/bin/bash
-set -euo pipefail
 
 CFG="/etc/clash/config.yaml"
 DATA_DIR="/data/clash"
+PID_FILE="/run/clash/mihomo.pid"
 
 mkdir -p "${DATA_DIR}"
+mkdir -p "$(dirname "${PID_FILE}")"
 
+# Download GeoX files if configured
 python3 - <<'PY'
 import os
 import sys
@@ -39,4 +41,22 @@ for url in urls:
     os.system(f"curl -fL --retry 2 --connect-timeout 10 -o '{out_path}' '{url}'")
 PY
 
-exec mihomo -d /etc/clash
+# Clean up old PID file
+rm -f "${PID_FILE}"
+
+# Start mihomo in background, capture PID, and wait
+mihomo -d /etc/clash &
+MIHOMO_PID=$!
+echo ${MIHOMO_PID} > "${PID_FILE}"
+
+# Trap signals to ensure PID file cleanup
+trap 'rm -f "${PID_FILE}"; exit' INT TERM EXIT
+
+# Wait for mihomo process
+wait ${MIHOMO_PID}
+EXIT_CODE=$?
+
+# Clean up PID file on exit
+rm -f "${PID_FILE}"
+exit ${EXIT_CODE}
+

@@ -28,6 +28,10 @@ UPDATE_BASE = f"/updated/{NODE_ID}"
 UPDATE_LAST_KEY = f"{UPDATE_BASE}/last"      # persistent timestamp
 UPDATE_ONLINE_KEY = f"{UPDATE_BASE}/online"  # TTL key
 
+# etcd_hosts
+ETCD_HOSTS_PATH = "/etc/etcd_hosts"
+ETCD_HOSTS_PREFIX = "/dns/hosts"
+
 UPDATE_TTL_SECONDS = int(os.environ.get("UPDATE_TTL_SECONDS", "60"))
 OPENVPN_STATUS_INTERVAL = int(os.environ.get("OPENVPN_STATUS_INTERVAL", "10"))
 WIREGUARD_STATUS_INTERVAL = int(os.environ.get("WIREGUARD_STATUS_INTERVAL", "10"))
@@ -689,20 +693,34 @@ def clash_refresh_loop():
             global_cfg = load_prefix("/global/")
             payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
             out = _run_generator("gen_clash", payload)
+
             # Hot reload: update config and send HUP signal instead of restarting
             reload_clash(out["config_yaml"])
-            print(f"[clash-refresh] hot reload completed (HUP signal sent)", flush=True)
+
+            # Update tproxy rules if mode changed
             if out["mode"] == "tproxy":
+                # If previously not in tproxy mode, remove old rules first
+                if not tproxy_enabled:
+                    try:
+                        tproxy_remove()
+                    except Exception:
+                        pass
+                # Apply new tproxy rules
                 tproxy_apply(
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
                 )
+                _set_cached_tproxy_exclude(out["tproxy_exclude"])
                 tproxy_enabled = True
             else:
+                # If switching away from tproxy mode, remove rules
                 if tproxy_enabled:
-                    tproxy_remove()
+                    try:
+                        tproxy_remove()
+                    except Exception:
+                        pass
                     tproxy_enabled = False
         except Exception as e:
             print(f"[clash-refresh] error: {e}", flush=True)
@@ -743,17 +761,40 @@ def reload_frr_smooth(conf_text: str) -> None:
 
 # ---------- Clash ----------
 
-def clash_pid() -> int:
+def clash_pid() -> Optional[int]:
+    """Get mihomo PID, return None if process not running."""
     try:
         return int(open("/run/clash/mihomo.pid", encoding="utf-8").read().strip())
     except Exception:
-        return int(subprocess.check_output("pidof mihomo", shell=True).decode().split()[0])
+        try:
+            output = subprocess.check_output("pidof mihomo", shell=True, stderr=subprocess.DEVNULL).decode().strip()
+            if output:
+                pids = output.split()
+                if pids:
+                    return int(pids[0])
+        except subprocess.CalledProcessError:
+            pass
+        except Exception:
+            pass
+    return None
 
 
 def reload_clash(conf_text: str) -> None:
-    with open("/etc/clash/config.yaml", "w", encoding="utf-8") as f:
-        f.write(conf_text)
-    run(f"kill -HUP {clash_pid()}")
+    """Reload clash config. Returns None if clash is not running."""
+    pid = clash_pid()
+    if pid is None:
+        print("[clash] not running, skipping reload (config still written)", flush=True)
+        with open("/etc/clash/config.yaml", "w", encoding="utf-8") as f:
+            f.write(conf_text)
+        return
+    try:
+        with open("/etc/clash/config.yaml", "w", encoding="utf-8") as f:
+            f.write(conf_text)
+        run(f"kill -HUP {pid}")
+        print(f"[clash] reloaded (pid={pid})", flush=True)
+    except Exception as e:
+        print(f"[clash] reload failed: {e}", flush=True)
+        raise
 
 
 def _split_ml(val: str) -> List[str]:
@@ -1024,16 +1065,41 @@ def _safe_rule_path(rel: str) -> str:
 def _download_rules(rules: Dict[str, str]) -> None:
     if not rules:
         return
-    proxy = os.environ.get("MOSDNS_HTTP_PROXY", f"http://127.0.0.1:{CLASH_HTTP_PORT}")
-    proxies = {"http": proxy, "https": proxy}
+
+    # Check if Clash is running and use its proxy if available
+    proxy = None
+    clash_pid_val = clash_pid()
+    if clash_pid_val is not None:
+        # Clash is running, use its HTTP proxy
+        proxy = os.environ.get("MOSDNS_HTTP_PROXY", f"http://127.0.0.1:{CLASH_HTTP_PORT}")
+        print(f"[mosdns] Using Clash proxy for rule downloads: {proxy}", flush=True)
+    else:
+        # Clash not running, check for explicit proxy setting or download direct
+        proxy = os.environ.get("MOSDNS_HTTP_PROXY")
+        if proxy:
+            print(f"[mosdns] Using configured proxy: {proxy}", flush=True)
+        else:
+            print(f"[mosdns] Clash not running, downloading rules directly (may be slow)", flush=True)
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     base_dir = "/etc/mosdns"
+
     for rel, url in rules.items():
         safe_rel = _safe_rule_path(rel)
         out_path = os.path.join(base_dir, safe_rel)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        resp = requests.get(url, timeout=30, proxies=proxies)
-        resp.raise_for_status()
-        _write_text(out_path, resp.text, mode=0o644)
+
+        try:
+            if proxies:
+                resp = requests.get(url, timeout=30, proxies=proxies)
+            else:
+                resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            _write_text(out_path, resp.text, mode=0o644)
+            print(f"[mosdns] Downloaded rule: {rel}", flush=True)
+        except Exception as e:
+            print(f"[mosdns] Failed to download {rel}: {e}", flush=True)
+            raise
 
 
 def _download_rules_with_backoff(rules: Dict[str, str]) -> None:
@@ -1043,10 +1109,11 @@ def _download_rules_with_backoff(rules: Dict[str, str]) -> None:
     while True:
         try:
             _download_rules(rules)
+            print(f"[mosdns] All rules downloaded successfully", flush=True)
             return
         except Exception as e:
             t = backoff.next_sleep()
-            print(f"[mosdns] rules download failed: {e}; retry in {t:.1f}s", flush=True)
+            print(f"[mosdns] Rules download failed: {e}; retry in {t:.1f}s", flush=True)
             time.sleep(t)
 
 
@@ -1055,14 +1122,65 @@ def _touch_rules_stamp() -> None:
     _write_text(path, now_utc_iso() + "\n", mode=0o644)
 
 
+def _write_dnsmasq_config(clash_enabled: bool = False) -> None:
+    """Generate dnsmasq configuration for frontend DNS forwarding."""
+    # Only include Clash DNS (1053) if Clash is enabled
+    # dnsmasq uses # syntax for non-standard ports
+    if clash_enabled:
+        servers = """server=127.0.0.1#1153
+server=127.0.0.1#1053
+server=223.5.5.5
+server=119.29.29.29"""
+    else:
+        servers = """server=127.0.0.1#1153
+server=223.5.5.5
+server=119.29.29.29"""
+
+    config = f"""# dnsmasq configuration for MosDNS frontend
+port=53
+no-resolv
+{servers}
+addn-hosts=/etc/etcd_hosts
+bogus-priv
+strict-order
+keep-in-foreground
+log-queries=extra
+"""
+    _write_text("/etc/dnsmasq.conf", config, mode=0o644)
+
+
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
     out = _run_generator("gen_mosdns", payload)
     with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
         f.write(out["config_text"])
 
+    # Check if Clash is enabled to configure dnsmasq accordingly
+    clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
+
+    # Start dnsmasq first before downloading rules (so DNS is available during download)
+    _write_dnsmasq_config(clash_enabled=clash_enabled)
+    _supervisor_restart("dnsmasq")
+    if clash_enabled:
+        print("[mosdns] dnsmasq started as frontend DNS on port 53 (with Clash DNS)", flush=True)
+    else:
+        print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
+
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
+        # If Clash is enabled, wait a bit for it to be ready
+        if clash_enabled:
+            # Check if Clash is running, if not, wait for it to start
+            for attempt in range(10):  # Wait up to 10 seconds
+                if clash_pid() is not None:
+                    print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
+                    time.sleep(1)  # Extra second for proxy to be fully ready
+                    break
+                print(f"[mosdns] Waiting for Clash to start... (attempt {attempt + 1}/10)", flush=True)
+                time.sleep(1)
+            else:
+                print(f"[mosdns] Clash not ready after 10s, downloading rules directly", flush=True)
+
         _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
 
@@ -1146,21 +1264,45 @@ def handle_commit() -> None:
     global_clash = {k: v for k, v in global_cfg.items() if k.startswith("/global/clash/")}
     if changed("clash", {"node": clash_domain, "global": global_clash}):
         if node.get(f"/nodes/{NODE_ID}/clash/enable") != "true":
+            # Stop clash (mihomo) service
             try:
                 tproxy_remove()
             except Exception:
                 pass
             tproxy_enabled = False
+            try:
+                _supervisor_stop("mihomo")
+            except Exception:
+                pass
             with _clash_refresh_lock:
                 _clash_refresh_enable = False
             with _tproxy_check_lock:
                 _tproxy_check_enabled = False
         else:
+            # Check if clash needs restart (mode change or subscription change)
             payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
             out = _run_generator("gen_clash", payload)
+            new_mode = out["mode"]
+
+            # If switching to/from tproxy mode, need to remove tproxy first
+            if tproxy_enabled and new_mode != "tproxy":
+                try:
+                    tproxy_remove()
+                except Exception:
+                    pass
+                tproxy_enabled = False
+
+            # Start clash if not running
+            if not _supervisor_is_running("mihomo"):
+                _supervisor_start("mihomo")
+                # Wait a bit for clash to start
+                time.sleep(2)
+
+            # Reload configuration
             reload_clash(out["config_yaml"])
-            mode = out["mode"]
-            if mode == "tproxy":
+
+            # Apply tproxy if needed
+            if new_mode == "tproxy":
                 tproxy_apply(
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
@@ -1172,11 +1314,9 @@ def handle_commit() -> None:
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = True
             else:
-                if tproxy_enabled:
-                    tproxy_remove()
-                    tproxy_enabled = False
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = False
+
             with _clash_refresh_lock:
                 _clash_refresh_enable = out["refresh_enable"]
                 _clash_refresh_interval = max(0, int(out["refresh_interval_minutes"]))
@@ -1194,6 +1334,7 @@ def handle_commit() -> None:
             reload_mosdns(node, global_cfg)
         else:
             _supervisor_stop("mosdns")
+            _supervisor_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
         did_apply = True
 
     reconcile_force = False
@@ -1252,7 +1393,104 @@ def periodic_reconcile_loop() -> None:
             print(f"[reconcile] periodic error: {e}", flush=True)
 
 
+# ---------- etcd_hosts ----------
+def _load_dns_hosts() -> Dict[str, List[str]]:
+    """Load all DNS host records from etcd. Supports multiple IPs per hostname (one per line)."""
+    hosts: Dict[str, List[str]] = {}
+    try:
+        records = load_prefix(ETCD_HOSTS_PREFIX + "/")
+        for key, value in records.items():
+            # Key format: /dns/hosts/example.com => "192.168.1.1\n192.168.1.2"
+            # Extract hostname from key
+            if key.startswith(ETCD_HOSTS_PREFIX + "/"):
+                hostname = key[len(ETCD_HOSTS_PREFIX + "/"):]
+                # Split by newline to support multiple IPs per hostname
+                ips = [ip.strip() for ip in value.strip().splitlines() if ip.strip()]
+                if hostname and ips:
+                    hosts[hostname] = ips
+    except Exception as e:
+        print(f"[etcd_hosts] failed to load hosts: {e}", flush=True)
+    return hosts
+
+
+def _write_hosts_file(hosts: Dict[str, List[str]]) -> None:
+    """Write hosts to /etc/etcd_hosts file. Supports multiple IPs per hostname."""
+    try:
+        # Sort by hostname for consistent output
+        lines = []
+        for hostname in sorted(hosts.keys()):
+            ips = hosts[hostname]
+            # Write each IP on a separate line with the hostname
+            for ip in ips:
+                lines.append(f"{ip}\t{hostname}")
+
+        content = "\n".join(lines) + "\n" if lines else ""
+        _write_if_changed(ETCD_HOSTS_PATH, content, mode=0o644)
+        total_ips = sum(len(ips) for ips in hosts.values())
+        print(f"[etcd_hosts] wrote {len(hosts)} hostname(s) with {total_ips} IP(s) to {ETCD_HOSTS_PATH}", flush=True)
+    except Exception as e:
+        print(f"[etcd_hosts] failed to write hosts file: {e}", flush=True)
+
+
+_etcd_hosts_hash: str = ""
+
+
+def update_etcd_hosts() -> None:
+    """Update etcd_hosts file from etcd records."""
+    global _etcd_hosts_hash
+    try:
+        hosts = _load_dns_hosts()
+        current_hash = sha(hosts)
+
+        if current_hash != _etcd_hosts_hash:
+            _write_hosts_file(hosts)
+            _etcd_hosts_hash = current_hash
+        else:
+            print(f"[etcd_hosts] no changes ({len(hosts)} hosts)", flush=True)
+    except Exception as e:
+        print(f"[etcd_hosts] update failed: {e}", flush=True)
+
+
+def etcd_hosts_watch_loop() -> None:
+    """Watch /dns/hosts prefix for changes and update hosts file."""
+    global _etcd_hosts_hash
+
+    # Initial update
+    update_etcd_hosts()
+
+    backoff = Backoff()
+    while True:
+        cancel = None
+        try:
+            backoff.reset()
+            # Watch the /dns/hosts prefix for any changes
+            events, cancel = _etcd_call(lambda: etcd.watch_prefix(ETCD_HOSTS_PREFIX + "/"))
+            for _ in events:
+                try:
+                    update_etcd_hosts()
+                except Exception as e:
+                    print(f"[etcd_hosts] update error: {e}", flush=True)
+
+        except Exception as e:
+            t = backoff.next_sleep()
+            print(f"[etcd_hosts] watch error: {e}; retry in {t:.1f}s", flush=True)
+            time.sleep(t)
+        finally:
+            try:
+                if cancel:
+                    cancel()
+            except Exception:
+                pass
+
+
 def main() -> None:
+    # Initialize empty etcd_hosts file
+    try:
+        _write_text(ETCD_HOSTS_PATH, "", mode=0o644)
+        print(f"[init] created {ETCD_HOSTS_PATH}", flush=True)
+    except Exception as e:
+        print(f"[init] failed to create {ETCD_HOSTS_PATH}: {e}", flush=True)
+
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
     threading.Thread(target=wireguard_status_loop, daemon=True).start()
@@ -1261,6 +1499,7 @@ def main() -> None:
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
+    threading.Thread(target=etcd_hosts_watch_loop, daemon=True).start()
 
     publish_update("startup")
     watch_loop()

@@ -60,6 +60,11 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
 
     merged["external-ui"] = "/etc/clash/ui"
 
+    # Set essential Clash Meta configurations for optimal performance
+    merged["find-process-mode"] = "off"
+    merged["unified-delay"] = True
+    merged["geodata-loader"] = "standard"
+
     merged["socks-port"] = SOCKS_PORT
     if mode == "mixed":
         merged["mixed-port"] = HTTP_PORT
