@@ -1425,9 +1425,13 @@ def _write_hosts_file(hosts: Dict[str, List[str]]) -> None:
                 lines.append(f"{ip}\t{hostname}")
 
         content = "\n".join(lines) + "\n" if lines else ""
-        _write_if_changed(ETCD_HOSTS_PATH, content, mode=0o644)
         total_ips = sum(len(ips) for ips in hosts.values())
-        print(f"[etcd_hosts] wrote {len(hosts)} hostname(s) with {total_ips} IP(s) to {ETCD_HOSTS_PATH}", flush=True)
+
+        # Always write the file (even if empty) to ensure it exists
+        if _write_if_changed(ETCD_HOSTS_PATH, content, mode=0o644):
+            print(f"[etcd_hosts] wrote {len(hosts)} hostname(s) with {total_ips} IP(s) to {ETCD_HOSTS_PATH}", flush=True)
+        else:
+            print(f"[etcd_hosts] file unchanged ({len(hosts)} hostname(s), {total_ips} IP(s))", flush=True)
     except Exception as e:
         print(f"[etcd_hosts] failed to write hosts file: {e}", flush=True)
 
@@ -1445,8 +1449,11 @@ def update_etcd_hosts() -> None:
         if current_hash != _etcd_hosts_hash:
             _write_hosts_file(hosts)
             _etcd_hosts_hash = current_hash
+            total_ips = sum(len(ips) for ips in hosts.values())
+            print(f"[etcd_hosts] updated: {len(hosts)} hostname(s), {total_ips} IP(s)", flush=True)
         else:
-            print(f"[etcd_hosts] no changes ({len(hosts)} hosts)", flush=True)
+            total_ips = sum(len(ips) for ips in hosts.values())
+            print(f"[etcd_hosts] no changes: {len(hosts)} hostname(s), {total_ips} IP(s)", flush=True)
     except Exception as e:
         print(f"[etcd_hosts] update failed: {e}", flush=True)
 
@@ -1486,7 +1493,7 @@ def etcd_hosts_watch_loop() -> None:
 def main() -> None:
     # Initialize empty etcd_hosts file
     try:
-        _write_text(ETCD_HOSTS_PATH, "", mode=0o644)
+        _write_text(ETCD_HOSTS_PATH, "\n", mode=0o644)  # Write newline instead of empty string
         print(f"[init] created {ETCD_HOSTS_PATH}", flush=True)
     except Exception as e:
         print(f"[init] failed to create {ETCD_HOSTS_PATH}: {e}", flush=True)
