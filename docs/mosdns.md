@@ -217,16 +217,15 @@ The watcher generates `/etc/dnsmasq.conf` with these settings:
 ### Startup sequence
 
 1. MosDNS enable detected
-2. Avahi daemon started (for mDNS support via D-Bus)
-3. dnsmasq config written to `/etc/dnsmasq.conf`
-4. dnsmasq started on port 53 (DNS now available with mDNS)
-5. MosDNS config written to `/etc/mosdns/config.yaml`
-6. Rule files downloaded (DNS available via dnsmasq)
-7. MosDNS started
+2. dnsmasq config written to `/etc/dnsmasq.conf`
+3. dnsmasq started on port 53 (DNS now available with mDNS via Avahi)
+4. MosDNS config written to `/etc/mosdns/config.yaml`
+5. Rule files downloaded (DNS available via dnsmasq)
+6. MosDNS started
 
 This ensures DNS queries work even during MosDNS rule download phase, with full mDNS support enabled.
 
-**Note**: D-Bus system service runs at all times (priority 100), Avahi runs only when MosDNS is enabled (priority 200).
+**Note**: D-Bus system service and Avahi daemon run at all times (autostart=true) to provide continuous mDNS support, independent of MosDNS state.
 
 ### Implementation
 
@@ -285,10 +284,8 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
     print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
 
-    # Start Avahi for mDNS support (D-Bus should already be running)
-    _supervisor_restart("avahi")
-
     # Start dnsmasq FIRST (before downloading rules)
+    # Avahi and D-Bus are always running, no need to start them here
     _write_dnsmasq_config(clash_enabled=clash_enabled)
     _supervisor_restart("dnsmasq")
 
@@ -305,4 +302,4 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
 **Trigger**: Changes to MosDNS configuration trigger `/commit` watch → `reconcile_once()` → `reload_mosdns()` → MosDNS restart.
 
-When MosDNS is disabled, both dnsmasq and Avahi are automatically stopped.
+When MosDNS is disabled, dnsmasq is stopped. D-Bus and Avahi continue running to provide mDNS support for other services.
