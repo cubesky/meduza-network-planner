@@ -9,7 +9,7 @@ import threading
 import random
 import signal
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 import etcd3
 import requests
