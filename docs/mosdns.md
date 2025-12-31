@@ -9,10 +9,17 @@ If the key is missing or not `true`, MosDNS is disabled.
 
 When enabled, the watcher:
 1. Writes `/etc/dnsmasq.conf` and starts dnsmasq on port 53 (frontend DNS)
-2. Writes `/etc/mosdns/config.yaml`
-3. Downloads rule files
-4. Starts MosDNS
-5. Sets `/etc/resolv.conf` to `127.0.0.1`
+2. Writes MosDNS text files from etcd:
+   - `/etc/mosdns/etcd_local.txt` (from `/global/mosdns/local`)
+   - `/etc/mosdns/etcd_block.txt` (from `/global/mosdns/block`)
+   - `/etc/mosdns/etcd_ddns.txt` (from `/global/mosdns/ddns`)
+   - `/etc/mosdns/etcd_global.txt` (from `/global/mosdns/global`)
+3. Writes `/etc/mosdns/config.yaml`
+4. Downloads rule files
+5. Restarts MosDNS
+6. Sets `/etc/resolv.conf` to `127.0.0.1`
+
+All changes are triggered by `/commit` - MosDNS is restarted when any of these files change.
 
 ## Rule files
 
@@ -58,6 +65,62 @@ Value must be a YAML list. Example:
 
 This list becomes the `plugins:` section of `/etc/mosdns/config.yaml`.
 If the key is missing or empty, `/mosdns/config.yaml` is used as the default.
+
+## Text Files
+
+MosDNS can load additional text lists from etcd. These are written directly to files:
+
+### Local Domains
+- **etcd key**: `/global/mosdns/local`
+- **File path**: `/etc/mosdns/etcd_local.txt`
+- **Usage**: Define local domain names (one per line)
+
+Example:
+```bash
+etcdctl put /global/mosdns/local "local1.example.com
+local2.example.com
+home.local"
+```
+
+### Blocked Domains
+- **etcd key**: `/global/mosdns/block`
+- **File path**: `/etc/mosdns/etcd_block.txt`
+- **Usage**: Block specific domains (one per line)
+
+Example:
+```bash
+etcdctl put /global/mosdns/block "ads.example.com
+tracker malicious.local"
+```
+
+### DDNS Domains
+- **etcd key**: `/global/mosdns/ddns`
+- **File path**: `/etc/mosdns/etcd_ddns.txt`
+- **Usage**: Dynamic DNS domains (one per line)
+
+Example:
+```bash
+etcdctl put /global/mosdns/ddns "myhome.ddns.net
+office.dynamicdns.com"
+```
+
+### Global Domains
+- **etcd key**: `/global/mosdns/global`
+- **File path**: `/etc/mosdns/etcd_global.txt`
+- **Usage**: Global domain list (one per line)
+
+Example:
+```bash
+etcdctl put /global/mosdns/global "google.com
+cloudflare.com
+github.com"
+```
+
+**Important**:
+- Files are created even if the key is missing (empty files)
+- Files are rewritten on every `/commit` trigger
+- MosDNS is restarted when any file changes
+- Use newline (`\n`) to separate multiple entries
 
 ## Rule updates
 
@@ -204,26 +267,42 @@ local-ttl=1
     _write_text("/etc/dnsmasq.conf", config, mode=0o644)
 ```
 
-**Location**: [watcher.py:1159-1178](watcher.py#L1159-L1178)
+**Location**: [watcher.py:1159-1205](watcher.py#L1159-L1205)
 
 ```python
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
-    # Write MosDNS config...
+    payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+    out = _run_generator("gen_mosdns", payload)
+
+    # Write MosDNS config
+    with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
+        f.write(out["config_text"])
+
+    # Write MosDNS text files from etcd (always write, even if empty)
+    _write_text("/etc/mosdns/etcd_local.txt", out.get("local", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_block.txt", out.get("block", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_ddns.txt", out.get("ddns", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
+    print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
+
     # Start Avahi for mDNS support (D-Bus should already be running)
     _supervisor_restart("avahi")
-    print("[mosdns] avahi-daemon started for mDNS support", flush=True)
 
     # Start dnsmasq FIRST (before downloading rules)
     _write_dnsmasq_config(clash_enabled=clash_enabled)
     _supervisor_restart("dnsmasq")
-    print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
 
-    # Now download rules (DNS is available via dnsmasq)
+    # Download rules if needed
     if _should_refresh_rules(refresh_minutes):
         _download_rules_with_backoff(out.get("rules", {}))
+        _touch_rules_stamp()
 
     # Finally start MosDNS
     _supervisor_restart("mosdns")
 ```
+
+**Generator**: [generators/gen_mosdns.py](generators/gen_mosdns.py)
+
+**Trigger**: Changes to MosDNS configuration trigger `/commit` watch → `reconcile_once()` → `reload_mosdns()` → MosDNS restart.
 
 When MosDNS is disabled, both dnsmasq and Avahi are automatically stopped.

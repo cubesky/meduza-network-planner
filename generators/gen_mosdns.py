@@ -67,10 +67,21 @@ def main() -> None:
     global_cfg = payload["global"]
     rules_raw = global_cfg.get("/global/mosdns/rule_files", "")
     rules = _parse_json_map(rules_raw) if rules_raw else {}
+
+    # MosDNS text files from etcd
+    local_text = global_cfg.get("/global/mosdns/local", "")
+    block_text = global_cfg.get("/global/mosdns/block", "")
+    ddns_text = global_cfg.get("/global/mosdns/ddns", "")
+    global_text = global_cfg.get("/global/mosdns/global", "")
+
     out = {
         "config_text": _build_config_text(global_cfg),
         "rules": rules,
         "refresh_minutes": _refresh_minutes(node_id, node),
+        "local": local_text,
+        "block": block_text,
+        "ddns": ddns_text,
+        "global": global_text,
     }
     write_output(out)
 

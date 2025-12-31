@@ -1162,6 +1162,13 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
         f.write(out["config_text"])
 
+    # Write MosDNS text files from etcd (always write, even if empty)
+    _write_text("/etc/mosdns/etcd_local.txt", out.get("local", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_block.txt", out.get("block", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_ddns.txt", out.get("ddns", ""), mode=0o644)
+    _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
+    print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
+
     # Check if Clash is enabled to configure dnsmasq accordingly
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
 
@@ -1349,6 +1356,13 @@ def handle_commit() -> None:
             _supervisor_stop("avahi")  # Stop Avahi when MosDNS is disabled
         did_apply = True
 
+    # etcd_hosts: process on every /commit (not watched separately)
+    # This ensures etcd_hosts is always synchronized with etcd state
+    try:
+        update_etcd_hosts()
+    except Exception as e:
+        print(f"[reconcile] etcd_hosts update failed: {e}", flush=True)
+
     reconcile_force = False
 
     if did_apply:
@@ -1470,38 +1484,6 @@ def update_etcd_hosts() -> None:
         print(f"[etcd_hosts] update failed: {e}", flush=True)
 
 
-def etcd_hosts_watch_loop() -> None:
-    """Watch /dns/hosts prefix for changes and update hosts file."""
-    global _etcd_hosts_hash
-
-    # Initial update
-    update_etcd_hosts()
-
-    backoff = Backoff()
-    while True:
-        cancel = None
-        try:
-            backoff.reset()
-            # Watch the /dns/hosts prefix for any changes
-            events, cancel = _etcd_call(lambda: etcd.watch_prefix(ETCD_HOSTS_PREFIX + "/"))
-            for _ in events:
-                try:
-                    update_etcd_hosts()
-                except Exception as e:
-                    print(f"[etcd_hosts] update error: {e}", flush=True)
-
-        except Exception as e:
-            t = backoff.next_sleep()
-            print(f"[etcd_hosts] watch error: {e}; retry in {t:.1f}s", flush=True)
-            time.sleep(t)
-        finally:
-            try:
-                if cancel:
-                    cancel()
-            except Exception:
-                pass
-
-
 def main() -> None:
     # Initialize empty etcd_hosts file
     try:
@@ -1518,7 +1500,7 @@ def main() -> None:
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
-    threading.Thread(target=etcd_hosts_watch_loop, daemon=True).start()
+    # etcd_hosts now processed in reconcile_once() via /commit, no separate watch needed
 
     publish_update("startup")
     watch_loop()
