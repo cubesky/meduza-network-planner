@@ -339,7 +339,7 @@ When adding support for a new tool:
        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
        out = _run_generator("gen_tool", payload)
        # Write config files
-       # Reload service via supervisor
+       # Reload service via s6-overlay
    ```
 
 5. **Add reconciliation logic** in `handle_commit()`:
@@ -350,28 +350,28 @@ When adding support for a new tool:
        did_apply = True
    ```
 
-6. **Add supervisor config** if needed:
-   - Update `supervisord.conf` with program section
+6. **Add s6 service definition** if needed:
+   - Create service in `s6-services/<tool>/run`
    - Create run script in `scripts/run-<tool>.sh`
 
 ## Service Management Patterns
 
-### Supervisor-Managed Services
+### s6-Overlay Managed Services
 
-All long-running services are managed by supervisord:
+All long-running services are managed by s6-overlay:
 
 ```python
 # Check status
-status = _supervisor_status("service-name")  # Returns "RUNNING", "STOPPED", "FATAL"
+status = _s6_status("service-name")  # Returns "up" or "down"
 
 # Control service
-_supervisor_start("service-name")
-_supervisor_stop("service-name")
-_supervisor_restart("service-name")
+_s6_start("service-name")
+_s6_stop("service-name")
+_s6_restart("service-name")
 
 # For multi-instance services (OpenVPN, WireGuard)
-_supervisorctl(["reread"])
-_supervisorctl(["update"])
+_s6_create_dynamic_service(name, command)
+_s6_reload_services()
 ```
 
 ### Service Categories
@@ -385,7 +385,7 @@ _supervisorctl(["update"])
 1. **Restart process**:
    - EasyTier, Tinc, MosDNS, dnsmasq
    ```python
-   _supervisor_restart("service-name")
+   _s6_restart("service-name")
    ```
 
 2. **Signal-based reload**:
@@ -400,11 +400,12 @@ _supervisorctl(["update"])
    reload_frr_smooth(conf_text)
    ```
 
-4. **Supervisor reread/update**:
+4. **Dynamic service reload**:
    - OpenVPN, WireGuard (when instances change)
    ```python
-   _supervisorctl(["reread"])
-   _supervisorctl(["update"])
+   _s6_create_dynamic_service(f"openvpn-{name}", command)
+   _s6_reload_services()
+   _s6_restart(f"openvpn-{name}")
    ```
 
 ## Background Loops
@@ -415,7 +416,7 @@ The watcher runs multiple daemon threads:
 2. **`openvpn_status_loop()`** - Monitor OpenVPN interface status
 3. **`wireguard_status_loop()`** - Monitor WireGuard interface status
 4. **`monitor_children_loop()`** - Restart failed mesh services
-5. **`supervisor_retry_loop()`** - Handle FATAL state services
+5. **`s6_retry_loop()`** - Monitor service health
 6. **`clash_refresh_loop()`** - Refresh Clash subscription periodically
 7. **`tproxy_check_loop()`** - Verify and fix TPROXY iptables rules
 8. **`periodic_reconcile_loop()`** - Full reconciliation every 5 minutes
@@ -631,7 +632,7 @@ Controlled by `/global/internal_routing_system`:
 
 4. **Check status**:
    ```bash
-   supervisorctl status
+   s6-rc -a list
    etcdctl get /updated/<NODE_ID>/online --prefix
    ```
 
@@ -650,7 +651,7 @@ echo '{"node_id":"test","node":{},"global":{},"all_nodes":{}}' | \
    - Validate JSON structure with `jq`
 
 2. **Service won't start**:
-   - Check supervisor status: `supervisorctl status`
+   - Check s6 status: `s6-rc -a list | grep <service>`
    - View logs: `/var/log/<service>.*.log`
 
 3. **TPROXY not working**:

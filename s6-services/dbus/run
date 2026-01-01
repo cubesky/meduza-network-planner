@@ -1,0 +1,4 @@
+#!/command/execlineb -P
+# s6-overlay service script for dbus
+fdmove -c 2 1
+exec /usr/bin/dbus-daemon --system --nofork

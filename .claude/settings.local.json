@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(xargs dos2unix:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(uv run python -m py_compile:*)",
+      "Bash(for file in *.py)",
+      "Bash(do echo:*)",
+      "Bash(done)"
+    ]
+  }
+}
