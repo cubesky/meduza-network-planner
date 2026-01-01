@@ -151,6 +151,7 @@ COPY generators/ /generators/
 COPY s6-services/ /etc/s6-overlay/sv/
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
 COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
+COPY scripts/preprocess-clash.py /usr/local/bin/preprocess-clash.py
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
 COPY scripts/run-tinc.sh /usr/local/bin/run-tinc.sh
 COPY scripts/run-mosdns.sh /usr/local/bin/run-mosdns.sh

@@ -725,12 +725,14 @@ def clash_refresh_loop():
                         tproxy_remove()
                     except Exception:
                         pass
-                # Apply new tproxy rules
+                # Apply new tproxy rules with LAN source filtering
+                lan_sources = _clash_lan_sources(node)
                 tproxy_apply(
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
+                    lan_sources if lan_sources else None,  # Enable LAN mode if configured
                 )
                 _set_cached_tproxy_exclude(out["tproxy_exclude"])
                 tproxy_enabled = True
@@ -862,12 +864,36 @@ def _clash_exclude_ifaces(node: Dict[str, str]) -> List[str]:
 
 
 def _clash_exclude_src(node: Dict[str, str]) -> List[str]:
+    """返回需要排除的源 CIDR 列表(不代理)"""
+    # 当前使用反向逻辑:只代理 LAN 流量,所以排除非 LAN
+    # 这个函数保留用于默认网关排除
     cidrs: List[str] = []
     gw_ip = os.environ.get("DEFAULT_GW", "").strip()
     if gw_ip:
         if "/" not in gw_ip:
             gw_ip = f"{gw_ip}/32"
         cidrs.append(gw_ip)
+    return sorted(set(cidrs))
+
+
+def _clash_lan_sources(node: Dict[str, str]) -> List[str]:
+    """返回需要代理的源 CIDR 列表(LAN 网段)"""
+    cidrs: List[str] = []
+
+    # 读取 /nodes/<NODE_ID>/lan
+    lan_cidrs = _split_ml(node.get(f"/nodes/{NODE_ID}/lan", ""))
+    for cidr in lan_cidrs:
+        cidr = cidr.strip()
+        if cidr and "/" in cidr:
+            cidrs.append(cidr)
+
+    # 读取 /nodes/<NODE_ID>/private_lan (可选)
+    private_lan_cidrs = _split_ml(node.get(f"/nodes/{NODE_ID}/private_lan", ""))
+    for cidr in private_lan_cidrs:
+        cidr = cidr.strip()
+        if cidr and "/" in cidr:
+            cidrs.append(cidr)
+
     return sorted(set(cidrs))
 
 
@@ -939,15 +965,38 @@ def tproxy_apply(
     exclude_src: List[str],
     exclude_ifaces: List[str],
     exclude_ports: List[str],
+    lan_sources: List[str] = None,
 ) -> None:
-    run(
-        f"EXCLUDE_CIDRS='{ ' '.join(exclude_dst) }' "
-        f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
-        f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
-        f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
-        f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
-        f"/usr/local/bin/tproxy.sh apply"
-    )
+    """Apply TPROXY iptables rules.
+
+    Args:
+        exclude_dst: Destination CIDRs to exclude from proxying
+        exclude_src: Source CIDRs to exclude from proxying
+        exclude_ifaces: Network interfaces to exclude
+        exclude_ports: Ports to exclude
+        lan_sources: If provided, ONLY proxy traffic from these sources (LAN mode)
+    """
+    if lan_sources:
+        # LAN MODE: Only proxy traffic from specified LAN sources
+        run(
+            f"EXCLUDE_CIDRS='{ ' '.join(exclude_dst) }' "
+            f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
+            f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
+            f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
+            f"LAN_SOURCES='{ ' '.join(lan_sources) }' "
+            f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
+            f"/usr/local/bin/tproxy.sh apply"
+        )
+    else:
+        # STANDARD MODE: Proxy everything except excluded
+        run(
+            f"EXCLUDE_CIDRS='{ ' '.join(exclude_dst) }' "
+            f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
+            f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
+            f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
+            f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
+            f"/usr/local/bin/tproxy.sh apply"
+        )
 
 
 def tproxy_remove() -> None:
@@ -1009,11 +1058,12 @@ def _fix_tproxy_iptables(
     exclude_src: List[str],
     exclude_ifaces: List[str],
     exclude_ports: List[str],
+    lan_sources: List[str] = None,
 ) -> None:
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(exclude_dst, exclude_src, exclude_ifaces, exclude_ports)
+        tproxy_apply(exclude_dst, exclude_src, exclude_ifaces, exclude_ports, lan_sources)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -1416,11 +1466,13 @@ def handle_commit() -> None:
 
             # Apply tproxy if needed
             if new_mode == "tproxy":
+                lan_sources = _clash_lan_sources(node)
                 tproxy_apply(
                     out["tproxy_exclude"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
+                    lan_sources if lan_sources else None,
                 )
                 _set_cached_tproxy_exclude(out["tproxy_exclude"])
                 tproxy_enabled = True
