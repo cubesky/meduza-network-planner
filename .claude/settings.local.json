@@ -10,7 +10,9 @@
       "Bash(for file in *.py)",
       "Bash(do echo:*)",
       "Bash(done)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(cat:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

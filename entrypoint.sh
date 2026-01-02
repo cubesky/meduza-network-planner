@@ -5,6 +5,7 @@ set -euo pipefail
 
 mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc /run/wireguard /run/dbus
 mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
+mkdir -p /var/log
 
 # Ensure stable DNS before services start.
 /usr/local/bin/run-dns-monitor.sh --once
@@ -45,4 +46,5 @@ fi
 # s6-overlay v3 initialization
 # The /init process will automatically set up the supervision tree
 # and start services based on the compiled database from /etc/s6-overlay/sv/
+echo "[entrypoint] Starting s6-overlay with services..." >&2
 exec /init
