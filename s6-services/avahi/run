@@ -1,5 +1,6 @@
-#!/command/with-contenv execlineb -P
+#!/command/execlineb -P
 # s6-overlay service script for avahi-daemon
+with-contenv
 fdmove -c 2 1
 s6-setenv AVAHI_DAEMON_DETECT_LOCAL 0
 exec /usr/sbin/avahi-daemon --no-chroot --debug
