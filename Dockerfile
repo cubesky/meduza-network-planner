@@ -148,7 +148,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
 COPY generators/ /generators/
-COPY s6-services/ /etc/s6-overlay/sv/
+COPY s6-services/ /etc/s6-overlay/s6-rc.d/
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
 COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
 COPY scripts/preprocess-clash.py /usr/local/bin/preprocess-clash.py
@@ -171,6 +171,6 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
     /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh \
     /usr/local/bin/get-logs /usr/local/bin/get-services \
-    /etc/s6-overlay/sv/*/run
+    /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish 2>/dev/null || true
 
 ENTRYPOINT ["/entrypoint.sh"]
