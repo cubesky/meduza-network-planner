@@ -6,6 +6,11 @@ scripts/*.sh text eol=lf
 watcher.py text eol=lf
 Dockerfile text eol=lf
 
+# s6-services empty files are critical (dependencies.d and contents.d)
+# These MUST be tracked by git even though they are empty
+s6-services/**/dependencies.d/* -text
+s6-services/**/contents.d/* -text
+
 # Other text files
 *.md text eol=lf
 *.py text eol=lf
