@@ -52,12 +52,14 @@ if [[ -z "$SERVICE" ]]; then
     exit 1
 fi
 
-LOG_FILE="/var/log/${SERVICE}.out.log"
+# s6-log 使用目录而不是单个文件
+LOG_DIR="/var/log/${SERVICE}"
+LOG_FILE="${LOG_DIR}/current"
 
 if [[ ! -f "$LOG_FILE" ]]; then
     echo "Error: Log file not found: $LOG_FILE" >&2
-    echo "Available log files:" >&2
-    ls -1 /var/log/*.out.log 2>/dev/null || echo "  (none)" >&2
+    echo "Available log directories:" >&2
+    ls -1d /var/log/*/ 2>/dev/null | sed 's|/var/log/||; s|/$||' | grep -v '^s6-' || echo "  (none)" >&2
     exit 1
 fi
 

@@ -91,26 +91,55 @@ exec logutil-service /var/log/mihomo
 - ✅ dnsmasq
 - ✅ dns-monitor
 
-### 8. 缺少 Pipeline 配置 ✅
-**问题**: 带日志的服务缺少 pipeline 配置
+### 8. Pipeline 配置问题 ✅ (已修正)
+**初始错误**: 错误地使用了 s6-rc pipeline 配置
 
-**修复**: 为所有带日志的服务添加了 pipeline 配置:
+**问题**: 
+- ❌ 创建了 `producer-for`, `consumer-for`, `pipeline-name` 文件
+- ❌ 在 `user/contents.d/` 中添加了 `<service>-pipeline` 文件
+- ❌ 这导致服务无法启动
 
-每个服务都包含:
-- ✅ `<service>/producer-for` → 内容: `<service>-log`
-- ✅ `<service>/log/consumer-for` → 内容: `<service>`
-- ✅ `<service>/log/pipeline-name` → 内容: `<service>-pipeline`
-- ✅ `<service>/log/type` → 内容: `longrun`
-- ✅ `user/contents.d/<service>-pipeline` → 空文件
+**正确方式**:
+在 s6-overlay v3 中，如果服务目录下有 `log/` 子目录：
+- ✅ `log/` 目录应该包含 `type` (longrun) 和 `run` 脚本
+- ✅ s6-overlay 会**自动**识别 `log/` 目录并创建管道
+- ✅ **不需要** `producer-for`, `consumer-for`, `pipeline-name` 文件
+- ✅ 直接在 `user/contents.d/` 中添加服务名（如 `mihomo`），不是 `mihomo-pipeline`
+- ✅ s6 会自动处理服务输出到 log 的重定向
 
-**配置的 Pipeline**:
-- ✅ mihomo-pipeline
-- ✅ watcher-pipeline
-- ✅ tinc-pipeline
-- ✅ mosdns-pipeline
-- ✅ easytier-pipeline
-- ✅ dnsmasq-pipeline
-- ✅ dns-monitor-pipeline
+**修复**: 
+- 删除了所有 `producer-for`, `consumer-for`, `pipeline-name` 文件
+- 删除了 `user/contents.d/*-pipeline` 文件
+- 在 `user/contents.d/` 中直接添加服务名
+**修复**: 
+- 删除了所有 `producer-for`, `consumer-for`, `pipeline-name` 文件
+- 删除了 `user/contents.d/*-pipeline` 文件
+- 在 `user/contents.d/` 中直接添加服务名
+
+**带日志的服务**:
+- ✅ mihomo
+- ✅ watcher
+- ✅ tinc
+- ✅ mosdns
+- ✅ easytier
+- ✅ dnsmasq
+- ✅ dns-monitor
+
+### 9. 更新工具脚本 ✅
+**问题**: get-logs 和 get-services 脚本使用旧的 s6 v2 路径和命令
+
+**修复**:
+
+#### get-logs.sh:
+- ❌ 旧路径: `/var/log/<service>.out.log` (单个文件)
+- ✅ 新路径: `/var/log/<service>/current` (s6-log 目录结构)
+
+#### get-services.sh:
+- ❌ 旧路径: `/etc/s6-overlay/sv/<service>`
+- ✅ 新路径: `/run/service/<service>` (运行时服务目录)
+- ❌ 旧命令: `s6-rc listall`, 手动检查 `/etc/s6-overlay/sv/`
+- ✅ 新命令: `s6-rc-db list all`, `s6-rc -a list`
+- ✅ 新增: Pipeline 和 Bundle 状态显示
 
 ## 最终结构
 
@@ -119,20 +148,21 @@ exec logutil-service /var/log/mihomo
 default (bundle)
   └── user (bundle)
       ├── dbus (longrun)
-      ├── avahi (longrun)
+      ├── avahi (longrun) - depends on: dbus
       ├── watchfrr (longrun)
-      ├── mihomo-pipeline
-      │   ├── mihomo (longrun, producer)
-      │   └── mihomo-log (longrun, consumer)
-      ├── watcher-pipeline
-      │   ├── watcher (longrun, producer)
-      │   └── watcher-log (longrun, consumer)
-      ├── tinc-pipeline
-      ├── mosdns-pipeline
-      ├── easytier-pipeline
-      ├── dnsmasq-pipeline
-      └── dns-monitor-pipeline
+      ├── watcher (longrun) - depends on: dbus, avahi, watchfrr
+      ├── mihomo (longrun with log/)
+      ├── easytier (longrun with log/)
+      ├── tinc (longrun with log/)
+      ├── mosdns (longrun with log/)
+      ├── dnsmasq (longrun with log/)
+      └── dns-monitor (longrun with log/)
 ```
+
+**注意**: 每个带 `log/` 的服务，s6-overlay 会自动：
+1. 识别 `log/` 子目录
+2. 创建从服务到 log 的管道
+3. 启动 log 服务接收主服务的输出
 
 ### 依赖关系:
 ```
@@ -156,13 +186,13 @@ s6-services/
 │       ├── dbus (空文件)
 │       ├── avahi (空文件)
 │       ├── watchfrr (空文件)
-│       ├── mihomo-pipeline (空文件)
-│       ├── watcher-pipeline (空文件)
-│       ├── tinc-pipeline (空文件)
-│       ├── mosdns-pipeline (空文件)
-│       ├── easytier-pipeline (空文件)
-│       ├── dnsmasq-pipeline (空文件)
-│       └── dns-monitor-pipeline (空文件)
+│       ├── watcher (空文件)
+│       ├── mihomo (空文件)
+│       ├── easytier (空文件)
+│       ├── tinc (空文件)
+│       ├── mosdns (空文件)
+│       ├── dnsmasq (空文件)
+│       └── dns-monitor (空文件)
 ├── dbus/
 │   ├── type (longrun)
 │   ├── run (可执行)
@@ -196,16 +226,15 @@ s6-services/
 └── mihomo/ (及其他带日志的服务，结构类似)
     ├── type (longrun)
     ├── run (可执行)
-    ├── producer-for (内容: mihomo-log)
     ├── finish (可选)
     ├── dependencies.d/
     │   └── base (空文件)
     └── log/
         ├── type (longrun)
-        ├── run (可执行)
-        ├── consumer-for (内容: mihomo)
-        └── pipeline-name (内容: mihomo-pipeline)
+        └── run (可执行)
 ```
+
+**重要**: log/ 目录会被 s6-overlay **自动识别和处理**，不需要额外的 pipeline 配置文件。
 
 ## 验证
 
@@ -245,5 +274,7 @@ docker compose up -d
 4. **Bundle 结构**: 使用 `contents.d/` 目录，而不是 `contents` 文件
 5. **依赖文件**: 必须是空文件，文件名即依赖名
 6. **日志语法**: 使用 `logutil-service`，而不是 `s6-svlogd`
-7. **Pipeline**: 必须显式配置 producer-for, consumer-for, pipeline-name
-8. **base 依赖**: 所有服务都应该依赖 `base`
+7. **日志目录**: `/var/log/<service>/current`，而不是 `/var/log/<service>.out.log`
+8. **Log 处理**: log/ 子目录会被 s6 自动识别，不需要 pipeline 配置文件
+9. **base 依赖**: 所有服务都应该依赖 `base`
+10. **服务列表**: 在 `user/contents.d/` 中直接列出服务名，不是 pipeline 名
