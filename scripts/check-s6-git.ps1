@@ -40,8 +40,11 @@ Write-Host ""
 
 # Check for staged deletions
 Write-Host "Checking for staged deletions of important files..." -ForegroundColor Cyan
+# Exclude watcher-managed services that were intentionally removed from user bundle
 $deleted = git diff --cached --name-only --diff-filter=D | Where-Object {
-    $_ -match "^s6-services/" -and ($_ -match "dependencies\.d/" -or $_ -match "contents\.d/")
+    $_ -match "^s6-services/" -and 
+    ($_ -match "dependencies\.d/" -or $_ -match "contents\.d/") -and
+    $_ -notmatch "user/contents\.d/(dnsmasq|easytier|mihomo|mosdns|tinc)$"
 }
 
 if ($deleted) {

@@ -39,7 +39,8 @@ echo "" >&2
 
 # Check for staged deletions of important files
 echo "Checking for staged deletions of important files..." >&2
-deleted=$(git diff --cached --name-only --diff-filter=D | grep "^s6-services/" | grep -E "(dependencies\.d/|contents\.d/)")
+# Exclude watcher-managed services that were intentionally removed from user bundle
+deleted=$(git diff --cached --name-only --diff-filter=D | grep "^s6-services/" | grep -E "(dependencies\.d/|contents\.d/)" | grep -vE "user/contents\.d/(dnsmasq|easytier|mihomo|mosdns|tinc)$")
 if [ -n "$deleted" ]; then
     echo "⚠️  WARNING: Important files are staged for deletion:" >&2
     echo "$deleted" | sed 's/^/  - /' >&2
