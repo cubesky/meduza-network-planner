@@ -120,7 +120,7 @@ found_errors=0
 for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
     log_file="/var/log/${service}/current"
     if [[ -f "$log_file" ]]; then
-        errors=$(grep -i "error\|fail\|fatal\|exception" "$log_file" 2>/dev/null | tail -n 3)
+        errors=$(grep -Ei "error|fail|fatal|exception" "$log_file" 2>/dev/null | tail -n 3)
         if [[ -n "$errors" ]]; then
             echo "  ${service}:" >&2
             echo "$errors" | sed 's/^/    /' >&2
