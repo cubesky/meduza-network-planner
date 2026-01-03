@@ -2,5 +2,4 @@
 # s6-overlay service script for avahi-daemon
 with-contenv
 fdmove -c 2 1
-/command/s6-setenv AVAHI_DAEMON_DETECT_LOCAL 0
-exec /usr/sbin/avahi-daemon --no-chroot --debug
+exec /usr/bin/env AVAHI_DAEMON_DETECT_LOCAL=0 /usr/sbin/avahi-daemon --no-chroot --debug
