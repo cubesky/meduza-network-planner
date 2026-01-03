@@ -8,7 +8,7 @@ mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
 mkdir -p /var/log
 
 # s6 logutil-service runs as nobody; ensure log dirs exist and are writable.
-for svc in watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
+for svc in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
   install -d -m 02755 -o nobody -g nogroup "/var/log/${svc}"
 done
 

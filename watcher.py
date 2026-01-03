@@ -37,6 +37,18 @@ UPDATE_TTL_SECONDS = int(os.environ.get("UPDATE_TTL_SECONDS", "60"))
 OPENVPN_STATUS_INTERVAL = int(os.environ.get("OPENVPN_STATUS_INTERVAL", "10"))
 WIREGUARD_STATUS_INTERVAL = int(os.environ.get("WIREGUARD_STATUS_INTERVAL", "10"))
 S6_RETRY_INTERVAL = int(os.environ.get("S6_RETRY_INTERVAL", "30"))
+S6_PIPELINE_SERVICES = {
+    "dbus",
+    "avahi",
+    "watchfrr",
+    "watcher",
+    "mihomo",
+    "easytier",
+    "tinc",
+    "mosdns",
+    "dnsmasq",
+    "dns-monitor",
+}
 
 
 def sha(obj: Any) -> str:
@@ -345,9 +357,14 @@ def _s6_status(name: str) -> str:
             return "down"
         # Check if service is in the list of active services
         services = cp.stdout.strip().split() if cp.stdout.strip() else []
-        return "up" if name in services else "down"
+        target = _s6_unit(name)
+        return "up" if target in services or name in services else "down"
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return "down"
+
+
+def _s6_unit(name: str) -> str:
+    return f"{name}-pipeline" if name in S6_PIPELINE_SERVICES else name
 
 
 def _s6_live_dir() -> str:
@@ -399,18 +416,21 @@ def _s6_status_all() -> Dict[str, str]:
 
 def _s6_start(name: str) -> None:
     """Start an s6 service."""
-    subprocess.run(["s6-rc", "-u", name], capture_output=True)
+    target = _s6_unit(name)
+    subprocess.run(["s6-rc", "-u", target], capture_output=True)
 
 
 def _s6_stop(name: str) -> None:
     """Stop an s6 service."""
-    subprocess.run(["s6-rc", "-d", name], capture_output=True)
+    target = _s6_unit(name)
+    subprocess.run(["s6-rc", "-d", target], capture_output=True)
 
 
 def _s6_restart(name: str) -> None:
     """Restart an s6 service."""
     # s6-rc -r restarts a service
-    subprocess.run(["s6-rc", "-r", name], capture_output=True)
+    target = _s6_unit(name)
+    subprocess.run(["s6-rc", "-r", target], capture_output=True)
 
 
 def _s6_is_running(name: str) -> bool:
