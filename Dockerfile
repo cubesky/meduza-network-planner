@@ -1,6 +1,7 @@
 FROM library/debian:12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/command:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Versions can be overridden at build time:
 #   docker build --build-arg EASYTIER_VERSION=2.4.5 --build-arg MIHOMO_VERSION=1.19.17 --build-arg TINC_VERSION=1.1pre18 --build-arg MOSDNS_VERSION=5.3.3 .

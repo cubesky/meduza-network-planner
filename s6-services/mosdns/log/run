@@ -1,2 +1,2 @@
 #!/bin/sh
-exec logutil-service /var/log/mosdns
+exec /command/logutil-service /var/log/mosdns
