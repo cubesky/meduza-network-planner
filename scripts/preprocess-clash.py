@@ -13,7 +13,6 @@ Clash 配置预处理脚本
 """
 
 import base64
-import hashlib
 import ipaddress
 import os
 import re
@@ -182,9 +181,8 @@ def download_provider(url: str, output_dir: str, provider_name: str) -> str:
     ext = os.path.splitext(basename)[1] if basename else ""
     if not ext:
         ext = ".yml"
-    short = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     safe_name = _safe_name(provider_name)
-    local_path = os.path.join(output_dir, f"{safe_name}-{short}{ext}")
+    local_path = os.path.join(output_dir, f"{safe_name}{ext}")
 
     # 写入文件
     os.makedirs(output_dir, exist_ok=True)
