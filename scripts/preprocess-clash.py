@@ -12,7 +12,10 @@ Clash 配置预处理脚本
     python3 preprocess-clash.py /etc/clash/config.yaml /etc/clash/providers/
 """
 
+import base64
+import ipaddress
 import os
+import re
 import sys
 import yaml
 import json
@@ -20,8 +23,8 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
-from typing import Set, List, Dict, Any
+from urllib.parse import urlparse, unquote
+from typing import Set, List, Dict, Any, Optional
 
 
 def curl_download(url: str, timeout: int = 10) -> str:
@@ -88,6 +91,73 @@ def resolve_hostname(hostname: str) -> Set[str]:
     return ips
 
 
+def _maybe_decode_base64(text: str) -> Optional[str]:
+    stripped = "".join(text.split())
+    if not stripped:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", stripped):
+        return None
+    padding = (-len(stripped)) % 4
+    if padding:
+        stripped += "=" * padding
+    try:
+        decoded = base64.urlsafe_b64decode(stripped)
+    except Exception:
+        return None
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _host_from_ss(link: str) -> Optional[str]:
+    rest = link[len("ss://"):]
+    rest = rest.split("#", 1)[0]
+    rest = rest.split("?", 1)[0]
+    rest = unquote(rest)
+    if "@" in rest:
+        hostport = rest.rsplit("@", 1)[1]
+        return hostport.split(":", 1)[0] if hostport else None
+    decoded = _maybe_decode_base64(rest)
+    if not decoded or "@" not in decoded:
+        return None
+    hostport = decoded.rsplit("@", 1)[1]
+    return hostport.split(":", 1)[0] if hostport else None
+
+
+def _host_from_link(link: str) -> Optional[str]:
+    if link.startswith("ss://"):
+        return _host_from_ss(link)
+    if "://" not in link:
+        return None
+    parsed = urlparse(link)
+    return parsed.hostname
+
+
+def extract_ips_from_subscription_text(text: str) -> Set[str]:
+    ips: Set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        host = _host_from_link(line)
+        if not host:
+            continue
+        if _is_ip(host):
+            ips.add(host)
+        else:
+            ips.update(resolve_hostname(host))
+    return ips
+
+
 def download_provider(url: str, output_dir: str) -> str:
     """下载 provider 配置到本地"""
     print(f"[*] 下载 provider: {url}", flush=True)
@@ -135,13 +205,44 @@ def process_providers(config: Dict[str, Any], provider_dir: str) -> Set[str]:
         # 读取下载的配置
         try:
             with open(local_path, encoding="utf-8") as f:
-                provider_data = yaml.safe_load(f) or {}
+                provider_data = yaml.safe_load(f)
         except Exception as e:
             print(f"[!] 无法解析 {local_path}: {e}", flush=True)
             continue
 
+        if isinstance(provider_data, str):
+            decoded = _maybe_decode_base64(provider_data)
+            candidate = decoded or provider_data
+            link_ips = extract_ips_from_subscription_text(candidate)
+            if link_ips:
+                all_ips.update(link_ips)
+                print(f"[✓] from {provider_name} extracted {len(link_ips)} IP (links)", flush=True)
+            if decoded:
+                try:
+                    provider_data = yaml.safe_load(decoded)
+                    if isinstance(provider_data, dict):
+                        print(f"[*] provider base64 decoded yaml: {local_path}", flush=True)
+                    else:
+                        print(f"[!] provider config invalid ({type(provider_data).__name__}): {local_path}", flush=True)
+                        continue
+                except Exception as e:
+                    print(f"[!] provider base64 parse failed: {local_path}: {e}", flush=True)
+                    continue
+            else:
+                if link_ips:
+                    continue
+                print(f"[!] provider config invalid (str): {local_path}", flush=True)
+                continue
+
         # 提取代理
+        if not isinstance(provider_data, dict):
+            print(f"[!] provider config invalid ({type(provider_data).__name__}): {local_path}", flush=True)
+            continue
+
         proxies = provider_data.get("proxies", [])
+        if not isinstance(proxies, list):
+            print(f"[!] provider proxies invalid: {local_path}", flush=True)
+            proxies = []
         if proxies:
             ips = extract_ips_from_proxies(proxies)
             all_ips.update(ips)
