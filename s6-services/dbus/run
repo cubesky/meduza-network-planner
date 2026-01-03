@@ -2,5 +2,4 @@
 # s6-overlay service script for dbus
 with-contenv
 fdmove -c 2 1
-if { test -f /run/dbus/pid } /bin/rm -f /run/dbus/pid
-exec /usr/bin/dbus-daemon --system --nofork
+exec /usr/local/bin/run-dbus.sh

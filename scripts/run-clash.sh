@@ -9,8 +9,13 @@ mkdir -p "${DATA_DIR}"
 mkdir -p "${PROVIDERS_DIR}"
 mkdir -p "$(dirname "${PID_FILE}")"
 
+if [ ! -s "${CFG}" ]; then
+    echo "error: clash config missing or empty: ${CFG}" >&2
+    exit 1
+fi
+
 # 1. 下载 GeoX 文件如果配置了
-python3 - <<'PY'
+if ! python3 - <<'PY'
 import os
 import sys
 import yaml
@@ -42,10 +47,17 @@ for url in urls:
     out_path = os.path.join(data_dir, name)
     os.system(f"curl -fL --retry 2 --connect-timeout 10 -o '{out_path}' '{url}'")
 PY
+then
+    echo "error: geox download failed" >&2
+    exit 1
+fi
 
 # 2. 预处理 proxy-provider: 下载并提取 IP
 echo "[*] 预处理 proxy-providers..." >&2
-python3 /usr/local/bin/preprocess-clash.py "${CFG}" "${PROVIDERS_DIR}"
+if ! python3 /usr/local/bin/preprocess-clash.py "${CFG}" "${PROVIDERS_DIR}"; then
+    echo "error: preprocess-clash failed" >&2
+    exit 1
+fi
 
 # 3. 如果存在代理服务器 IP 列表,创建 ipset
 PROXY_IPS_FILE="${PROVIDERS_DIR}/proxy_servers.txt"
@@ -92,6 +104,10 @@ trap 'rm -f "${PID_FILE}"; exit' INT TERM EXIT
 # Wait for mihomo process
 wait ${MIHOMO_PID}
 EXIT_CODE=$?
+
+if [ ${EXIT_CODE} -ne 0 ]; then
+    echo "error: mihomo exited with code ${EXIT_CODE}" >&2
+fi
 
 # Clean up PID file on exit
 rm -f "${PID_FILE}"

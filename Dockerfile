@@ -152,6 +152,7 @@ COPY generators/ /generators/
 COPY s6-services/ /etc/s6-overlay/s6-rc.d/
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
 COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
+COPY scripts/run-dbus.sh /usr/local/bin/run-dbus.sh
 COPY scripts/preprocess-clash.py /usr/local/bin/preprocess-clash.py
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
 COPY scripts/run-tinc.sh /usr/local/bin/run-tinc.sh
@@ -168,7 +169,7 @@ COPY avahi/avahi-daemon.conf /etc/avahi/avahi-daemon.conf
 COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
-    /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-easytier.sh \
+    /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-dbus.sh /usr/local/bin/run-easytier.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
     /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh \
     /usr/local/bin/get-logs /usr/local/bin/get-services \
