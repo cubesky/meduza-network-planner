@@ -751,26 +751,78 @@ def monitor_children_loop():
 def s6_retry_loop():
     backoffs: Dict[str, Backoff] = {}
     next_time: Dict[str, float] = {}
+
+    def should_try(key: str) -> bool:
+        return time.time() >= next_time.get(key, 0)
+
+    def on_fail(key: str) -> None:
+        b = backoffs.setdefault(key, Backoff())
+        next_time[key] = time.time() + b.next_sleep()
+
+    def on_ok(key: str) -> None:
+        b = backoffs.setdefault(key, Backoff())
+        b.reset()
+        next_time[key] = 0
+
     while True:
         time.sleep(max(5, S6_RETRY_INTERVAL))
         try:
-            statuses = _s6_status_all()
-            now = time.time()
-            for name, state in statuses.items():
-                if name == "watcher":
+            node = load_prefix(f"/nodes/{NODE_ID}/")
+            global_cfg = load_prefix("/global/")
+            mesh_type = global_cfg.get("/global/mesh_type", "easytier")
+
+            clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
+            mosdns_enabled = node.get(f"/nodes/{NODE_ID}/mosdns/enable") == "true"
+            clash_ready = True
+            if clash_enabled and mosdns_enabled:
+                clash_ready = _clash_is_ready()
+
+            desired: Dict[str, Optional[bool]] = {
+                "mihomo": clash_enabled,
+            }
+
+            if mesh_type == "tinc":
+                desired["tinc"] = node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true"
+                desired["easytier"] = False
+            else:
+                desired["easytier"] = node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true"
+                desired["tinc"] = False
+
+            if not mosdns_enabled:
+                desired["mosdns"] = False
+                desired["dnsmasq"] = False
+            elif clash_enabled and not clash_ready:
+                desired["mosdns"] = None
+                desired["dnsmasq"] = None
+            else:
+                desired["mosdns"] = True
+                desired["dnsmasq"] = True
+
+            for name, want in desired.items():
+                state = _s6_status(name)
+                if want is None:
+                    on_ok(name)
                     continue
-                # s6-overlay uses "down" for stopped services
-                # We only retry services that should be running but are down
-                if state == "up":
-                    if name in backoffs:
-                        backoffs[name].reset()
-                        next_time[name] = 0
-                    continue
-                # Service is down - check if it should be running
-                # For now, we'll skip the retry logic since s6 handles restarts automatically
-                # This loop is mainly for logging and monitoring
-                if state == "down" and name not in backoffs:
-                    print(f"[s6-retry] service {name} is down", flush=True)
+                if want:
+                    if state != "up" and should_try(name):
+                        print(f"[s6-retry] starting {name} (desired up)", flush=True)
+                        _s6_start(name)
+                        if _s6_status(name) == "up":
+                            on_ok(name)
+                        else:
+                            on_fail(name)
+                    elif state == "up":
+                        on_ok(name)
+                else:
+                    if state == "up" and should_try(name):
+                        print(f"[s6-retry] stopping {name} (desired down)", flush=True)
+                        _s6_stop(name)
+                        if _s6_status(name) == "up":
+                            on_fail(name)
+                        else:
+                            on_ok(name)
+                    elif state != "up":
+                        on_ok(name)
         except Exception as e:
             print(f"[s6-retry] error: {e}", flush=True)
             continue
@@ -1629,15 +1681,18 @@ def handle_commit() -> None:
                     print(f"[clash] waiting for process to start... (attempt {attempt + 1}/10)", flush=True)
                     time.sleep(1)
                 else:
-                    print("[clash] failed to start after 10s", flush=True)
-                    raise RuntimeError("Clash failed to start")
+                    print("[clash] WARNING: process not started after 10s; will retry later", flush=True)
             else:
                 # Reload configuration when already running.
                 reload_clash(out["config_yaml"])
 
             # Wait for Clash to be ready (url-test groups have selected nodes)
-            print("[clash] waiting for url-test proxies to select nodes...", flush=True)
-            clash_ready = _wait_clash_ready(timeout=60)
+            if not _s6_is_running("mihomo"):
+                print("[clash] not running yet, skipping readiness check", flush=True)
+                clash_ready = False
+            else:
+                print("[clash] waiting for url-test proxies to select nodes...", flush=True)
+                clash_ready = _wait_clash_ready(timeout=60)
 
             # Apply tproxy ONLY after Clash is ready (to avoid network disruption)
             if new_mode == "tproxy":

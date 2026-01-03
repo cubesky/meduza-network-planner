@@ -13,6 +13,7 @@ Clash 配置预处理脚本
 """
 
 import base64
+import hashlib
 import ipaddress
 import os
 import re
@@ -158,7 +159,15 @@ def extract_ips_from_subscription_text(text: str) -> Set[str]:
     return ips
 
 
-def download_provider(url: str, output_dir: str) -> str:
+def _safe_name(name: str) -> str:
+    if not name:
+        return "provider"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    safe = safe.strip("._")
+    return safe or "provider"
+
+
+def download_provider(url: str, output_dir: str, provider_name: str) -> str:
     """下载 provider 配置到本地"""
     print(f"[*] 下载 provider: {url}", flush=True)
 
@@ -167,10 +176,15 @@ def download_provider(url: str, output_dir: str) -> str:
         print(f"[!] 无法下载 {url}", flush=True)
         return None
 
-    # 解析内容以获取文件名
+    # 生成稳定且不冲突的文件名
     parsed = urlparse(url)
-    basename = os.path.basename(parsed.path) or "provider.yml"
-    local_path = os.path.join(output_dir, basename)
+    basename = os.path.basename(parsed.path)
+    ext = os.path.splitext(basename)[1] if basename else ""
+    if not ext:
+        ext = ".yml"
+    short = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    safe_name = _safe_name(provider_name)
+    local_path = os.path.join(output_dir, f"{safe_name}-{short}{ext}")
 
     # 写入文件
     os.makedirs(output_dir, exist_ok=True)
@@ -198,7 +212,7 @@ def process_providers(config: Dict[str, Any], provider_dir: str) -> Set[str]:
             continue
 
         # 下载到本地
-        local_path = download_provider(url, provider_dir)
+        local_path = download_provider(url, provider_dir, provider_name)
         if not local_path:
             continue
 
