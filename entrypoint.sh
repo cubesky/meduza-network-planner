@@ -7,6 +7,11 @@ mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc /run/wireguard /run/dbu
 mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
 mkdir -p /var/log
 
+# s6 logutil-service runs as nobody; ensure log dirs exist and are writable.
+for svc in watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
+  install -d -m 02755 -o nobody -g nogroup "/var/log/${svc}"
+done
+
 # Ensure stable DNS before services start.
 /usr/local/bin/run-dns-monitor.sh --once
 

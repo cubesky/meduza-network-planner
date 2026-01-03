@@ -171,6 +171,7 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
     /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh \
     /usr/local/bin/get-logs /usr/local/bin/get-services \
-    /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish 2>/dev/null || true
+    /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish \
+    /etc/s6-overlay/s6-rc.d/*/log/run 2>/dev/null || true
 
 ENTRYPOINT ["/entrypoint.sh"]
