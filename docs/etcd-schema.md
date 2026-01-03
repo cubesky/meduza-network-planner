@@ -79,6 +79,8 @@ Schema (per instance):
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/update_source     # e.g. tun0 / tun1 ...
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/enable            # "true" | "false"
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/weight
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/no_transit        # "true" | "false", default "false"
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/no_forward        # "true" | "false", default "false"
 ```
 
 Status reporting:
@@ -95,6 +97,9 @@ ENV:
 Notes:
 - 不再支持直接下发 `config`，必须由上述结构化键生成。
 - `secret/ca/cert/key/tls_auth/tls_crypt` 只能使用 inline 内容。
+- **no_transit**: 当设置为 `true` 时，不通过该邻居发送流量（但仍然发送直接属于对方网络的路由）。只向该邻居通告本地起源的路由和从该邻居学来的路由，不通告从其他邻居学来的路由。这可以防止该邻居成为我方的中转路径。默认为 `false`（允许中转）。
+- **no_forward**: 当设置为 `true` 时，不允许该邻居从我方路由流量（但允许对方访问我方网络）。只向该邻居通告本地起源的路由，不转发从其他 BGP 邻居学来的任何路由。这可以防止该邻居将我方作为中转节点。此选项比 `no_transit` 更严格。默认为 `false`（允许转发所有路由）。
+- 如果同时设置了 `no_transit` 和 `no_forward`，`no_forward` 优先生效（因为它更严格）。
 
 
 ## WireGuard
@@ -124,6 +129,8 @@ Schema (per instance):
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/update_source     # ignored (auto from dev)
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/enable            # "true" | "false"
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/weight
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/no_transit        # "true" | "false", default "false"
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/no_forward        # "true" | "false", default "false"
 ```
 
 Status reporting:
@@ -143,6 +150,9 @@ Notes:
 - WireGuard does not manage routes; routing is handled by FRR.
 - If `allowed_ips` is empty, it defaults to `0.0.0.0/0`.
 - `bgp/enable` defaults to `true` when omitted.
+- **no_transit**: 当设置为 `true` 时，不通过该邻居发送流量（但仍然发送直接属于对方网络的路由）。只向该邻居通告本地起源的路由和从该邻居学来的路由，不通告从其他邻居学来的路由。这可以防止该邻居成为我方的中转路径。默认为 `false`（允许中转）。
+- **no_forward**: 当设置为 `true` 时，不允许该邻居从我方路由流量（但允许对方访问我方网络）。只向该邻居通告本地起源的路由，不转发从其他 BGP 邻居学来的任何路由。这可以防止该邻居将我方作为中转节点。此选项比 `no_transit` 更严格。默认为 `false`（允许转发所有路由）。
+- 如果同时设置了 `no_transit` 和 `no_forward`，`no_forward` 优先生效（因为它更严格）。
 
 
 ## Global BGP filter (shared for all neighbors)

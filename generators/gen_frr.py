@@ -243,6 +243,27 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
     lines.append("!")
     lines.append("")
 
+    # Prefix list for local-originated networks (LAN + private_lan + edge_broadcast)
+    local_originated_prefixes: List[str] = []
+    local_originated_prefixes.extend(lans)
+    if internal_routing == "bgp":
+        local_originated_prefixes.extend(private_lans)
+    local_originated_prefixes = sorted(set(local_originated_prefixes))
+    
+    if local_originated_prefixes or bgp_edge_broadcast:
+        seq = 10
+        for pfx in local_originated_prefixes:
+            lines.append(f"ip prefix-list PL-LOCAL-ORIGINATED seq {seq} permit {pfx}")
+            seq += 10
+        # Add edge broadcast prefixes if this is an exit node
+        ovpn = _parse_openvpn(node_id, node)
+        wg = _parse_wireguard(node_id, node)
+        if _node_is_exit(ovpn, wg):
+            for pfx in bgp_edge_broadcast:
+                lines.append(f"ip prefix-list PL-LOCAL-ORIGINATED seq {seq} permit {pfx}")
+                seq += 10
+        lines.append("")
+
     if private_lans:
         seq = 10
         for pfx in private_lans:
@@ -313,13 +334,70 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         lines += ["!", ""]
 
     if bgp_enable and local_as:
+        ovpn = _parse_openvpn(node_id, node)
+        wg = _parse_wireguard(node_id, node)
+        self_is_exit = _node_is_exit(ovpn, wg)
+        
+        # Create per-neighbor route-maps for no_transit and no_forward
+        neighbor_route_maps: Dict[str, Dict[str, str]] = {}
+        for kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
+            if cfg.get("enable") != "true":
+                continue
+            if not _bgp_enabled(cfg):
+                continue
+            peer_ip = cfg.get("bgp/peer_ip", "")
+            peer_asn = cfg.get("bgp/peer_asn", "")
+            if not peer_ip or not peer_asn:
+                continue
+            
+            no_transit = cfg.get("bgp/no_transit", "false") == "true"
+            no_forward = cfg.get("bgp/no_forward", "false") == "true"
+            
+            # Create unique route-map names for this neighbor if needed
+            rm_in = f"RM-BGP-IN"
+            rm_out = f"RM-BGP-OUT-EXTERNAL" if private_lans else "RM-BGP-OUT"
+            
+            # no_forward takes precedence over no_transit (more restrictive)
+            if no_forward:
+                # Only advertise local-originated routes (not learned from other BGP neighbors)
+                rm_out = f"RM-BGP-OUT-{peer_ip.replace('.', '-')}"
+                lines.append(f"route-map {rm_out} permit 10")
+                lines.append(" match ip address prefix-list PL-LOCAL-ORIGINATED")
+                if private_lans:
+                    lines.append(" call RM-BGP-OUT-EXTERNAL")
+                else:
+                    lines.append(" call RM-BGP-OUT")
+                lines.append("!")
+                lines.append("")
+            elif no_transit:
+                # no_transit: only send back routes that came from this peer + local-originated routes
+                # Allow transit of learned routes to this peer, but only routes learned from this peer
+                rm_out = f"RM-BGP-OUT-{peer_ip.replace('.', '-')}"
+                lines.append(f"bgp as-path access-list AS-PATH-FROM-{peer_ip.replace('.', '-')} permit _{peer_asn}_")
+                lines.append(f"bgp as-path access-list AS-PATH-FROM-{peer_ip.replace('.', '-')} permit ^{peer_asn} ")
+                lines.append(f"bgp as-path access-list AS-PATH-FROM-{peer_ip.replace('.', '-')} permit ^{peer_asn}$")
+                lines.append("")
+                lines.append(f"route-map {rm_out} permit 5")
+                lines.append(" match ip address prefix-list PL-LOCAL-ORIGINATED")
+                if private_lans:
+                    lines.append(" call RM-BGP-OUT-EXTERNAL")
+                else:
+                    lines.append(" call RM-BGP-OUT")
+                lines.append(f"route-map {rm_out} permit 10")
+                lines.append(f" match as-path AS-PATH-FROM-{peer_ip.replace('.', '-')}")
+                if private_lans:
+                    lines.append(" call RM-BGP-OUT-EXTERNAL")
+                else:
+                    lines.append(" call RM-BGP-OUT")
+                lines.append("!")
+                lines.append("")
+            
+            neighbor_route_maps[peer_ip] = {"in": rm_in, "out": rm_out}
+        
         lines.append(f"router bgp {local_as}")
         if router_id:
             lines.append(f" bgp router-id {router_id}")
 
-        ovpn = _parse_openvpn(node_id, node)
-        wg = _parse_wireguard(node_id, node)
-        self_is_exit = _node_is_exit(ovpn, wg)
         for kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
             if cfg.get("enable") != "true":
                 continue
@@ -368,11 +446,12 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"  neighbor {peer_ip} activate")
                 if weight:
                     lines.append(f"  neighbor {peer_ip} weight {weight}")
-                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
-                if private_lans:
-                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
-                else:
-                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                # Use per-neighbor route-map if available
+                rm_maps = neighbor_route_maps.get(peer_ip, {})
+                rm_in = rm_maps.get("in", "RM-BGP-IN")
+                rm_out = rm_maps.get("out", "RM-BGP-OUT-EXTERNAL" if private_lans else "RM-BGP-OUT")
+                lines.append(f"  neighbor {peer_ip} route-map {rm_in} in")
+                lines.append(f"  neighbor {peer_ip} route-map {rm_out} out")
                 # Enable BGP transit if peer ASN is in the allowed list or '*' is set
                 if bgp_transit_all or (bgp_transit_as_list and peer_asn in bgp_transit_as_list):
                     lines.append(f"  neighbor {peer_ip} next-hop-self")
