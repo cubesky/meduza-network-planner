@@ -1,4 +1,4 @@
 #!/bin/bash
 set -euo pipefail
 
-exec dnsmasq --conf-file=/etc/dnsmasq.conf
+exec dnsmasq --keep-in-foreground --conf-file=/etc/dnsmasq.conf
