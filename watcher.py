@@ -373,8 +373,8 @@ def _s6_live_dir() -> str:
     for candidate in (
         os.environ.get("S6_RC_LIVE"),
         os.environ.get("S6RC_LIVE"),
-        "/run/service",
         "/run/s6-rc",
+        "/run/service",
     ):
         if candidate and os.path.isdir(candidate):
             return candidate
@@ -577,16 +577,34 @@ def _s6_remove_dynamic_service(name: str) -> None:
 
 def _s6_reload_services() -> None:
     """Reload s6 services database after adding/removing services."""
+    tmp_source_dir = None
     try:
-        base_source = "/etc/s6-overlay/s6-rc.d"
+        internal_source = "/package/admin/s6-overlay/etc/s6-overlay/s6-rc.d"
         runtime_source = "/run/s6-rc/source"
-        if os.path.isdir(base_source):
-            source_dir = base_source
+        base_source = "/etc/s6-overlay/s6-rc.d"
+
+        sources: List[str] = []
+        if os.path.isdir(internal_source):
+            sources.append(internal_source)
         elif os.path.isdir(runtime_source):
-            source_dir = runtime_source
-        else:
+            sources.append(runtime_source)
+
+        if os.path.isdir(base_source):
+            sources.append(base_source)
+
+        if not sources:
             print("[s6] no service source directory found", flush=True)
             return
+
+        tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
+        for src in sources:
+            shutil.copytree(src, tmp_source_dir, dirs_exist_ok=True)
+        source_dir = tmp_source_dir
+        base_dir = os.path.join(source_dir, "base")
+        if not os.path.isdir(base_dir):
+            os.makedirs(os.path.join(base_dir, "contents.d"), exist_ok=True)
+            _write_if_changed(os.path.join(base_dir, "type"), "bundle\n")
+            print("[s6] base service missing; created fallback bundle", flush=True)
 
         compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
         compile_cp = subprocess.run(
@@ -611,6 +629,9 @@ def _s6_reload_services() -> None:
             print(f"[s6] failed to update services: {err}", flush=True)
     except Exception as e:
         print(f"[s6] failed to reload services: {e}", flush=True)
+    finally:
+        if tmp_source_dir:
+            shutil.rmtree(tmp_source_dir, ignore_errors=True)
 
 
 
