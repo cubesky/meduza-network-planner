@@ -440,10 +440,21 @@ def _s6_svstat_state(name: str) -> Optional[str]:
 
 
 def _s6_rc(cmd: str, target: str) -> bool:
+    # Check if s6-rc is initialized before attempting operations
+    live_dir = _s6_live_dir()
+    db_dir = os.path.join(live_dir, "db")
+    if not os.path.isdir(live_dir) or not os.path.isdir(db_dir):
+        print(f"[s6] {cmd} {target} skipped: s6-rc not initialized", flush=True)
+        return False
+    
     cp = subprocess.run(["s6-rc", cmd, target], capture_output=True, text=True)
     if cp.returncode != 0:
         msg = cp.stderr.strip() or cp.stdout.strip() or "unknown error"
-        print(f"[s6] {cmd} {target} failed: {msg}", flush=True)
+        # Don't spam errors if s6-rc isn't initialized yet
+        if "unable to take locks" not in msg.lower():
+            print(f"[s6] {cmd} {target} failed: {msg}", flush=True)
+        else:
+            print(f"[s6] {cmd} {target} failed: s6-rc not ready (lock error)", flush=True)
         return False
     return True
 
@@ -584,6 +595,18 @@ def _s6_reload_services() -> None:
         tmp_source_dir = None
         compiled_dir = None
         try:
+            # Wait for s6-rc to be fully initialized
+            live_dir = _s6_live_dir()
+            if not os.path.isdir(live_dir):
+                print(f"[s6] live directory {live_dir} does not exist, skipping reload", flush=True)
+                return
+            
+            # Check if db directory exists (indicates s6-rc is initialized)
+            db_dir = os.path.join(live_dir, "db")
+            if not os.path.isdir(db_dir):
+                print(f"[s6] db directory {db_dir} does not exist, s6-rc not fully initialized, skipping reload", flush=True)
+                return
+
             internal_source = "/package/admin/s6-overlay/etc/s6-overlay/s6-rc.d"
             runtime_source = "/run/s6-rc/source"
             base_source = "/etc/s6-overlay/s6-rc.d"
@@ -2145,6 +2168,22 @@ def update_etcd_hosts() -> None:
 
 
 def main() -> None:
+    # Wait for s6-rc to be fully initialized before starting
+    max_wait = 30  # Maximum wait time in seconds
+    wait_interval = 0.5
+    waited = 0
+    print("[init] waiting for s6-rc initialization...", flush=True)
+    while waited < max_wait:
+        live_dir = _s6_live_dir()
+        db_dir = os.path.join(live_dir, "db")
+        if os.path.isdir(live_dir) and os.path.isdir(db_dir):
+            print(f"[init] s6-rc initialized after {waited:.1f}s", flush=True)
+            break
+        time.sleep(wait_interval)
+        waited += wait_interval
+    else:
+        print(f"[init] WARNING: s6-rc not initialized after {max_wait}s, proceeding anyway", flush=True)
+
     # Initialize empty etcd_hosts file
     try:
         _write_text(ETCD_HOSTS_PATH, "\n", mode=0o644)  # Write newline instead of empty string
