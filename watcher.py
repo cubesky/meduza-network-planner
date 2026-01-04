@@ -1730,17 +1730,24 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready:
         global_cfg: Global configuration from etcd
         clash_ready: Whether Clash is ready (url-test groups have selected nodes)
     """
-    payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
-    out = _run_generator("gen_mosdns", payload)
-    with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
-        f.write(out["config_text"])
+    try:
+        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
+        out = _run_generator("gen_mosdns", payload)
+        with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
+            f.write(out["config_text"])
+        print("[mosdns] wrote config.yaml", flush=True)
 
-    # Write MosDNS text files from etcd (always write, even if empty)
-    _write_text("/etc/mosdns/etcd_local.txt", out.get("local", ""), mode=0o644)
-    _write_text("/etc/mosdns/etcd_block.txt", out.get("block", ""), mode=0o644)
-    _write_text("/etc/mosdns/etcd_ddns.txt", out.get("ddns", ""), mode=0o644)
-    _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
-    print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
+        # Write MosDNS text files from etcd (always write, even if empty)
+        _write_text("/etc/mosdns/etcd_local.txt", out.get("local", ""), mode=0o644)
+        _write_text("/etc/mosdns/etcd_block.txt", out.get("block", ""), mode=0o644)
+        _write_text("/etc/mosdns/etcd_ddns.txt", out.get("ddns", ""), mode=0o644)
+        _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
+        print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
+    except Exception as e:
+        print(f"[mosdns] failed to generate config: {e}", flush=True)
+        # Still try to start dnsmasq and mosdns if config exists
+        if not _file_nonempty("/etc/mosdns/config.yaml"):
+            raise
 
     # Check if Clash is enabled to configure dnsmasq accordingly
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
@@ -1756,18 +1763,22 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready:
     else:
         print("[mosdns] port 53 in use, skipping dnsmasq restart", flush=True)
 
-    refresh_minutes = out["refresh_minutes"]
-    if _should_refresh_rules(refresh_minutes):
-        # If Clash is enabled and ready, use it for downloading rules
-        if clash_enabled and clash_ready:
-            print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
-        elif clash_enabled:
-            print(f"[mosdns] Clash enabled but not ready, downloading rules directly (will retry after Clash ready)", flush=True)
-        else:
-            print(f"[mosdns] Clash not enabled, downloading rules directly", flush=True)
+    try:
+        refresh_minutes = out.get("refresh_minutes", 1440)
+        if _should_refresh_rules(refresh_minutes):
+            # If Clash is enabled and ready, use it for downloading rules
+            if clash_enabled and clash_ready:
+                print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
+            elif clash_enabled:
+                print(f"[mosdns] Clash enabled but not ready, downloading rules directly (will retry after Clash ready)", flush=True)
+            else:
+                print(f"[mosdns] Clash not enabled, downloading rules directly", flush=True)
 
-        _download_rules_with_backoff(out.get("rules", {}))
-        _touch_rules_stamp()
+            _download_rules_with_backoff(out.get("rules", {}))
+            _touch_rules_stamp()
+    except Exception as e:
+        print(f"[mosdns] rule download failed: {e}", flush=True)
+        # Continue anyway - mosdns can work without custom rules
 
     _s6_restart("mosdns")
 
@@ -1962,7 +1973,10 @@ def handle_commit() -> None:
             did_apply = True
     elif changed("mosdns", mosdns_material):
         if mosdns_enabled:
-            reload_mosdns(node, global_cfg, clash_ready=clash_ready)
+            try:
+                reload_mosdns(node, global_cfg, clash_ready=clash_ready)
+            except Exception as e:
+                print(f"[reconcile] mosdns reload failed: {e}", flush=True)
         else:
             _s6_stop("mosdns")
             _s6_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
