@@ -414,11 +414,11 @@ def _s6_status_all() -> Dict[str, str]:
         return {}
 
 
-def _s6_rc(cmd: str, target: str) -> bool:
-    cp = subprocess.run(["s6-rc", cmd, target], capture_output=True, text=True)
+def _s6_rc(action: str, target: str) -> bool:
+    cp = subprocess.run(["s6-rc", action, target], capture_output=True, text=True)
     if cp.returncode != 0:
         msg = cp.stderr.strip() or cp.stdout.strip() or "unknown error"
-        print(f"[s6] {cmd} {target} failed: {msg}", flush=True)
+        print(f"[s6] {action} {target} failed: {msg}", flush=True)
         return False
     return True
 
@@ -426,22 +426,23 @@ def _s6_rc(cmd: str, target: str) -> bool:
 def _s6_start(name: str) -> None:
     """Start an s6 service."""
     target = _s6_unit(name)
-    if not _s6_rc("start", target) and target != name:
-        _s6_rc("start", name)
+    if not _s6_rc("-u", target) and target != name:
+        _s6_rc("-u", name)
 
 
 def _s6_stop(name: str) -> None:
     """Stop an s6 service."""
     target = _s6_unit(name)
-    if not _s6_rc("stop", target) and target != name:
-        _s6_rc("stop", name)
+    if not _s6_rc("-d", target) and target != name:
+        _s6_rc("-d", name)
 
 
 def _s6_restart(name: str) -> None:
     """Restart an s6 service."""
+    # s6-rc -r restarts a service
     target = _s6_unit(name)
-    _s6_rc("stop", target) or (target != name and _s6_rc("stop", name))
-    _s6_rc("start", target) or (target != name and _s6_rc("start", name))
+    if not _s6_rc("-r", target) and target != name:
+        _s6_rc("-r", name)
 
 
 def _s6_is_running(name: str) -> bool:
