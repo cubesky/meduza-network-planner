@@ -373,8 +373,8 @@ def _s6_live_dir() -> str:
     for candidate in (
         os.environ.get("S6_RC_LIVE"),
         os.environ.get("S6RC_LIVE"),
-        "/run/service",
         "/run/s6-rc",
+        "/run/service",
     ):
         if candidate and os.path.isdir(candidate):
             return candidate
@@ -498,11 +498,11 @@ def _dnsmasq_pids() -> List[int]:
     return pids
 
 
-def _kill_stray_dnsmasq(force: bool = False) -> bool:
+def _kill_stray_dnsmasq() -> bool:
     killed = False
     for pid in _dnsmasq_pids():
         ppid = _proc_ppid(pid)
-        if not force and ppid and _proc_comm(ppid) == "s6-supervise":
+        if ppid and _proc_comm(ppid) == "s6-supervise":
             continue
         try:
             os.kill(pid, signal.SIGTERM)
@@ -577,16 +577,18 @@ def _s6_remove_dynamic_service(name: str) -> None:
 
 def _s6_reload_services() -> None:
     """Reload s6 services database after adding/removing services."""
+    tmp_source_dir = None
     try:
         base_source = "/etc/s6-overlay/s6-rc.d"
         runtime_source = "/run/s6-rc/source"
-        if os.path.isdir(base_source):
-            source_dir = base_source
-        elif os.path.isdir(runtime_source):
-            source_dir = runtime_source
+        if os.path.isdir(runtime_source):
+            tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
+            shutil.copytree(runtime_source, tmp_source_dir, dirs_exist_ok=True)
+            if os.path.isdir(base_source):
+                shutil.copytree(base_source, tmp_source_dir, dirs_exist_ok=True)
+            source_dir = tmp_source_dir
         else:
-            print("[s6] no service source directory found", flush=True)
-            return
+            source_dir = base_source
 
         compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
         compile_cp = subprocess.run(
@@ -611,6 +613,9 @@ def _s6_reload_services() -> None:
             print(f"[s6] failed to update services: {err}", flush=True)
     except Exception as e:
         print(f"[s6] failed to reload services: {e}", flush=True)
+    finally:
+        if tmp_source_dir:
+            shutil.rmtree(tmp_source_dir, ignore_errors=True)
 
 
 
@@ -934,7 +939,7 @@ def s6_retry_loop():
                             on_fail(name)
                             continue
                         if actual_state != "up" and not _port_available(53):
-                            _kill_stray_dnsmasq(force=True)
+                            _kill_stray_dnsmasq()
                             if not _port_available(53):
                                 print("[s6-retry] port 53 in use, stopping dnsmasq and skipping start", flush=True)
                                 _s6_stop(name)
@@ -1432,24 +1437,7 @@ def tproxy_check_loop() -> None:
         try:
             with _tproxy_check_lock:
                 enabled = _tproxy_check_enabled
-            if not enabled:
-                continue
-
-            if not tproxy_enabled:
-                if not _clash_is_ready():
-                    continue
-                print("[tproxy-check] clash ready, applying pending TPROXY rules", flush=True)
-                node = load_prefix(f"/nodes/{NODE_ID}/")
-                global_cfg = load_prefix("/global/")
-                lan_sources = _clash_lan_sources(node)
-                _fix_tproxy_iptables(
-                    _get_cached_tproxy_exclude(),
-                    _clash_exclude_src(node),
-                    _clash_exclude_ifaces(node),
-                    _clash_exclude_ports(node, global_cfg),
-                    lan_sources if lan_sources else None,
-                )
-                tproxy_enabled = True
+            if not enabled or not tproxy_enabled:
                 continue
 
             if _check_tproxy_iptables():
@@ -1883,9 +1871,6 @@ def handle_commit() -> None:
 
             # Apply tproxy ONLY after Clash is ready (to avoid network disruption)
             if new_mode == "tproxy":
-                _set_cached_tproxy_exclude(out["tproxy_exclude"])
-                with _tproxy_check_lock:
-                    _tproxy_check_enabled = True
                 if clash_ready:
                     print("[clash] applying TPROXY (Clash is ready)", flush=True)
                     lan_sources = _clash_lan_sources(node)
@@ -1896,7 +1881,10 @@ def handle_commit() -> None:
                         _clash_exclude_ports(node, global_cfg),
                         lan_sources if lan_sources else None,
                     )
+                    _set_cached_tproxy_exclude(out["tproxy_exclude"])
                     tproxy_enabled = True
+                    with _tproxy_check_lock:
+                        _tproxy_check_enabled = True
                 else:
                     print("[clash] WARNING: TPROXY not applied (Clash not ready), will retry on next check", flush=True)
             else:
