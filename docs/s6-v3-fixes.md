@@ -146,46 +146,6 @@ exec logutil-service /var/log/mihomo
 - ✅ 新命令: `s6-rc-db list all`, `s6-rc -a list`
 - ✅ 新增: Pipeline 和 Bundle 状态显示
 
-### 10. 环境变量传递问题 ✅
-**问题**: s6 服务无法读取容器级别的环境变量（如 `NODE_ID`），导致启动失败并报告 `code 127`
-
-**原因**: 
-- run 脚本使用 `#!/command/execlineb` 而不是 `#!/command/with-contenv execlineb`
-- 没有继承容器的环境变量
-
-**修复**: 所有服务的 run 脚本改用 `with-contenv`
-- ✅ dbus
-- ✅ avahi  
-- ✅ watchfrr
-- ✅ watcher
-- ✅ dns-monitor
-- ✅ mihomo
-- ✅ easytier
-- ✅ tinc
-- ✅ mosdns
-- ✅ dnsmasq
-
-### 11. 服务启动管理 ✅
-**问题**: tinc, easytier, mosdns, mihomo, dnsmasq 应该由 watcher 动态管理，不应该自动启动
-
-**修复**:
-- ❌ 从 `user/contents.d/` 中移除这些服务
-- ✅ 仅保留基础服务自动启动
-
-**自动启动的服务** (在 `user/contents.d/` 中):
-- dbus - D-Bus 消息总线
-- avahi - mDNS 服务发现
-- watchfrr - FRRouting 看门狗
-- watcher - 配置监控器（负责动态启动其他服务）
-- dns-monitor - DNS 监控
-
-**由 watcher 管理的服务** (不自动启动):
-- mihomo - Clash Meta 代理
-- easytier - EasyTier VPN
-- tinc - Tinc VPN
-- mosdns - MosDNS 解析器
-- dnsmasq - Dnsmasq DHCP/DNS
-
 ## 最终结构
 
 ### Bundle 层级:

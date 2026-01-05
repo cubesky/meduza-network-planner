@@ -1,4 +1,4 @@
-#!/command/with-contenv execlineb -P
+#!/command/execlineb -P
 # s6-overlay service script for watchfrr
 fdmove -c 2 1
 exec /usr/local/bin/watchfrr-supervise.sh
