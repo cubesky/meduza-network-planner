@@ -153,7 +153,7 @@ _clash_refresh_next = 0.0
 _tproxy_check_lock = threading.Lock()
 _tproxy_check_enabled = False
 _tproxy_check_interval = 60  # 1 minute default
-_cached_tproxy_exclude: List[str] = []
+_cached_tproxy_targets: List[str] = []
 
 # reconcile lock
 _reconcile_lock = threading.Lock()
@@ -707,12 +707,12 @@ def clash_refresh_loop():
                         pass
                 # Apply new tproxy rules
                 tproxy_apply(
-                    out["tproxy_exclude"],
+                    out["tproxy_targets"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
                 )
-                _set_cached_tproxy_exclude(out["tproxy_exclude"])
+                _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
             else:
                 # If switching away from tproxy mode, remove rules
@@ -915,13 +915,22 @@ def _clash_exclude_ports(node: Dict[str, str], global_cfg: Dict[str, str]) -> Li
 
 
 def tproxy_apply(
-    exclude_dst: List[str],
+    proxy_dst: List[str],
     exclude_src: List[str],
     exclude_ifaces: List[str],
     exclude_ports: List[str],
 ) -> None:
+    """
+    Apply TPROXY rules in include mode (only proxy specified destinations).
+
+    Args:
+        proxy_dst: List of CIDRs to proxy (from /lan configuration)
+        exclude_src: Source CIDRs to bypass proxy
+        exclude_ifaces: Interfaces to bypass proxy
+        exclude_ports: Ports to bypass proxy
+    """
     run(
-        f"EXCLUDE_CIDRS='{ ' '.join(exclude_dst) }' "
+        f"PROXY_CIDRS='{ ' '.join(proxy_dst) }' "
         f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
         f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
         f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
@@ -934,15 +943,15 @@ def tproxy_remove() -> None:
     run(f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 /usr/local/bin/tproxy.sh remove")
 
 
-def _get_cached_tproxy_exclude() -> List[str]:
-    """Get the cached tproxy exclude list."""
-    return list(_cached_tproxy_exclude)
+def _get_cached_tproxy_targets() -> List[str]:
+    """Get the cached tproxy target list."""
+    return list(_cached_tproxy_targets)
 
 
-def _set_cached_tproxy_exclude(exclude: List[str]) -> None:
-    """Cache the tproxy exclude list."""
-    global _cached_tproxy_exclude
-    _cached_tproxy_exclude = list(exclude)
+def _set_cached_tproxy_targets(targets: List[str]) -> None:
+    """Cache the tproxy target list."""
+    global _cached_tproxy_targets
+    _cached_tproxy_targets = list(targets)
 
 
 def _check_tproxy_iptables() -> bool:
@@ -985,7 +994,7 @@ def _check_tproxy_iptables() -> bool:
 
 
 def _fix_tproxy_iptables(
-    exclude_dst: List[str],
+    proxy_dst: List[str],
     exclude_src: List[str],
     exclude_ifaces: List[str],
     exclude_ports: List[str],
@@ -993,7 +1002,7 @@ def _fix_tproxy_iptables(
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(exclude_dst, exclude_src, exclude_ifaces, exclude_ports)
+        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ports)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -1023,7 +1032,7 @@ def tproxy_check_loop() -> None:
 
             # Reapply tproxy rules
             _fix_tproxy_iptables(
-                _get_cached_tproxy_exclude(),
+                _get_cached_tproxy_targets(),
                 _clash_exclude_src(node),
                 _clash_exclude_ifaces(node),
                 _clash_exclude_ports(node, global_cfg),
@@ -1397,12 +1406,12 @@ def handle_commit() -> None:
             # Apply tproxy if needed
             if new_mode == "tproxy":
                 tproxy_apply(
-                    out["tproxy_exclude"],
+                    out["tproxy_targets"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
                 )
-                _set_cached_tproxy_exclude(out["tproxy_exclude"])
+                _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = True

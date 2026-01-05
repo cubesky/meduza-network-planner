@@ -6,21 +6,12 @@ TPROXY_PORT="${TPROXY_PORT:-7893}"
 MARK="${MARK:-0x1}"
 TABLE="${TABLE:-100}"
 
-# If EXCLUDE_CIDRS is provided (space-separated CIDRs), use it.
-# Otherwise use a conservative default (local/reserved/private).
-if [[ -n "${EXCLUDE_CIDRS:-}" ]]; then
-  read -r -a EXCLUDE_ARR <<< "${EXCLUDE_CIDRS}"
+# PROXY_CIDRS: space-separated CIDRs of source addresses to proxy
+# Only traffic FROM these sources will be proxied, everything else bypasses
+if [[ -n "${PROXY_CIDRS:-}" ]]; then
+  read -r -a PROXY_ARR <<< "${PROXY_CIDRS}"
 else
-  EXCLUDE_ARR=(
-    "127.0.0.0/8"
-    "0.0.0.0/8"
-    "10.0.0.0/8"
-    "172.16.0.0/12"
-    "192.168.0.0/16"
-    "169.254.0.0/16"
-    "224.0.0.0/4"
-    "240.0.0.0/4"
-  )
+  PROXY_ARR=()
 fi
 
 # Optional source CIDRs to bypass.
@@ -70,14 +61,13 @@ apply_rules() {
 
   # PREROUTING only: proxy forwarded/inbound traffic.
   # Intentionally DO NOT hook OUTPUT, so local-originated traffic is not proxied.
+
+  # Apply exclusions that apply in both modes
   for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
   done
   for cidr in "${EXCLUDE_SRC_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -j RETURN
-  done
-  for cidr in "${EXCLUDE_ARR[@]}"; do
-    iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
   done
   for port in "${EXCLUDE_PORTS_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
@@ -88,8 +78,11 @@ apply_rules() {
   iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
   iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
 
-  iptables -t mangle -A CLASH_TPROXY -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-  iptables -t mangle -A CLASH_TPROXY -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+  # Only proxy traffic FROM specified source CIDRs
+  for cidr in "${PROXY_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+  done
 
   iptables -t mangle -A PREROUTING -j CLASH_TPROXY
 

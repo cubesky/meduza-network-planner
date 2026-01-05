@@ -486,55 +486,48 @@ These settings are **always enforced** regardless of subscription configuration 
 
 **Location**: [generators/gen_clash.py:64-66](generators/gen_clash.py#L64-L66)
 
-### Exclusions
+### TPROXY Mode (Include-Based Proxying)
 
-Traffic is excluded from TPROXY based on:
+**IMPORTANT**: Clash TPROXY uses **include mode based on source IP** - only traffic **FROM** specified LANs is proxied. All other traffic bypasses the proxy and connects directly.
 
-1. **Destination CIDRs** (`exclude_dst`):
-   - RFC1918/reserved blocks
-   - EasyTier overlay (10.42.1.0/24)
-   - Node LANs from `/nodes/<NODE_ID>/lan/*`
-   - Clash subscription rules
+**Proxy Source Networks** (from `/nodes/<NODE_ID>/lan` and `/nodes/<NODE_ID>/private_lan`):
+- Traffic **originating from** CIDRs in `/nodes/<NODE_ID>/lan` is proxied
+- Traffic **originating from** CIDRs in `/nodes/<NODE_ID>/private_lan` is also proxied
+- All other source networks bypass the proxy automatically
+- Empty LAN list = no traffic is proxied
 
-2. **Source CIDRs** (`exclude_src`):
+**Exclusions** (applied to all traffic):
+
+1. **Source CIDRs** (`exclude_src`):
    - Default gateway (from `DEFAULT_GW` env var)
 
-3. **Interfaces** (`exclude_ifaces`):
+2. **Interfaces** (`exclude_ifaces`):
    - EasyTier/Tinc devices
    - OpenVPN/WireGuard interfaces
 
-4. **Ports** (`exclude_ports`):
+3. **Ports** (`exclude_ports`):
    - Configured via `/nodes/<NODE_ID>/clash/exclude_tproxy_port`
    - Auto-detected mesh listener ports
    - OpenVPN/WireGuard ports
 
 ### Proxy Provider Considerations
 
-**Note**: This project uses `proxy-provider` for dynamic proxy lists, not static `proxies` in the configuration. Proxy servers are loaded externally, so their IPs cannot be automatically extracted and excluded from TPROXY.
+**Note**: This project uses `proxy-provider` for dynamic proxy lists, not static `proxies` in the configuration. Proxy servers are loaded externally.
 
-**To prevent proxy loops**, manually exclude proxy server IPs using:
-```bash
-# Via etcd
-etcdctl put /nodes/<NODE_ID>/clash/exclude_tproxy_port "PROXY_PORT"
-
-# Or add proxy server IPs to LAN exclude list
-etcdctl put /nodes/<NODE_ID>/lan "10.42.10.0/24\nPROXY_IP/32"
-```
-
-This ensures direct connections to proxy servers bypass TPROXY interception.
+Since TPROXY uses **include mode** (only proxying traffic from specified LANs), proxy server connections automatically bypass the proxy by default (unless the proxy server's source IP is within a configured LAN CIDR).
 
 ### Applying TPROXY Rules
 
 ```python
 tproxy_apply(
-    exclude_dst,   # List of CIDRs
-    exclude_src,   # List of CIDRs
-    exclude_ifaces, # List of interface names
-    exclude_ports,  # List of port numbers
+    proxy_dst,      # List of source CIDRs to proxy (from /lan and /private_lan)
+    exclude_src,    # List of source CIDRs to bypass
+    exclude_ifaces, # List of interface names to bypass
+    exclude_ports,  # List of port numbers to bypass
 )
 ```
 
-The script `/usr/local/bin/tproxy.sh` handles iptables and ip rule setup.
+The script `/usr/local/bin/tproxy.sh` handles iptables and ip rule setup using `PROXY_CIDRS` to specify which source addresses to proxy.
 
 ### TPROXY Monitoring
 

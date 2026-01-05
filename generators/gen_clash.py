@@ -11,17 +11,22 @@ SOCKS_PORT = 7891
 HTTP_PORT = 7890
 
 
-def _node_lans_for_exclude(node: Dict[str, str], node_id: str) -> List[str]:
-    cidrs = [
-        "127.0.0.0/8", "0.0.0.0/8", "10.0.0.0/8",
-        "172.16.0.0/12", "192.168.0.0/16",
-        "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
-        "10.42.1.0/24",
-        "10.88.0.0/16",   # podman
-        "10.89.0.0/16",   # podman
-        "10.0.0.0/24",    # docker default
-    ]
-    cidrs.extend(node_lans(node, node_id))
+def _node_lans_for_proxy(node: Dict[str, str], node_id: str) -> List[str]:
+    """
+    Generate list of source CIDRs to proxy (include mode).
+    Only proxy traffic originating from LANs specified in /lan and /private_lan.
+    All other traffic will bypass the proxy.
+    """
+    from common import split_ml
+
+    # Get public LANs
+    lans = split_ml(node.get(f"/nodes/{node_id}/lan", ""))
+
+    # Get private LANs
+    private_lans = split_ml(node.get(f"/nodes/{node_id}/private_lan", ""))
+
+    # Combine both
+    cidrs = lans + private_lans
     return sorted(set(cidrs))
 
 
@@ -83,7 +88,7 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     return {
         "config_yaml": yaml.safe_dump(merged, sort_keys=False, allow_unicode=True),
         "mode": mode,
-        "tproxy_exclude": _node_lans_for_exclude(node, node_id),
+        "tproxy_targets": _node_lans_for_proxy(node, node_id),
         "refresh_enable": refresh_enable,
         "refresh_interval_minutes": interval,
     }
