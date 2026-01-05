@@ -17,18 +17,13 @@
 **文件**: `entrypoint.sh`
 
 ### 3. 服务类型配置错误 ✅
-**问题**: Bundle 类型文件内容错误，并且包含不应该自定义的 `rc` bundle
+**问题**: Bundle 类型文件内容错误
 - ❌ `default/type`: `bundled` 
 - ✅ `default/type`: `bundle`
-- ❌ `rc/` 目录存在（`rc` 是 s6-overlay 内置 bundle，不应自定义）
-- ✅ **完全删除** `rc/` 目录
+- ❌ `rc/type`: `bundled`（整个 rc 目录应删除）
+- ✅ 已删除 `rc/` 目录
 
-**重要**: 在 s6-overlay v3 中，`rc` 是一个特殊的内置 bundle，用于初始化阶段。如果我们自定义它，会导致 s6-rc-compile 编译失败，报错：
-```
-s6-rc-compile fatal unable to open /etc/s6-overlay/s6-rc.d/rc/contents: no such file or directory
-```
-
-**文件**: `s6-services/default/type`, `s6-services/rc/` (已彻底删除)
+**文件**: `s6-services/default/type`, `s6-services/rc/` (已删除)
 
 ### 4. Bundle 结构错误 ✅
 **问题**: 缺少正确的 bundle 结构
@@ -245,17 +240,7 @@ s6-services/
 
 运行验证脚本:
 ```bash
-# PowerShell - 验证 s6 配置
-.\scripts\verify-s6-config.ps1
-
-# PowerShell - 检查 git 状态
-.\scripts\check-s6-git.ps1
-
-# Bash - 验证 s6 配置
 bash scripts/verify-s6-config.sh
-
-# Bash - 检查 git 状态
-bash scripts/check-s6-git.sh
 ```
 
 该脚本会检查:
@@ -265,33 +250,6 @@ bash scripts/check-s6-git.sh
 4. ✅ 依赖关系和依赖文件格式
 5. ✅ Pipeline 配置完整性
 6. ✅ 日志脚本语法正确性
-7. ✅ Git 追踪的空文件状态
-
-## Git 保护措施
-
-为了防止 git 意外删除重要的空文件，已添加以下保护：
-
-1. **Git Hooks**:
-   - `.git/hooks/pre-commit` - Bash 版本
-   - `.git/hooks/pre-commit.ps1` - PowerShell 版本
-   - 在提交前自动检查空文件状态
-
-2. **Git Attributes**:
-   - `.gitattributes` - 标记空文件不使用文本转换
-   - 确保 dependencies.d 和 contents.d 中的空文件被正确追踪
-
-3. **检查脚本**:
-   - `scripts/check-s6-git.sh` - Bash 版本
-   - `scripts/check-s6-git.ps1` - PowerShell 版本
-   - 手动检查 git 追踪状态
-
-4. **文档**:
-   - `s6-services/README.md` - 详细说明空文件的重要性
-
-### 当前状态
-- ✅ 总共 25 个空文件
-- ✅ 全部被 git 追踪
-- ✅ 无暂存的删除操作
 
 ## 重新构建
 
