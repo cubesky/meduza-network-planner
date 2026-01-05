@@ -1,12 +1,8 @@
 #!/bin/bash
 # 快速查看 s6 服务日志
 # Usage: get-logs [-f] [-n lines] <service>
-# Supports: Docker and Podman
 
 set -euo pipefail
-
-# s6-overlay v3 命令路径 - 支持 Docker 和 Podman
-export PATH="/command:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 FOLLOW=false
 LINES=100
@@ -45,10 +41,6 @@ if [[ -z "$SERVICE" ]]; then
     echo "" >&2
     echo "Available services:" >&2
     echo "  watcher, mihomo, easytier, tinc, mosdns, dnsmasq, dns-monitor" >&2
-    echo "" >&2
-    echo "This command must be run inside the container:" >&2
-    echo "  docker compose exec meduza get-logs <service>" >&2
-    echo "  podman compose exec meduza get-logs <service>" >&2
     exit 1
 fi
 
