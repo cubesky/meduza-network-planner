@@ -413,7 +413,7 @@ def _s6_status_all() -> Dict[str, str]:
                     out[svc] = "up" if svc in active_services else "down"
         return out
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        return {}
+    return {}
 
 
 def _s6_svstat_state(name: str) -> Optional[str]:
@@ -1692,14 +1692,14 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready:
 
     # Start dnsmasq first before downloading rules (so DNS is available during download)
     # Only include Clash DNS in forwarding list if Clash is ready
-    status = _write_dnsmasq_config(clash_enabled=clash_enabled, clash_ready=clash_ready)
-    if not _port_available(53):
-        _kill_stray_dnsmasq()
-    if _port_available(53):
-        _s6_restart("dnsmasq")
-        print(f"[mosdns] dnsmasq started as frontend DNS on port 53 ({status})", flush=True)
-    else:
-        print("[mosdns] port 53 in use, skipping dnsmasq restart", flush=True)
+      status = _write_dnsmasq_config(clash_enabled=clash_enabled, clash_ready=clash_ready)
+      if not _port_available(53):
+          _kill_stray_dnsmasq()
+      if _port_available(53):
+          _s6_restart("dnsmasq")
+          print(f"[mosdns] dnsmasq started as frontend DNS on port 53 ({status})", flush=True)
+      else:
+          print("[mosdns] port 53 in use, skipping dnsmasq restart", flush=True)
 
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
