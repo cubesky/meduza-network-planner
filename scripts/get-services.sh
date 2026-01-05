@@ -67,7 +67,7 @@ echo "" >&2
 
 # 4. 显示 Pipeline 状态
 echo "[Pipeline Services]" >&2
-for pipeline in dbus-pipeline avahi-pipeline watchfrr-pipeline watcher-pipeline mihomo-pipeline easytier-pipeline tinc-pipeline mosdns-pipeline dnsmasq-pipeline dns-monitor-pipeline; do
+for pipeline in mihomo-pipeline watcher-pipeline tinc-pipeline mosdns-pipeline easytier-pipeline dnsmasq-pipeline dns-monitor-pipeline; do
     if s6-rc-db -l /run/service/db list all 2>/dev/null | grep -q "^${pipeline}$"; then
         # 检查是否激活
         if s6-rc -a list 2>/dev/null | grep -q "^${pipeline}$"; then
@@ -101,7 +101,7 @@ fi
 
 # 6. 显示日志文件信息
 echo "[Log Files]" >&2
-for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
+for service in watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
     log_dir="/var/log/${service}"
     log_file="${log_dir}/current"
     if [[ -f "$log_file" ]]; then
@@ -117,7 +117,7 @@ echo "" >&2
 # 7. 快速查看最近的错误
 echo "[Recent Errors (last 3 from each log)]" >&2
 found_errors=0
-for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
+for service in watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
     log_file="/var/log/${service}/current"
     if [[ -f "$log_file" ]]; then
         errors=$(grep -i "error\|fail\|fatal\|exception" "$log_file" 2>/dev/null | tail -n 3)

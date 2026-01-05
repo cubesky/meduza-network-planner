@@ -44,7 +44,7 @@ if [[ -z "$SERVICE" ]]; then
     echo "  -n, --lines N     显示最近 N 行日志 (默认: 100)" >&2
     echo "" >&2
     echo "Available services:" >&2
-    echo "  dbus, avahi, watchfrr, watcher, mihomo, easytier, tinc, mosdns, dnsmasq, dns-monitor" >&2
+    echo "  watcher, mihomo, easytier, tinc, mosdns, dnsmasq, dns-monitor" >&2
     echo "" >&2
     echo "This command must be run inside the container:" >&2
     echo "  docker compose exec meduza get-logs <service>" >&2
