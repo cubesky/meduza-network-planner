@@ -823,34 +823,6 @@ def s6_retry_loop():
                             on_ok(name)
                     elif state != "up":
                         on_ok(name)
-
-            with _ovpn_lock:
-                ovpn_names = list(_ovpn_cfg_names)
-            for name in ovpn_names:
-                svc = f"openvpn-{name}"
-                if _s6_status(svc) != "up" and should_try(svc):
-                    print(f"[s6-retry] starting {svc} (desired up)", flush=True)
-                    _s6_start(svc)
-                    if _s6_status(svc) == "up":
-                        on_ok(svc)
-                    else:
-                        on_fail(svc)
-                else:
-                    on_ok(svc)
-
-            with _wg_lock:
-                wg_names = list(_wg_cfg_names)
-            for name in wg_names:
-                svc = f"wireguard-{name}"
-                if _s6_status(svc) != "up" and should_try(svc):
-                    print(f"[s6-retry] starting {svc} (desired up)", flush=True)
-                    _s6_start(svc)
-                    if _s6_status(svc) == "up":
-                        on_ok(svc)
-                    else:
-                        on_fail(svc)
-                else:
-                    on_ok(svc)
         except Exception as e:
             print(f"[s6-retry] error: {e}", flush=True)
             continue
