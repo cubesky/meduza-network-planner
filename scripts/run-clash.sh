@@ -2,14 +2,12 @@
 
 CFG="/etc/clash/config.yaml"
 DATA_DIR="/data/clash"
-PROVIDERS_DIR="/etc/clash/providers"
 PID_FILE="/run/clash/mihomo.pid"
 
 mkdir -p "${DATA_DIR}"
-mkdir -p "${PROVIDERS_DIR}"
 mkdir -p "$(dirname "${PID_FILE}")"
 
-# 1. 下载 GeoX 文件如果配置了
+# Download GeoX files if configured
 python3 - <<'PY'
 import os
 import sys
@@ -43,41 +41,6 @@ for url in urls:
     os.system(f"curl -fL --retry 2 --connect-timeout 10 -o '{out_path}' '{url}'")
 PY
 
-# 2. 预处理 proxy-provider: 下载并提取 IP
-echo "[*] 预处理 proxy-providers..." >&2
-python3 /usr/local/bin/preprocess-clash.py "${CFG}" "${PROVIDERS_DIR}"
-
-# 3. 如果存在代理服务器 IP 列表,创建 ipset
-PROXY_IPS_FILE="${PROVIDERS_DIR}/proxy_servers.txt"
-if [ -f "${PROXY_IPS_FILE}" ]; then
-    echo "[*] 创建 ipset for proxy servers..." >&2
-
-    # 删除旧的 ipset (如果存在)
-    ipset destroy proxy-servers 2>/dev/null || true
-
-    # 创建新的 ipset
-    ipset create proxy-servers hash:ip
-
-    # 添加所有 IP 到 ipset
-    while read -r ip; do
-        [ -n "$ip" ] && ipset add proxy-servers "$ip"
-    done < "${PROXY_IPS_FILE}"
-
-    echo "[✓] ipset 创建完成" >&2
-
-    # 4. 添加 iptables 规则跳过代理服务器 IP
-    # 这需要在 TPROXY 规则之前添加
-    IPTABLES_CHECK="iptables -t mangle -C CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN 2>/dev/null"
-    if ! $IPTABLES_CHECK; then
-        # 在 CLASH_TPROXY 链的开头插入规则,跳过来自代理服务器的流量
-        iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN
-        iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers dst -j RETURN
-        echo "[✓] 已添加 iptables 规则跳过代理服务器" >&2
-    fi
-else
-    echo "[!] 未找到代理服务器 IP 列表" >&2
-fi
-
 # Clean up old PID file
 rm -f "${PID_FILE}"
 
@@ -96,3 +59,4 @@ EXIT_CODE=$?
 # Clean up PID file on exit
 rm -f "${PID_FILE}"
 exit ${EXIT_CODE}
+

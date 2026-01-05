@@ -30,16 +30,6 @@ else
   EXCLUDE_SRC_ARR=()
 fi
 
-# IMPORTANT: If LAN_SOURCES is provided, ONLY traffic from these sources will be proxied.
-# This reverses the default behavior (proxy everything except excluded).
-if [[ -n "${LAN_SOURCES:-}" ]]; then
-  read -r -a LAN_SRC_ARR <<< "${LAN_SOURCES}"
-  LAN_MODE=true
-else
-  LAN_SRC_ARR=()
-  LAN_MODE=false
-fi
-
 # Optional ingress interfaces to bypass.
 if [[ -n "${EXCLUDE_IFACES:-}" ]]; then
   read -r -a EXCLUDE_IFACES_ARR <<< "${EXCLUDE_IFACES}"
@@ -78,59 +68,28 @@ apply_rules() {
 
   iptables -t mangle -N CLASH_TPROXY
 
-  # LAN MODE: Only proxy traffic from specified LAN sources
-  if [[ "$LAN_MODE" == "true" ]]; then
-    echo "[TPROXY] LAN MODE enabled - only proxying traffic from: ${LAN_SRC_ARR[*]}" >&2
+  # PREROUTING only: proxy forwarded/inbound traffic.
+  # Intentionally DO NOT hook OUTPUT, so local-originated traffic is not proxied.
+  for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
+  done
+  for cidr in "${EXCLUDE_SRC_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -j RETURN
+  done
+  for cidr in "${EXCLUDE_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
+  done
+  for port in "${EXCLUDE_PORTS_ARR[@]}"; do
+    iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p udp --dport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p tcp --sport "${port}" -j RETURN
+    iptables -t mangle -A CLASH_TPROXY -p udp --sport "${port}" -j RETURN
+  done
+  iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
+  iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
 
-    # First, bypass traffic that should NOT be proxied (interfaces, sources, destinations, ports)
-    for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
-    done
-    for cidr in "${EXCLUDE_SRC_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -j RETURN
-    done
-    for cidr in "${EXCLUDE_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
-    done
-    for port in "${EXCLUDE_PORTS_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p udp --dport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p tcp --sport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p udp --sport "${port}" -j RETURN
-    done
-    iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
-    iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
-
-    # Then, ONLY proxy traffic from LAN sources (directly apply TPROXY)
-    for lan_cidr in "${LAN_SRC_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -s "${lan_cidr}" -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-      iptables -t mangle -A CLASH_TPROXY -s "${lan_cidr}" -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-    done
-
-    # All other traffic (not from LAN) falls through and continues without proxy
-  else
-    # STANDARD MODE: Proxy everything except excluded
-    for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
-    done
-    for cidr in "${EXCLUDE_SRC_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -j RETURN
-    done
-    for cidr in "${EXCLUDE_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
-    done
-    for port in "${EXCLUDE_PORTS_ARR[@]}"; do
-      iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p udp --dport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p tcp --sport "${port}" -j RETURN
-      iptables -t mangle -A CLASH_TPROXY -p udp --sport "${port}" -j RETURN
-    done
-    iptables -t mangle -A CLASH_TPROXY -p tcp --dport "${TPROXY_PORT}" -j RETURN
-    iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
-
-    iptables -t mangle -A CLASH_TPROXY -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-    iptables -t mangle -A CLASH_TPROXY -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-  fi
+  iptables -t mangle -A CLASH_TPROXY -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+  iptables -t mangle -A CLASH_TPROXY -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
 
   iptables -t mangle -A PREROUTING -j CLASH_TPROXY
 

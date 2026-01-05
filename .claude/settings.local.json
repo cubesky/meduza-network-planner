@@ -9,8 +9,7 @@
       "Bash(uv run python -m py_compile:*)",
       "Bash(for file in *.py)",
       "Bash(do echo:*)",
-      "Bash(done)",
-      "Bash(bash:*)"
+      "Bash(done)"
     ]
   }
 }
