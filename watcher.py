@@ -1112,6 +1112,7 @@ def _get_all_proxy_ips() -> Set[str]:
             return set()
 
         proxies = proxies_data.get("proxies", {})
+        all_ips = set()
         provider_ips = set()
         direct_ips = set()
 
