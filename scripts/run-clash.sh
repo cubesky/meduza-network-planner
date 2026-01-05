@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 CFG="/etc/clash/config.yaml"
 DATA_DIR="/data/clash"
@@ -61,37 +61,35 @@ fi
 
 # 3. 如果存在代理服务器 IP 列表,创建 ipset
 PROXY_IPS_FILE="${PROVIDERS_DIR}/proxy_servers.txt"
-if ! command -v ipset >/dev/null 2>&1; then
-    echo "error: ipset not found, skipping ipset/iptables rules" >&2
-elif [ -f "${PROXY_IPS_FILE}" ]; then
-    echo "[*] Creating ipset for proxy servers..." >&2
+if [ -f "${PROXY_IPS_FILE}" ]; then
+    echo "[*] 创建 ipset for proxy servers..." >&2
 
-    # Remove old ipset if present
+    # 删除旧的 ipset (如果存在)
     ipset destroy proxy-servers 2>/dev/null || true
 
-    # Create new ipset
+    # 创建新的 ipset
     ipset create proxy-servers hash:ip
 
-    # Add all IPs to ipset
+    # 添加所有 IP 到 ipset
     while read -r ip; do
         [ -n "$ip" ] && ipset add proxy-servers "$ip"
     done < "${PROXY_IPS_FILE}"
 
-    echo "[ok] ipset created" >&2
+    echo "[✓] ipset 创建完成" >&2
 
-    if command -v iptables >/dev/null 2>&1; then
-        IPTABLES_CHECK="iptables -t mangle -C CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN 2>/dev/null"
-        if ! $IPTABLES_CHECK; then
-            iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN
-            iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers dst -j RETURN
-            echo "[ok] iptables rules added for proxy servers" >&2
-        fi
-    else
-        echo "error: iptables not found, skipping iptables rules" >&2
+    # 4. 添加 iptables 规则跳过代理服务器 IP
+    # 这需要在 TPROXY 规则之前添加
+    IPTABLES_CHECK="iptables -t mangle -C CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN 2>/dev/null"
+    if ! $IPTABLES_CHECK; then
+        # 在 CLASH_TPROXY 链的开头插入规则,跳过来自代理服务器的流量
+        iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN
+        iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers dst -j RETURN
+        echo "[✓] 已添加 iptables 规则跳过代理服务器" >&2
     fi
 else
-    echo "[!] proxy server IP list not found" >&2
+    echo "[!] 未找到代理服务器 IP 列表" >&2
 fi
+
 # Clean up old PID file
 rm -f "${PID_FILE}"
 
@@ -114,4 +112,3 @@ fi
 # Clean up PID file on exit
 rm -f "${PID_FILE}"
 exit ${EXIT_CODE}
-
