@@ -21,7 +21,12 @@ NODE_ID = os.environ["NODE_ID"]
 TPROXY_PORT = 7893
 MOSDNS_SOCKS_PORT = 7891
 CLASH_HTTP_PORT = 7890
+CLASH_API_PORT = 9090
+CLASH_API_SECRET = ""
 GEN_DIR = "/generators"
+
+# IPSet for proxy server exclusions
+PROXY_IPSET_NAME = "clash_proxy_ips"
 
 # /updated/<NODE_ID>/...
 UPDATE_BASE = f"/updated/{NODE_ID}"
@@ -154,6 +159,16 @@ _tproxy_check_lock = threading.Lock()
 _tproxy_check_enabled = False
 _tproxy_check_interval = 60  # 1 minute default
 _cached_tproxy_targets: List[str] = []
+
+# Mihomo crash monitoring
+_clash_monitoring_lock = threading.Lock()
+_clash_last_healthy = 0.0
+_clash_monitoring_enabled = False
+
+# Proxy IP extraction and ipset management
+_proxy_ips_lock = threading.Lock()
+_cached_proxy_ips: Set[str] = set()
+_proxy_ips_enabled = False
 
 # reconcile lock
 _reconcile_lock = threading.Lock()
@@ -695,7 +710,7 @@ def clash_refresh_loop():
             out = _run_generator("gen_clash", payload)
 
             # Hot reload: update config and send HUP signal instead of restarting
-            reload_clash(out["config_yaml"])
+            reload_clash(out["config_yaml"], api_controller=out.get("api_controller", ""), api_secret=out.get("api_secret", ""))
 
             # Update tproxy rules if mode changed
             if out["mode"] == "tproxy":
@@ -727,6 +742,122 @@ def clash_refresh_loop():
         finally:
             with _clash_refresh_lock:
                 _clash_refresh_next = time.time() + (interval * 60)
+
+
+def clash_crash_monitor_loop():
+    """
+    Monitor Mihomo for crashes and manage TProxy accordingly.
+
+    If Mihomo crashes in TProxy mode:
+    1. Immediately remove TProxy iptables rules
+    2. Cleanup proxy IP ipset
+    3. Wait for Mihomo to recover
+    4. Re-apply TProxy rules when Mihomo is healthy again
+    """
+    global _clash_last_healthy, _clash_monitoring_enabled, tproxy_enabled
+
+    while True:
+        time.sleep(5)
+
+        with _clash_monitoring_lock:
+            enabled = _clash_monitoring_enabled
+
+        if not enabled or not tproxy_enabled:
+            continue
+
+        try:
+            is_healthy = clash_health_check()
+
+            if is_healthy:
+                # Mihomo is healthy
+                if _clash_last_healthy == 0:
+                    # Was unhealthy, now recovered - reapply TProxy
+                    print("[clash-monitor] Mihomo recovered, reapplying TProxy", flush=True)
+                    node = load_prefix(f"/nodes/{NODE_ID}/")
+                    global_cfg = load_prefix("/global/")
+
+                    proxy_dst = _get_cached_tproxy_targets()
+                    if not proxy_dst:
+                        print("[clash-monitor] No cached TProxy targets, skipping reapply", flush=True)
+                    else:
+                        # Re-create empty ipset and apply TProxy first
+                        print("[clash-monitor] Re-initializing proxy IP ipset...", flush=True)
+                        _ensure_proxy_ipset()
+
+                        tproxy_apply(
+                            proxy_dst,
+                            _clash_exclude_src(node),
+                            _clash_exclude_ifaces(node),
+                            [],  # No individual IPs, using ipset
+                            _clash_exclude_ports(node, global_cfg),
+                        )
+                        print("[clash-monitor] TProxy reapplied successfully", flush=True)
+
+                        # Start async IP extraction
+                        threading.Thread(target=_update_proxy_ips_async, daemon=True).start()
+
+                _clash_last_healthy = time.time()
+            else:
+                # Mihomo is not healthy
+                if _clash_last_healthy > 0:
+                    # Was healthy, now crashed - remove TProxy immediately
+                    print("[clash-monitor] Mihomo crashed, removing TProxy", flush=True)
+                    try:
+                        tproxy_remove()
+                        _cleanup_proxy_ips()
+                        print("[clash-monitor] TProxy and ipset removed due to crash", flush=True)
+                    except Exception as e:
+                        print(f"[clash-monitor] Failed to remove TProxy: {e}", flush=True)
+
+                _clash_last_healthy = 0.0
+
+        except Exception as e:
+            print(f"[clash-monitor] Error: {e}", flush=True)
+
+
+def clash_proxy_ips_monitor_loop():
+    """
+    Monitor proxy provider IPs and update ipset periodically.
+
+    This ensures that proxy server IP changes are reflected in TProxy exclusions.
+    Runs every 5 minutes when TProxy is enabled.
+    """
+    global tproxy_enabled, _proxy_ips_enabled
+
+    while True:
+        time.sleep(300)  # Check every 5 minutes
+
+        if not tproxy_enabled or not _proxy_ips_enabled:
+            continue
+
+        try:
+            print("[clash-proxy-ips] Checking for proxy IP updates...", flush=True)
+
+            # Get current IPs
+            current_ips = _get_all_proxy_ips()
+
+            with _proxy_ips_lock:
+                if current_ips != _cached_proxy_ips:
+                    print(f"[clash-proxy-ips] Proxy IPs changed, updating ipset (old: {len(_cached_proxy_ips)}, new: {len(current_ips)})", flush=True)
+
+                    if not current_ips:
+                        # No IPs found, cleanup
+                        _ipset_destroy(PROXY_IPSET_NAME)
+                        _cached_proxy_ips = set()
+                        _proxy_ips_enabled = False
+                    else:
+                        # Update ipset with new IPs
+                        _ipset_create(PROXY_IPSET_NAME)
+                        _ipset_flush(PROXY_IPSET_NAME)
+                        _ipset_add(PROXY_IPSET_NAME, current_ips)
+                        _cached_proxy_ips = current_ips
+
+                    print("[clash-proxy-ips] ipset updated successfully", flush=True)
+                else:
+                    print("[clash-proxy-ips] No changes detected", flush=True)
+
+        except Exception as e:
+            print(f"[clash-proxy-ips] Error: {e}", flush=True)
 
 
 # ---------- FRR smooth reload ----------
@@ -761,6 +892,542 @@ def reload_frr_smooth(conf_text: str) -> None:
 
 # ---------- Clash ----------
 
+def _extract_ips_from_proxies(proxies: List[Dict]) -> Set[str]:
+    """
+    Extract IP addresses from proxy configurations.
+
+    Args:
+        proxies: List of proxy dictionaries from Clash API
+
+    Returns:
+        Set of unique IP addresses found
+    """
+    ips = set()
+
+    for proxy in proxies:
+        # Extract server IP from various proxy types
+        server = proxy.get("server", "")
+        if not server:
+            continue
+
+        # Check if server is an IP address (not a hostname)
+        # IPv4 format: x.x.x.x
+        # IPv6 format: [:::] or compressed
+        if _is_ip_address(server):
+            ips.add(server)
+            continue
+
+        # Try to resolve hostname to IP
+        try:
+            import socket
+            # Get both IPv4 and IPv6 addresses
+            addr_info = socket.getaddrinfo(server, None)
+            for info in addr_info:
+                ip = info[4][0]
+                ips.add(ip)
+        except Exception as e:
+            print(f"[clash] Failed to resolve {server}: {e}", flush=True)
+
+    return ips
+
+
+def _is_ip_address(addr: str) -> bool:
+    """Check if address is an IP address (IPv4 or IPv6)."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(addr.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_ips_from_yaml(yaml_content: str) -> Set[str]:
+    """
+    Extract IP addresses from YAML proxy configuration.
+
+    Args:
+        yaml_content: YAML content (may be base64 encoded)
+
+    Returns:
+        Set of unique IP addresses
+    """
+    import base64
+    import yaml as yaml_lib
+
+    content = yaml_content.strip()
+
+    # Try to decode base64 first
+    try:
+        decoded = base64.b64decode(content)
+        # Check if decoded content is valid UTF-8 text
+        try:
+            content = decoded.decode("utf-8")
+        except UnicodeDecodeError:
+            # Not base64, use original
+            content = yaml_content.strip()
+    except Exception:
+        content = yaml_content.strip()
+
+    # Parse YAML
+    try:
+        config = yaml_lib.safe_load(content)
+        if not isinstance(config, dict):
+            return set()
+
+        proxies = config.get("proxies", [])
+        if isinstance(proxies, list):
+            return _extract_ips_from_proxies(proxies)
+    except Exception as e:
+        print(f"[clash] Failed to parse YAML: {e}", flush=True)
+
+    return set()
+
+
+def _extract_ips_from_subscription(content: str) -> Set[str]:
+    """
+    Extract IPs from various subscription formats.
+
+    Args:
+        content: Subscription content (YAML, base64 YAML, or ss:// / vless:// URLs)
+
+    Returns:
+        Set of unique IP addresses
+    """
+    ips = set()
+
+    # Try to parse as YAML first (may be base64 encoded)
+    yaml_ips = _extract_ips_from_yaml(content)
+    if yaml_ips:
+        ips.update(yaml_ips)
+
+    # Try to parse as newline-separated URLs
+    for line in content.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Parse ss:// or vless:// URLs
+        if line.startswith("ss://") or line.startswith("vless://"):
+            try:
+                import base64
+                # ss:// format: ss://base64(info)@server:port...
+                # vless:// format: vless://uuid@server:port?params
+                if "://" in line:
+                    _, rest = line.split("://", 1)
+                    # Remove protocol prefix
+                    rest = rest.split("?")[0]  # Remove query params
+                    rest = rest.split("#")[0]  # Remove fragment
+
+                    if "@" in rest:
+                        # Format: base64(info)@server:port or uuid@server:port
+                        creds, server_part = rest.rsplit("@", 1)
+                        server = server_part.split(":")[0]
+                        if _is_ip_address(server):
+                            ips.add(server)
+                        else:
+                            # Try to resolve hostname
+                            try:
+                                import socket
+                                addr_info = socket.getaddrinfo(server, None)
+                                for info in addr_info:
+                                    ip = info[4][0]
+                                    ips.add(ip)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+    return ips
+
+
+def _download_provider_content(url: str) -> Optional[str]:
+    """
+    Download content from a provider URL.
+
+    Args:
+        url: Provider URL
+
+    Returns:
+        Content as string, or None on failure
+    """
+    try:
+        # Use Clash proxy if available
+        proxy = None
+        clash_pid_val = clash_pid()
+        if clash_pid_val is not None:
+            proxy = f"http://127.0.0.1:{CLASH_HTTP_PORT}"
+            print(f"[clash] Downloading provider via proxy: {url}", flush=True)
+
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = requests.get(url, timeout=30, proxies=proxies)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        print(f"[clash] Failed to download provider {url}: {e}", flush=True)
+        return None
+
+
+def _get_proxy_ips_from_providers(providers: List[Dict]) -> Set[str]:
+    """
+    Extract all proxy IPs from proxy providers.
+
+    Args:
+        providers: List of provider dictionaries from Clash API
+
+    Returns:
+        Set of unique IP addresses
+    """
+    all_ips = set()
+
+    for provider in providers:
+        # Get provider file path
+        provider_path = provider.get("path", "")
+        if not provider_path:
+            continue
+
+        # Read provider file from Clash config directory
+        full_path = f"/etc/clash/{provider_path}"
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                ips = _extract_ips_from_subscription(content)
+                all_ips.update(ips)
+                print(f"[clash] Extracted {len(ips)} IPs from provider {provider_path}", flush=True)
+        except Exception as e:
+            print(f"[clash] Failed to read provider file {full_path}: {e}", flush=True)
+
+    return all_ips
+
+
+def _get_all_proxy_ips() -> Set[str]:
+    """
+    Get all proxy server IPs from Clash configuration.
+
+    Returns:
+        Set of unique IP addresses
+    """
+    try:
+        proxies_data = _clash_api_request("/proxies")
+        if not proxies_data:
+            return set()
+
+        proxies = proxies_data.get("proxies", {})
+        provider_ips = set()
+        direct_ips = set()
+
+        # Extract IPs from providers
+        for name, proxy in proxies.items():
+            if proxy.get("type") == "Selector" or proxy.get("type") == "URLTest":
+                # Get all proxies from the selector/url-test group
+                all_now = proxy.get("all", [])
+                for proxy_name in all_now:
+                    if proxy_name in proxies:
+                        p = proxies[proxy_name]
+                        # Get IP from server field
+                        server = p.get("server", "")
+                        if server and _is_ip_address(server):
+                            direct_ips.add(server)
+                        elif server:
+                            # Try to resolve hostname
+                            try:
+                                import socket
+                                addr_info = socket.getaddrinfo(server, None)
+                                for info in addr_info:
+                                    ip = info[4][0]
+                                    direct_ips.add(ip)
+                            except Exception:
+                                pass
+
+        # Extract IPs from provider files
+        providers = proxies_data.get("providers", {})
+        if providers:
+            provider_ips = _get_proxy_ips_from_providers(list(providers.values()))
+
+        all_ips.update(direct_ips)
+        all_ips.update(provider_ips)
+
+        return all_ips
+    except Exception as e:
+        print(f"[clash] Failed to get proxy IPs: {e}", flush=True)
+        return set()
+
+
+def _ipset_exists(name: str) -> bool:
+    """Check if an ipset exists."""
+    try:
+        result = subprocess.run(
+            ["ipset", "list", name],
+            capture_output=True,
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _ipset_create(name: str) -> None:
+    """Create an ipset if it doesn't exist."""
+    try:
+        # Check if ipset exists
+        result = subprocess.run(
+            ["ipset", "list", name],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            # Create ipset
+            print(f"[clash] Creating ipset {name}", flush=True)
+            subprocess.run(
+                ["ipset", "create", name, "hash:ip"],
+                check=True
+            )
+    except Exception as e:
+        print(f"[clash] Failed to create ipset {name}: {e}", flush=True)
+
+
+def _ipset_flush(name: str) -> None:
+    """Flush all entries from an ipset."""
+    try:
+        subprocess.run(
+            ["ipset", "flush", name],
+            check=True
+        )
+    except Exception as e:
+        print(f"[clash] Failed to flush ipset {name}: {e}", flush=True)
+
+
+def _ipset_add(name: str, ips: Set[str]) -> None:
+    """Add IPs to an ipset."""
+    if not ips:
+        return
+
+    try:
+        for ip in ips:
+            subprocess.run(
+                ["ipset", "add", name, ip],
+                check=True,  # ipset add is idempotent
+                stderr=subprocess.DEVNULL
+            )
+    except Exception as e:
+        print(f"[clash] Failed to add IPs to ipset {name}: {e}", flush=True)
+
+
+def _ipset_destroy(name: str) -> None:
+    """Destroy an ipset."""
+    try:
+        subprocess.run(
+            ["ipset", "destroy", name],
+            check=False,  # May not exist
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def _ensure_proxy_ipset() -> None:
+    """
+    Ensure proxy IP ipset exists (empty).
+
+    This creates an empty ipset that can be immediately used in iptables rules.
+    IPs will be populated asynchronously in the background.
+
+    Call this before applying TProxy to avoid blocking startup.
+    """
+    global _proxy_ips_enabled
+
+    with _proxy_ips_lock:
+        if _ipset_exists(PROXY_IPSET_NAME):
+            print(f"[clash] ipset {PROXY_IPSET_NAME} already exists", flush=True)
+            _proxy_ips_enabled = True
+            return
+
+        print(f"[clash] Creating empty ipset {PROXY_IPSET_NAME}", flush=True)
+        _ipset_create(PROXY_IPSET_NAME)
+        _proxy_ips_enabled = True
+        print(f"[clash] Empty ipset {PROXY_IPSET_NAME} created (will be populated asynchronously)", flush=True)
+
+
+def _update_proxy_ips_async() -> None:
+    """
+    Asynchronously update proxy IPs from Clash and sync to ipset.
+
+    This function runs in a background thread after TProxy is applied.
+    It extracts IPs from Clash API and provider files, then updates the ipset.
+
+    Non-blocking: Allows TProxy to start immediately even with slow providers.
+    """
+    global _cached_proxy_ips, _proxy_ips_enabled
+
+    with _proxy_ips_lock:
+        if not _proxy_ips_enabled:
+            return
+
+    print("[clash] Extracting proxy server IPs (async)...", flush=True)
+
+    try:
+        # Get all proxy IPs (may take time for large providers)
+        ips = _get_all_proxy_ips()
+
+        with _proxy_ips_lock:
+            if not _proxy_ips_enabled:
+                # TProxy was disabled while we were extracting
+                return
+
+            if not ips:
+                print("[clash] No proxy IPs found", flush=True)
+                _cached_proxy_ips = set()
+                return
+
+            print(f"[clash] Found {len(ips)} unique proxy IPs, updating ipset...", flush=True)
+
+            # Check if IPs actually changed
+            if ips == _cached_proxy_ips:
+                print("[clash] Proxy IPs unchanged, skipping update", flush=True)
+                return
+
+            # Flush old entries and add new IPs
+            _ipset_flush(PROXY_IPSET_NAME)
+            _ipset_add(PROXY_IPSET_NAME, ips)
+
+            # Update cache
+            old_count = len(_cached_proxy_ips)
+            _cached_proxy_ips = ips
+
+            print(f"[clash] Updated ipset {PROXY_IPSET_NAME}: {old_count} → {len(ips)} IPs", flush=True)
+
+    except Exception as e:
+        print(f"[clash] Failed to update proxy IPs (will retry in monitoring loop): {e}", flush=True)
+
+
+def _cleanup_proxy_ips() -> None:
+    """
+    Cleanup proxy IP ipset.
+
+    This should be called when Clash crashes or TProxy is disabled.
+    """
+    global _cached_proxy_ips, _proxy_ips_enabled
+
+    with _proxy_ips_lock:
+        print("[clash] Cleaning up proxy IP ipset...", flush=True)
+        _ipset_destroy(PROXY_IPSET_NAME)
+        _cached_proxy_ips = set()
+        _proxy_ips_enabled = False
+
+
+def _clash_api_request(endpoint: str, method: str = "GET", data: Optional[Dict] = None) -> Optional[Dict]:
+    """
+    Make a request to Mihomo API.
+
+    Args:
+        endpoint: API endpoint (e.g., "/proxies", "/proxies/SELECTED")
+        method: HTTP method (GET or DELETE)
+        data: Request body data for DELETE requests
+
+    Returns:
+        JSON response dict or None on failure
+    """
+    global CLASH_API_SECRET
+    try:
+        headers = {}
+        if CLASH_API_SECRET:
+            headers["Authorization"] = f"Bearer {CLASH_API_SECRET}"
+
+        url = f"http://127.0.0.1:{CLASH_API_PORT}{endpoint}"
+
+        if method == "GET":
+            resp = requests.get(url, headers=headers, timeout=5)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=headers, json=data, timeout=5)
+        else:
+            return None
+
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        print(f"[clash] API request failed: {e}", flush=True)
+        return None
+
+
+def clash_health_check() -> bool:
+    """
+    Check Mihomo health by verifying:
+    1. Process is running
+    2. API is accessible
+    3. ALL url-test proxies are NOT REJECT (strict check)
+
+    Returns:
+        True if Mihomo is healthy, False otherwise
+    """
+    # Check if process is running
+    if clash_pid() is None:
+        return False
+
+    # Check API availability
+    proxies_data = _clash_api_request("/proxies")
+    if not proxies_data:
+        return False
+
+    # Check ALL url-test proxies for REJECT status (strict requirement)
+    proxies = proxies_data.get("proxies", {})
+    url_test_proxies = []
+
+    # Collect all url-test selectors
+    for name, proxy in proxies.items():
+        if proxy.get("type") == "Selector" and "url-test" in name.lower():
+            url_test_proxies.append((name, proxy))
+
+    # If no url-test proxies found, assume healthy if API is accessible
+    if not url_test_proxies:
+        return True
+
+    # Strict check: ALL url-test proxies must NOT be REJECT
+    for name, proxy in url_test_proxies:
+        now = proxy.get("now", "")
+        if not now or now == "REJECT":
+            print(f"[clash] url-test proxy '{name}' is REJECT or empty (now={now})", flush=True)
+            return False
+
+    # All url-test proxies are healthy
+    return True
+
+
+def wait_for_clash_healthy(timeout: int = 30) -> None:
+    """
+    Wait for Mihomo to become healthy. Raises exception if timeout.
+
+    Args:
+        timeout: Maximum wait time in seconds (use None for infinite wait)
+
+    Raises:
+        RuntimeError: If Mihomo does not become healthy within timeout
+    """
+    start = time.time()
+    while True:
+        if clash_health_check():
+            print("[clash] Mihomo is healthy", flush=True)
+            return
+        time.sleep(1)
+        if timeout is not None:
+            if time.time() - start >= timeout:
+                raise RuntimeError(f"Mihomo did not become healthy after {timeout}s")
+
+
+def wait_for_clash_healthy_infinite() -> None:
+    """
+    Wait indefinitely for Mihomo to become health. No timeout.
+
+    This is used for MosDNS startup which MUST wait for Clash to be healthy.
+    """
+    print("[clash] Waiting indefinitely for Mihomo to become healthy...", flush=True)
+    while True:
+        if clash_health_check():
+            print("[clash] Mihomo is healthy", flush=True)
+            return
+        time.sleep(1)
+
+
 def clash_pid() -> Optional[int]:
     """Get mihomo PID, return None if process not running."""
     try:
@@ -779,8 +1446,18 @@ def clash_pid() -> Optional[int]:
     return None
 
 
-def reload_clash(conf_text: str) -> None:
-    """Reload clash config. Returns None if clash is not running."""
+def reload_clash(conf_text: str, api_controller: str = "", api_secret: str = "") -> None:
+    """
+    Reload clash config and update API credentials.
+
+    Args:
+        conf_text: Clash config YAML content
+        api_controller: API controller address (e.g., "0.0.0.0:9090")
+        api_secret: API secret for authentication
+    """
+    global CLASH_API_SECRET
+    CLASH_API_SECRET = api_secret
+
     pid = clash_pid()
     if pid is None:
         print("[clash] not running, skipping reload (config still written)", flush=True)
@@ -918,6 +1595,7 @@ def tproxy_apply(
     proxy_dst: List[str],
     exclude_src: List[str],
     exclude_ifaces: List[str],
+    exclude_ips: List[str],
     exclude_ports: List[str],
 ) -> None:
     """
@@ -927,13 +1605,16 @@ def tproxy_apply(
         proxy_dst: List of CIDRs to proxy (from /lan configuration)
         exclude_src: Source CIDRs to bypass proxy
         exclude_ifaces: Interfaces to bypass proxy
+        exclude_ips: Proxy server IPs to bypass (to prevent proxy loops)
         exclude_ports: Ports to bypass proxy
     """
     run(
         f"PROXY_CIDRS='{ ' '.join(proxy_dst) }' "
         f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
         f"EXCLUDE_IFACES='{ ' '.join(exclude_ifaces) }' "
+        f"EXCLUDE_IPS='{ ' '.join(exclude_ips) }' "
         f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
+        f"PROXY_IPSET_NAME='{PROXY_IPSET_NAME}' "
         f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
         f"/usr/local/bin/tproxy.sh apply"
     )
@@ -997,12 +1678,13 @@ def _fix_tproxy_iptables(
     proxy_dst: List[str],
     exclude_src: List[str],
     exclude_ifaces: List[str],
+    exclude_ips: List[str],
     exclude_ports: List[str],
 ) -> None:
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ports)
+        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -1030,11 +1712,12 @@ def tproxy_check_loop() -> None:
             node = load_prefix(f"/nodes/{NODE_ID}/")
             global_cfg = load_prefix("/global/")
 
-            # Reapply tproxy rules
+            # Reapply tproxy rules (using ipset, no individual IPs needed)
             _fix_tproxy_iptables(
                 _get_cached_tproxy_targets(),
                 _clash_exclude_src(node),
                 _clash_exclude_ifaces(node),
+                [],  # No individual IPs, using ipset
                 _clash_exclude_ports(node, global_cfg),
             )
         except Exception as e:
@@ -1245,6 +1928,19 @@ local-ttl=1
 
 
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
+    """
+    Reload MosDNS configuration with sequential startup logic.
+
+    Startup sequence when both Clash and MosDNS are enabled:
+    1. Start Dnsmasq (frontend DNS)
+    2. Wait INDEFINITELY for Mihomo to become healthy (NO TIMEOUT if Clash enabled)
+    3. Download MosDNS rules via Mihomo proxy
+    4. Start MosDNS
+    5. Apply TProxy (if Clash is in TProxy mode and Mihomo is healthy)
+
+    Note: If Clash is enabled, MosDNS will wait indefinitely for Mihomo to become healthy.
+    There is NO timeout - MosDNS cannot start until Clash is ready.
+    """
     payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
     out = _run_generator("gen_mosdns", payload)
     with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
@@ -1260,7 +1956,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     # Check if Clash is enabled to configure dnsmasq accordingly
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
 
-    # Start dnsmasq first before downloading rules (so DNS is available during download)
+    # Step 1: Start dnsmasq first (frontend DNS on port 53)
     _write_dnsmasq_config(clash_enabled=clash_enabled)
     _supervisor_restart("dnsmasq")
     if clash_enabled:
@@ -1268,25 +1964,26 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     else:
         print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
 
+    # Step 2: If Clash is enabled, wait INDEFINITELY for Mihomo to become healthy
+    if clash_enabled:
+        print("[mosdns] Waiting for Mihomo to become healthy (no timeout - will wait indefinitely)...", flush=True)
+        wait_for_clash_healthy_infinite()
+        print("[mosdns] Mihomo is healthy, proceeding with MosDNS setup", flush=True)
+
+    # Step 3: Download rules (MUST use Clash proxy if Clash is enabled)
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
-        # If Clash is enabled, wait a bit for it to be ready
         if clash_enabled:
-            # Check if Clash is running, if not, wait for it to start
-            for attempt in range(10):  # Wait up to 10 seconds
-                if clash_pid() is not None:
-                    print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
-                    time.sleep(1)  # Extra second for proxy to be fully ready
-                    break
-                print(f"[mosdns] Waiting for Clash to start... (attempt {attempt + 1}/10)", flush=True)
-                time.sleep(1)
-            else:
-                print(f"[mosdns] Clash not ready after 10s, downloading rules directly", flush=True)
+            print("[mosdns] Downloading rules via Mihomo proxy (Clash is enabled)", flush=True)
+        else:
+            print("[mosdns] Downloading rules directly", flush=True)
 
         _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
 
+    # Step 4: Start MosDNS
     _supervisor_restart("mosdns")
+    print("[mosdns] MosDNS started", flush=True)
 
 
 # ---------- reconcile ----------
@@ -1385,6 +2082,8 @@ def handle_commit() -> None:
             payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
             out = _run_generator("gen_clash", payload)
             new_mode = out["mode"]
+            api_controller = out.get("api_controller", "")
+            api_secret = out.get("api_secret", "")
 
             # If switching to/from tproxy mode, need to remove tproxy first
             if tproxy_enabled and new_mode != "tproxy":
@@ -1393,6 +2092,8 @@ def handle_commit() -> None:
                 except Exception:
                     pass
                 tproxy_enabled = False
+                with _clash_monitoring_lock:
+                    _clash_monitoring_enabled = False
 
             # Start clash if not running
             if not _supervisor_is_running("mihomo"):
@@ -1400,24 +2101,45 @@ def handle_commit() -> None:
                 # Wait a bit for clash to start
                 time.sleep(2)
 
-            # Reload configuration
-            reload_clash(out["config_yaml"])
+            # Reload configuration with API credentials
+            reload_clash(out["config_yaml"], api_controller=api_controller, api_secret=api_secret)
 
-            # Apply tproxy if needed
+            # Apply tproxy if needed (MANDATORY wait for Mihomo to be healthy - NO TIMEOUT)
             if new_mode == "tproxy":
+                print("[clash] Waiting for Mihomo to become healthy before applying TProxy (no timeout - will wait indefinitely)...", flush=True)
+                wait_for_clash_healthy_infinite()
+
+                # Create empty ipset immediately (non-blocking)
+                # IPs will be populated asynchronously after TProxy is applied
+                print("[clash] Initializing proxy IP ipset...", flush=True)
+                _ensure_proxy_ipset()
+
                 tproxy_apply(
                     out["tproxy_targets"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
+                    [],  # No individual IPs, using ipset instead
                     _clash_exclude_ports(node, global_cfg),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = True
+                with _clash_monitoring_lock:
+                    _clash_monitoring_enabled = True
+                print("[clash] TProxy applied successfully", flush=True)
+
+                # Start async IP extraction in background thread
+                # This won't block TProxy startup
+                threading.Thread(target=_update_proxy_ips_async, daemon=True).start()
             else:
+                # Not in TProxy mode, cleanup proxy IP ipset
+                _cleanup_proxy_ips()
+
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = False
+                with _clash_monitoring_lock:
+                    _clash_monitoring_enabled = False
 
             with _clash_refresh_lock:
                 _clash_refresh_enable = out["refresh_enable"]
@@ -1581,6 +2303,8 @@ def main() -> None:
     threading.Thread(target=monitor_children_loop, daemon=True).start()
     threading.Thread(target=supervisor_retry_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
+    threading.Thread(target=clash_crash_monitor_loop, daemon=True).start()
+    threading.Thread(target=clash_proxy_ips_monitor_loop, daemon=True).start()
     threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
     # etcd_hosts now processed in reconcile_once() via /commit, no separate watch needed

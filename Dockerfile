@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     frr frr-pythontools \
     openvpn \
     wireguard-tools \
-    iproute2 iptables \
+    iproute2 iptables ipset \
     iputils-ping dnsutils \
     mtr tcpdump nano \
     procps \

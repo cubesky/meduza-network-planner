@@ -70,6 +70,12 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     merged["unified-delay"] = True
     merged["geodata-loader"] = "standard"
 
+    # Ensure API configuration is present for health checks
+    if "external-controller" not in merged:
+        merged["external-controller"] = "0.0.0.0:9090"
+    if "secret" not in merged:
+        merged["secret"] = "BFC8rqg0umu-qay-xtq"
+
     merged["socks-port"] = SOCKS_PORT
     if mode == "mixed":
         merged["mixed-port"] = HTTP_PORT
@@ -91,6 +97,8 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
         "tproxy_targets": _node_lans_for_proxy(node, node_id),
         "refresh_enable": refresh_enable,
         "refresh_interval_minutes": interval,
+        "api_controller": merged.get("external-controller", "0.0.0.0:9090"),
+        "api_secret": merged.get("secret", ""),
     }
 
 
