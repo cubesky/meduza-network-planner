@@ -187,9 +187,6 @@ _wg_lock = threading.Lock()
 _wg_cfg_names: List[str] = []
 _wg_devs: Dict[str, str] = {}
 
-# s6 service reload
-_s6_reload_lock = threading.Lock()
-
 
 def ensure_online_lease():
     global _online_lease
@@ -580,65 +577,61 @@ def _s6_remove_dynamic_service(name: str) -> None:
 
 def _s6_reload_services() -> None:
     """Reload s6 services database after adding/removing services."""
-    with _s6_reload_lock:
-        tmp_source_dir = None
-        compiled_dir = None
-        try:
-            internal_source = "/package/admin/s6-overlay/etc/s6-overlay/s6-rc.d"
-            runtime_source = "/run/s6-rc/source"
-            base_source = "/etc/s6-overlay/s6-rc.d"
+    tmp_source_dir = None
+    try:
+        internal_source = "/package/admin/s6-overlay/etc/s6-overlay/s6-rc.d"
+        runtime_source = "/run/s6-rc/source"
+        base_source = "/etc/s6-overlay/s6-rc.d"
 
-            sources: List[str] = []
-            if os.path.isdir(internal_source):
-                sources.append(internal_source)
-            elif os.path.isdir(runtime_source):
-                sources.append(runtime_source)
+        sources: List[str] = []
+        if os.path.isdir(internal_source):
+            sources.append(internal_source)
+        elif os.path.isdir(runtime_source):
+            sources.append(runtime_source)
 
-            if os.path.isdir(base_source):
-                sources.append(base_source)
+        if os.path.isdir(base_source):
+            sources.append(base_source)
 
-            if not sources:
-                print("[s6] no service source directory found", flush=True)
-                return
+        if not sources:
+            print("[s6] no service source directory found", flush=True)
+            return
 
-            tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
-            for src in sources:
-                shutil.copytree(src, tmp_source_dir, dirs_exist_ok=True)
-            source_dir = tmp_source_dir
-            base_dir = os.path.join(source_dir, "base")
-            if not os.path.isdir(base_dir):
-                os.makedirs(os.path.join(base_dir, "contents.d"), exist_ok=True)
-                _write_if_changed(os.path.join(base_dir, "type"), "bundle\n")
-                print("[s6] base service missing; created fallback bundle", flush=True)
+        tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
+        for src in sources:
+            shutil.copytree(src, tmp_source_dir, dirs_exist_ok=True)
+        source_dir = tmp_source_dir
+        base_dir = os.path.join(source_dir, "base")
+        if not os.path.isdir(base_dir):
+            os.makedirs(os.path.join(base_dir, "contents.d"), exist_ok=True)
+            _write_if_changed(os.path.join(base_dir, "type"), "bundle\n")
+            print("[s6] base service missing; created fallback bundle", flush=True)
 
-            compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
-            compile_cp = subprocess.run(
-                ["s6-rc-compile", compiled_dir, source_dir],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if compile_cp.returncode != 0:
-                err = (compile_cp.stderr or compile_cp.stdout or "").strip()
-                print(f"[s6] failed to compile services: {err}", flush=True)
-                return
-            live_dir = _s6_live_dir()
-            update_cp = subprocess.run(
-                ["s6-rc-update", "-l", live_dir, compiled_dir],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if update_cp.returncode != 0:
-                err = (update_cp.stderr or update_cp.stdout or "").strip()
-                print(f"[s6] failed to update services: {err}", flush=True)
-        except Exception as e:
-            print(f"[s6] failed to reload services: {e}", flush=True)
-        finally:
-            if tmp_source_dir:
-                shutil.rmtree(tmp_source_dir, ignore_errors=True)
-            if compiled_dir:
-                shutil.rmtree(compiled_dir, ignore_errors=True)
+        compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
+        compile_cp = subprocess.run(
+            ["s6-rc-compile", compiled_dir, source_dir],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if compile_cp.returncode != 0:
+            err = (compile_cp.stderr or compile_cp.stdout or "").strip()
+            print(f"[s6] failed to compile services: {err}", flush=True)
+            return
+        live_dir = _s6_live_dir()
+        update_cp = subprocess.run(
+            ["s6-rc-update", "-l", live_dir, compiled_dir],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if update_cp.returncode != 0:
+            err = (update_cp.stderr or update_cp.stdout or "").strip()
+            print(f"[s6] failed to update services: {err}", flush=True)
+    except Exception as e:
+        print(f"[s6] failed to reload services: {e}", flush=True)
+    finally:
+        if tmp_source_dir:
+            shutil.rmtree(tmp_source_dir, ignore_errors=True)
 
 
 
