@@ -1,2 +1,5 @@
-#!/bin/sh
-exec logutil-service /var/log/tinc
+#!/command/execlineb -P
+s6-setenv logfile /var/log/tinc.out.log
+s6-setenv maxbytes 10485760
+s6-setenv maxfiles 10
+exec s6-svlogd "${logfile}" "${maxbytes}" "${maxfiles}"

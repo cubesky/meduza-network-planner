@@ -43,7 +43,8 @@ fi
 # FRR must be up before any transparent proxy rules are applied.
 /usr/lib/frr/frrinit.sh start
 
-# s6-overlay v3 will automatically compile services from /etc/s6-overlay/s6-rc.d/
-# No manual compilation needed - /init handles everything
-echo "[entrypoint] Starting s6-overlay..." >&2
+# s6-overlay v3 initialization
+# The /init process will automatically set up the supervision tree
+# and start services based on the compiled database from /etc/s6-overlay/sv/
+echo "[entrypoint] Starting s6-overlay with services..." >&2
 exec /init

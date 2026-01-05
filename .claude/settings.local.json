@@ -12,8 +12,7 @@
       "Bash(done)",
       "Bash(bash:*)",
       "Bash(cat:*)",
-      "Bash(chmod:*)",
-      "Bash(xargs:*)"
+      "Bash(chmod:*)"
     ]
   }
 }
