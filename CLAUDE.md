@@ -141,7 +141,41 @@ The `watcher.py` is the central orchestrator:
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/peer_ip
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/update_source
 /nodes/<NODE_ID>/openvpn/<NAME>/bgp/weight
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/no_transit         # "true" | "false", default "false"
+/nodes/<NODE_ID>/openvpn/<NAME>/bgp/no_forward        # "true" | "false", default "false"
 ```
+
+<a name="bgp-control-flags"></a>
+**BGP Control Flags:**
+
+- **no_transit**: Only learn routes directly originated by this peer (not transit routes).
+  - **Effect**: Filters inbound routes based on AS_PATH length. Only accepts routes with AS_PATH ≤ 2.
+  - **AS_PATH = 1**: Peer's own routes (directly originated by the peer) → **ACCEPT**
+  - **AS_PATH = 2**: Peer's customer routes (one hop beyond peer) → **ACCEPT**
+  - **AS_PATH > 2**: Transit routes (peer is providing transit for other ASes) → **DENY**
+  - **Outbound**: Routes learned from this peer are still advertised to iBGP and other eBGP neighbors normally.
+  - **Example**: If you have A - B - C, and C sets `no_transit=true` for B, then C will only learn B's own routes and B's customer routes. C will NOT learn routes that B learned from A (transit routes). However, C will still advertise B's routes to other neighbors, allowing them to reach B via C.
+  - **Use Case**: Learn routes from a peer without using them as a transit AS. Useful for preferring direct paths over indirect ones.
+  - **Implementation**: Uses AS_PATH filtering (`^.+ .+ .+` pattern) to deny routes with 3+ ASNs.
+
+- **no_forward**: Only advertise locally-originated and iBGP routes to this peer.
+  - **Effect**: Filters outbound routes to prevent this peer from reaching other eBGP networks through you.
+  - **Allows to peer**:
+    - Locally-originated routes (from `network` statements)
+    - Routes from OSPF (internal LANs)
+    - Routes learned from iBGP neighbors
+  - **Denies to peer**: Routes learned from other eBGP peers
+  - **Example**: If you have A - B - C - D, and C sets `no_forward=true` for B, then C will advertise C's own routes and iBGP routes to B, but will NOT advertise routes learned from D (or other eBGP peers) to B. B can reach C's networks, but cannot use C as a transit to reach D.
+  - **Use Case**: Allow a peer to access your networks without using you as transit to other eBGP networks. Useful for backup links or bandwidth-limited connections.
+  - **Implementation**: Uses BGP community (9999) to tag routes learned from eBGP peers, then filters them in outbound advertisements.
+
+- **Interaction**: If both `no_transit` and `no_forward` are set, both flags take effect independently (no_transit affects inbound, no_forward affects outbound).
+
+**Implementation Details:**
+- `no_transit`: AS_PATH filter `^.+ .+ .+` (3+ ASNs) applied in inbound route-map
+- `no_forward`: Community 9999 tags eBGP-learned routes, filtered in outbound route-map
+- Both options preserve iBGP routes and OSPF-learned routes (internal connectivity)
+- **Implementation**: [generators/gen_frr.py:137-161](generators/gen_frr.py#L137-L161)
 
 #### WireGuard Configuration
 ```python
@@ -162,7 +196,14 @@ The `watcher.py` is the central orchestrator:
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/enable
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_asn
 /nodes/<NODE_ID>/wireguard/<NAME>/bgp/peer_ip
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/no_transit         # "true" | "false", default "false"
+/nodes/<NODE_ID>/wireguard/<NAME>/bgp/no_forward        # "true" | "false", default "false"
 ```
+
+**BGP Control Flags:** (same as OpenVPN BGP above)
+- **no_transit**: Prevent traffic from being sent through this peer. Only advertise locally-originated routes.
+- **no_forward**: Completely disable transit. Stricter than `no_transit`.
+- See [OpenVPN BGP Control Flags](#bgp-control-flags) above for details.
 
 #### BGP Configuration
 ```python

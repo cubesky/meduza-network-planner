@@ -134,6 +134,32 @@ def _iter_bgp_transports(
     return out
 
 
+def _get_bgp_control_flags(cfg: Dict[str, str]) -> Tuple[bool, bool]:
+    """
+    Get no_transit and no_forward flags from BGP config.
+
+    Returns:
+        (no_transit, no_forward) tuple of booleans
+
+    Behavior:
+    - no_transit (True): Only learn routes directly originated by this peer (AS_PATH length = 1).
+      Don't learn routes that this peer has learned from other ASes (AS_PATH length > 1).
+      Routes learned from this peer are still advertised to iBGP and other eBGP neighbors.
+      Example: A - B - C, if C sets no_transit for B, then C will only learn B's own routes,
+      not routes that B learned from A. But C will advertise B's routes to other neighbors.
+
+    - no_forward (True): Only advertise locally-originated routes and iBGP routes to this peer.
+      Don't advertise routes learned from other eBGP peers.
+      Example: A - B - C - D, if C sets no_forward for B, then C will advertise C's own
+      routes and iBGP routes to B, but not routes learned from D or other eBGP peers.
+
+    - If both are set, no_forward takes precedence (affects outbound advertisement).
+    """
+    no_transit = cfg.get("bgp/no_transit", "false").lower() == "true"
+    no_forward = cfg.get("bgp/no_forward", "false").lower() == "true"
+    return no_transit, no_forward
+
+
 def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str], all_nodes: Dict[str, str]) -> str:
     router_id = node.get(f"/nodes/{node_id}/router_id", "")
     internal_routing = global_cfg.get("/global/internal_routing_system", "ospf")
@@ -161,6 +187,21 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
     # Parse BGP edge broadcast prefixes (newline-separated)
     bgp_edge_broadcast = sorted(set(split_ml(global_cfg.get("/global/bgp/edge_broadcast", ""))))
+
+    # Collect neighbors with BGP control flags
+    ovpn = _parse_openvpn(node_id, node)
+    wg = _parse_wireguard(node_id, node)
+    bgp_control_peers: Dict[str, Tuple[bool, bool]] = {}  # peer_ip -> (no_transit, no_forward)
+    for kind, name, cfg, dev in _iter_bgp_transports(ovpn, wg):
+        if cfg.get("enable") != "true":
+            continue
+        if not _bgp_enabled(cfg):
+            continue
+        peer_ip = cfg.get("bgp/peer_ip", "")
+        if peer_ip:
+            no_transit, no_forward = _get_bgp_control_flags(cfg)
+            if no_transit or no_forward:
+                bgp_control_peers[peer_ip] = (no_transit, no_forward)
 
     if internal_routing == "bgp":
         ospf_enable = False
@@ -286,6 +327,71 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         lines.append(" match ip address prefix-list PL-DEFAULT")
     lines += [f" set tag {TAG_NO_REINJECT}", "!", ""]
 
+    # Generate per-neighbor route-maps for BGP control flags
+    # These must be generated after collecting all peer information
+    if bgp_control_peers:
+        # Use communities to tag routes from eBGP peers (for no_forward filtering)
+        COMMUNITY_EBGP_LEARNED = 9999  # Community for routes learned from eBGP peers
+
+        # Check if we need to tag eBGP routes
+        has_no_forward = any(nf for peer, (nt, nf) in bgp_control_peers.items() if nf)
+        if has_no_forward:
+            # Create community for eBGP-learned routes
+            lines.append(f"bgp community-list standard EBGP_LEARNED permit {COMMUNITY_EBGP_LEARNED}")
+            lines.append("!")
+
+            # Create inbound wrapper that tags all eBGP-learned routes
+            # This will be applied to eBGP peers without no_forward/no_transit
+            lines.append("route-map RM-BGP-IN-TAG-EBGP permit 10")
+            lines.append(" match ip address prefix-list PL-BGP-IN")
+            lines.append(f" set community {COMMUNITY_EBGP_LEARNED} additive")
+            lines.append("route-map RM-BGP-IN-TAG-EBGP permit 20")
+            lines.append("!")
+            lines.append("")
+
+        # Generate inbound route-maps for peers with no_transit
+        for peer_ip, (no_transit, no_forward) in sorted(bgp_control_peers.items()):
+            peer_name = peer_ip.replace(".", "-")
+
+            if no_transit:
+                # no_transit: Only accept routes with AS_PATH length <= 2
+                # AS_PATH = 1: Peer's own routes
+                # AS_PATH = 2: Peer's customer's routes (allow)
+                # AS_PATH > 2: Transit routes (deny)
+                lines.append(f"route-map RM-BGP-IN-{peer_name} deny 10")
+                lines.append(" match ip address prefix-list PL-BGP-IN")
+                # Deny routes with AS_PATH length > 2 (transit routes)
+                lines.append(" match as-path list 1")  # ^.+ .+ .+
+                lines.append(f"route-map RM-BGP-IN-{peer_name} permit 20")
+                lines.append(" match ip address prefix-list PL-BGP-IN")
+                # Allow routes with AS_PATH length <= 2
+                lines.append(f"route-map RM-BGP-IN-{peer_name} permit 30")
+                lines.append(" ! Allow all other routes")
+                lines.append("!")
+                lines.append("")
+
+        # Generate AS_PATH filter list if needed
+        has_no_transit = any(nt for peer, (nt, nf) in bgp_control_peers.items() if nt)
+        if has_no_transit:
+            # AS_PATH filter list 1: Match routes with AS_PATH length > 2
+            # This indicates transit routes (peer is providing transit)
+            lines.append("ip as-path access-list 1 permit ^.+ .+ .+")  # 3 or more ASNs
+            lines.append("!")
+
+        # Generate outbound route-maps for peers with no_forward
+        for peer_ip, (no_transit, no_forward) in sorted(bgp_control_peers.items()):
+            peer_name = peer_ip.replace(".", "-")
+
+            if no_forward:
+                # no_forward: Only advertise locally-originated and iBGP routes
+                # Deny routes learned from eBGP peers (tagged with EBGP_LEARNED community)
+                lines.append(f"route-map RM-BGP-OUT-{peer_name} deny 10")
+                lines.append(" match community EBGP_LEARNED")
+                lines.append(f"route-map RM-BGP-OUT-{peer_name} permit 20")
+                lines.append(" ! Allow locally-originated and iBGP routes")
+                lines.append("!")
+                lines.append("")
+
     if ospf_enable:
         ospf_area = node.get(f"/nodes/{node_id}/ospf/area", "0")
         for iface in active_ifaces:
@@ -368,13 +474,43 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"  neighbor {peer_ip} activate")
                 if weight:
                     lines.append(f"  neighbor {peer_ip} weight {weight}")
-                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
-                if private_lans:
-                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
+
+                # Determine which inbound route-map to use
+                no_transit, no_forward = _get_bgp_control_flags(cfg)
+                if no_transit:
+                    # Use peer-specific inbound route-map with AS_PATH filtering
+                    peer_name = peer_ip.replace(".", "-")
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN-{peer_name} in")
+                elif has_no_forward and not no_forward:
+                    # This is a normal eBGP peer - tag routes for no_forward filtering
+                    # Use wrapper route-map that tags eBGP routes
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN-TAG-EBGP in")
                 else:
-                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                    # Standard inbound filter
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+
+                # Determine which outbound route-map to use based on BGP control flags
+                if no_forward:
+                    # Use per-neighbor route-map that filters eBGP-learned routes
+                    peer_name = peer_ip.replace(".", "-")
+                    lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-{peer_name} out")
+                elif no_transit:
+                    # no_transit doesn't affect outbound to this peer
+                    # Use standard outbound route-map
+                    if private_lans:
+                        lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
+                    else:
+                        lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+                else:
+                    # Normal peer - use standard outbound route-map
+                    if private_lans:
+                        lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-EXTERNAL out")
+                    else:
+                        lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+
                 # Enable BGP transit if peer ASN is in the allowed list or '*' is set
-                if bgp_transit_all or (bgp_transit_as_list and peer_asn in bgp_transit_as_list):
+                # But only if no_forward is not set (no_forward disables all transit)
+                if (bgp_transit_all or (bgp_transit_as_list and peer_asn in bgp_transit_as_list)) and not no_forward:
                     lines.append(f"  neighbor {peer_ip} next-hop-self")
 
         for info in ibgp_neighbors:

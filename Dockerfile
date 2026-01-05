@@ -140,6 +140,7 @@ COPY scripts/run-mosdns.sh /usr/local/bin/run-mosdns.sh
 COPY scripts/run-dnsmasq.sh /usr/local/bin/run-dnsmasq.sh
 COPY scripts/run-wireguard.sh /usr/local/bin/run-wireguard.sh
 COPY scripts/run-dns-monitor.sh /usr/local/bin/run-dns-monitor.sh
+COPY scripts/run-dbus.sh /usr/local/bin/run-dbus.sh
 
 COPY frr/ /etc/frr/
 COPY clash/ /clash/
@@ -149,6 +150,6 @@ COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-easytier.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
-    /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh
+    /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh /usr/local/bin/run-dbus.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

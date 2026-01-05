@@ -4,7 +4,8 @@
       "Bash(python -m py_compile:*)",
       "Bash(python generators/gen_clash.py:*)",
       "Bash(python:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(del:*)"
     ]
   }
 }
