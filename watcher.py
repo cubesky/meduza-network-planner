@@ -8,7 +8,6 @@ import shutil
 import threading
 import random
 import signal
-import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -340,7 +339,8 @@ def _iface_exists(dev: str) -> bool:
 def _s6_status(name: str) -> str:
     """Get status of an s6 service."""
     try:
-        cp = subprocess.run(["s6-rc", "-a", "list"], capture_output=True, text=True, timeout=5)
+        # s6-rc -a lists all active services
+        cp = subprocess.run(["s6-rc", "-a"], capture_output=True, text=True, timeout=5)
         if cp.returncode != 0:
             return "down"
         # Check if service is in the list of active services
@@ -350,48 +350,20 @@ def _s6_status(name: str) -> str:
         return "down"
 
 
-def _s6_live_dir() -> str:
-    for candidate in (
-        os.environ.get("S6_RC_LIVE"),
-        os.environ.get("S6RC_LIVE"),
-        "/run/service",
-        "/run/s6-rc",
-    ):
-        if candidate and os.path.isdir(candidate):
-            return candidate
-    return "/run/service"
-
-
-def _s6_db_dir() -> str:
-    return os.path.join(_s6_live_dir(), "db")
-
-
 def _s6_status_all() -> Dict[str, str]:
     """Get status of all s6 services."""
     try:
         # Get all active services
-        cp = subprocess.run(["s6-rc", "-a", "list"], capture_output=True, text=True, timeout=5)
+        cp = subprocess.run(["s6-rc", "-a"], capture_output=True, text=True, timeout=5)
         if cp.returncode != 0:
             return {}
         out: Dict[str, str] = {}
         active_services = cp.stdout.strip().split() if cp.stdout.strip() else []
         # Get all known services (compiled database)
-        db_dir = _s6_db_dir()
-        if os.path.isdir(db_dir):
-            all_cp = subprocess.run(
-                ["s6-rc-db", "-l", db_dir, "list", "all"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if all_cp.returncode == 0:
-                for svc in all_cp.stdout.strip().split():
-                    out[svc] = "up" if svc in active_services else "down"
-        else:
-            all_cp = subprocess.run(["s6-rc", "list"], capture_output=True, text=True, timeout=5)
-            if all_cp.returncode == 0:
-                for svc in all_cp.stdout.strip().split():
-                    out[svc] = "up" if svc in active_services else "down"
+        all_cp = subprocess.run(["s6-rc", "list"], capture_output=True, text=True, timeout=5)
+        if all_cp.returncode == 0:
+            for svc in all_cp.stdout.strip().split():
+                out[svc] = "up" if svc in active_services else "down"
         return out
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return {}
@@ -420,16 +392,10 @@ def _s6_is_running(name: str) -> bool:
 
 def _s6_create_dynamic_service(name: str, command: str) -> None:
     """Create a dynamic s6 service directory."""
-    service_dir = f"/etc/s6-overlay/s6-rc.d/{name}"
+    service_dir = f"/etc/s6-overlay/sv/{name}"
     os.makedirs(service_dir, exist_ok=True)
-    with open(os.path.join(service_dir, "type"), "w") as f:
-        f.write("longrun\n")
-    deps_dir = os.path.join(service_dir, "dependencies.d")
-    os.makedirs(deps_dir, exist_ok=True)
-    open(os.path.join(deps_dir, "base"), "a").close()
     run_script = f"""#!/command/execlineb -P
 # s6-overlay service script for {name}
-with-contenv
 fdmove -c 2 1
 exec {command}
 """
@@ -440,7 +406,7 @@ exec {command}
 
 def _s6_remove_dynamic_service(name: str) -> None:
     """Remove a dynamic s6 service."""
-    service_dir = f"/etc/s6-overlay/s6-rc.d/{name}"
+    service_dir = f"/etc/s6-overlay/sv/{name}"
     if os.path.exists(service_dir):
         # Stop service first
         _s6_stop(name)
@@ -451,27 +417,8 @@ def _s6_remove_dynamic_service(name: str) -> None:
 def _s6_reload_services() -> None:
     """Reload s6 services database after adding/removing services."""
     try:
-        compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
-        compile_cp = subprocess.run(
-            ["s6-rc-compile", compiled_dir, "/etc/s6-overlay/s6-rc.d"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if compile_cp.returncode != 0:
-            err = (compile_cp.stderr or compile_cp.stdout or "").strip()
-            print(f"[s6] failed to compile services: {err}", flush=True)
-            return
-        live_dir = _s6_live_dir()
-        update_cp = subprocess.run(
-            ["s6-rc-update", "-l", live_dir, compiled_dir],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if update_cp.returncode != 0:
-            err = (update_cp.stderr or update_cp.stdout or "").strip()
-            print(f"[s6] failed to update services: {err}", flush=True)
+        subprocess.run(["s6-rc-compile", "/etc/s6-overlay/compiled", "/etc/s6-overlay/sv"],
+                       capture_output=True, check=False, timeout=30)
     except Exception as e:
         print(f"[s6] failed to reload services: {e}", flush=True)
 
@@ -552,7 +499,7 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         _ovpn_cfg_names.extend(sorted(enabled))
 
     # Remove old services
-    for path in glob.glob("/etc/s6-overlay/s6-rc.d/openvpn-*"):
+    for path in glob.glob("/etc/s6-overlay/sv/openvpn-*"):
         svc_name = os.path.basename(path)
         if svc_name.startswith("openvpn-"):
             name = svc_name[8:]  # remove "openvpn-" prefix
@@ -635,7 +582,7 @@ def reload_wireguard(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         _wg_cfg_names.extend(sorted(enabled))
 
     # Remove old services
-    for path in glob.glob("/etc/s6-overlay/s6-rc.d/wireguard-*"):
+    for path in glob.glob("/etc/s6-overlay/sv/wireguard-*"):
         svc_name = os.path.basename(path)
         if svc_name.startswith("wireguard-"):
             name = svc_name[10:]  # remove "wireguard-" prefix
