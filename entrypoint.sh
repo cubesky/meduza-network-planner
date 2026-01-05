@@ -43,4 +43,5 @@ fi
 # FRR must be up before any transparent proxy rules are applied.
 /usr/lib/frr/frrinit.sh start
 
-exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+# Use pip-installed supervisord 4.3.0 instead of system version
+exec /usr/local/bin/supervisord -c /etc/supervisor/supervisord.conf

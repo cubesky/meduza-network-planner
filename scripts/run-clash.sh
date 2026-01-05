@@ -11,6 +11,7 @@ mkdir -p "$(dirname "${PID_FILE}")"
 python3 - <<'PY'
 import os
 import sys
+import subprocess
 import yaml
 from urllib.parse import urlparse
 
@@ -38,7 +39,11 @@ for url in urls:
     if not name:
         continue
     out_path = os.path.join(data_dir, name)
-    os.system(f"curl -fL --retry 2 --connect-timeout 10 -o '{out_path}' '{url}'")
+    subprocess.run(
+        ["curl", "-fL", "--retry", "2", "--connect-timeout", "10", "-o", out_path, url],
+        check=False,
+        capture_output=True
+    )
 PY
 
 # Clean up old PID file

@@ -31,7 +31,6 @@ RUN apt-get update && apt-get install -y \
     procps \
     curl jq git python3 python3-pip \
     ca-certificates \
-    supervisor \
     dnsmasq \
     avahi-daemon dbus \
     unzip gzip \
@@ -126,7 +125,8 @@ RUN set -eux; \
 
 RUN pip3 install --no-cache-dir --break-system-packages \
     "protobuf<=3.20.3" \
-    etcd3 pyyaml requests toml
+    etcd3 pyyaml requests toml \
+    "supervisor==4.3.0"
 
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
