@@ -601,14 +601,6 @@ def _s6_reload_services() -> None:
                 print("[s6] no service source directory found", flush=True)
                 return
 
-            # Clean up any orphaned temporary directories from previous runs
-            for pattern in ["/run/s6-rc-source-*", "/run/s6-rc-compiled-*"]:
-                for path in glob.glob(pattern):
-                    try:
-                        shutil.rmtree(path, ignore_errors=True)
-                    except Exception:
-                        pass
-
             tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
             for src in sources:
                 shutil.copytree(src, tmp_source_dir, dirs_exist_ok=True)
@@ -899,7 +891,6 @@ def monitor_children_loop():
 def s6_retry_loop():
     backoffs: Dict[str, Backoff] = {}
     next_time: Dict[str, float] = {}
-    last_clash_ready = False  # Track Clash ready state to detect transitions
 
     def should_try(key: str) -> bool:
         return time.time() >= next_time.get(key, 0)
@@ -925,18 +916,6 @@ def s6_retry_loop():
             clash_ready = True
             if clash_enabled and mosdns_enabled:
                 clash_ready = _clash_is_ready()
-
-            # Detect transition from not ready to ready
-            clash_became_ready = clash_enabled and mosdns_enabled and clash_ready and not last_clash_ready
-            last_clash_ready = clash_ready
-
-            # If Clash just became ready and mosdns config is missing, generate it
-            if clash_became_ready and mosdns_enabled and not _file_nonempty("/etc/mosdns/config.yaml"):
-                try:
-                    print("[s6-retry] Clash became ready, generating mosdns config", flush=True)
-                    reload_mosdns(node, global_cfg, clash_ready=True)
-                except Exception as e:
-                    print(f"[s6-retry] mosdns config generation failed: {e}", flush=True)
 
             desired: Dict[str, Optional[bool]] = {
                 "mihomo": clash_enabled,
