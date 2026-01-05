@@ -377,7 +377,8 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         if has_no_transit:
             # AS_PATH filter list 1: Match routes with AS_PATH length = 1
             # This indicates peer's own routes (directly originated)
-            lines.append("bgp as-path access-list 1 permit ^.+$")  # Exactly 1 ASN
+            # Use ^[0-9]+$ to match exactly one AS number (no spaces)
+            lines.append("bgp as-path access-list 1 permit ^[0-9]+$")
             lines.append("!")
 
         # Generate outbound route-maps for peers with no_forward
