@@ -1282,7 +1282,8 @@ def _update_proxy_ips_async() -> None:
             print(f"[clash] Found {len(ips)} unique proxy IPs, updating ipset...", flush=True)
 
             # Check if IPs actually changed
-            if ips == _cached_proxy_ips:
+            current_cached = _cached_proxy_ips
+            if ips == current_cached:
                 print("[clash] Proxy IPs unchanged, skipping update", flush=True)
                 return
 
@@ -1291,7 +1292,7 @@ def _update_proxy_ips_async() -> None:
             _ipset_add(PROXY_IPSET_NAME, ips)
 
             # Update cache
-            old_count = len(_cached_proxy_ips)
+            old_count = len(current_cached)
             _cached_proxy_ips = ips
 
             print(f"[clash] Updated ipset {PROXY_IPSET_NAME}: {old_count} → {len(ips)} IPs", flush=True)
