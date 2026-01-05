@@ -1,5 +1,4 @@
-#!/command/execlineb -P
+#!/command/with-contenv execlineb -P
 # s6-overlay service script for watcher
-with-contenv
 fdmove -c 2 1
 exec python3 /watcher.py
