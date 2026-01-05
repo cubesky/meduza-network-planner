@@ -552,8 +552,8 @@ Controlled by `/global/internal_routing_system`:
 ### BGP Configuration
 
 1. **Node setup**:
-   - `/nodes/<NODE_ID>/bgp/local_asn` - AS number
-   - `/nodes/<NODE_ID>/router_id` - Router ID (e.g., 1.1.1.1)
+   - `/nodes/<NODE_ID>/bgp/asn` - AS number
+   - `/nodes/<NODE_ID>/bgp/router_id` - Router ID (e.g., 1.1.1.1)
 
 2. **Neighbors** (auto-configured):
    - iBGP: Other nodes with `/nodes/*/router_id` set (when using BGP internally)

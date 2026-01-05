@@ -801,59 +801,6 @@ def clash_pid() -> Optional[int]:
     return None
 
 
-def _clash_api_get(endpoint: str) -> Optional[dict]:
-    """Query Clash API and return JSON response."""
-    try:
-        cp = subprocess.run(
-            ["curl", "-s", "--max-time", "3", f"http://127.0.0.1:9090{endpoint}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if cp.returncode == 0 and cp.stdout:
-            return json.loads(cp.stdout)
-    except Exception as e:
-        pass
-    return None
-
-
-def _clash_is_ready() -> bool:
-    """Check if Clash is ready by verifying url-test proxies have selected non-REJECT nodes."""
-    try:
-        proxies = _clash_api_get("/proxies")
-        if not proxies:
-            return False
-
-        # Check all url-test and fallback groups
-        for name, proxy in proxies.get("proxies", {}).items():
-            proxy_type = proxy.get("type", "")
-            if proxy_type in ("url-test", "fallback"):
-                # Check if this group has selected a node
-                now = proxy.get("now")
-                if not now or now == "REJECT" or now == "DIRECT":
-                    print(f"[clash] waiting for {name} to select node (current: {now})", flush=True)
-                    return False
-                print(f"[clash] {name} ready: {now}", flush=True)
-
-        return True
-    except Exception as e:
-        print(f"[clash] readiness check failed: {e}", flush=True)
-        return False
-
-
-def _wait_clash_ready(timeout: int = 60) -> bool:
-    """Wait for Clash to be ready (url-test groups have selected nodes)."""
-    print("[clash] waiting for url-test proxies to be ready...", flush=True)
-    start = time.time()
-    while time.time() - start < timeout:
-        if _clash_is_ready():
-            print(f"[clash] ready after {int(time.time() - start)}s", flush=True)
-            return True
-        time.sleep(2)
-    print(f"[clash] not ready after {timeout}s, proceeding anyway", flush=True)
-    return False
-
-
 def reload_clash(conf_text: str) -> None:
     """Reload clash config. Returns None if clash is not running."""
     pid = clash_pid()
@@ -972,7 +919,7 @@ def _parse_port(val: str) -> Optional[str]:
 
 
 def _clash_exclude_ports(node: Dict[str, str], global_cfg: Dict[str, str]) -> List[str]:
-    raw = node.get(f"/nodes/{NODE_ID}/clash/exclude_tproxy_port", "")
+    raw = load_key(f"/nodes/{NODE_ID}/clash/exclude_tproxy_port")
     ports = set(_split_ml(raw))
 
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
@@ -1144,16 +1091,12 @@ def tproxy_check_loop() -> None:
             node = load_prefix(f"/nodes/{NODE_ID}/")
             global_cfg = load_prefix("/global/")
 
-            # Get LAN sources for LAN mode
-            lan_sources = _clash_lan_sources(node)
-
             # Reapply tproxy rules
             _fix_tproxy_iptables(
                 _get_cached_tproxy_exclude(),
                 _clash_exclude_src(node),
                 _clash_exclude_ifaces(node),
                 _clash_exclude_ports(node, global_cfg),
-                lan_sources if lan_sources else None,
             )
         except Exception as e:
             print(f"[tproxy-check] error: {e}", flush=True)
@@ -1328,32 +1271,19 @@ def _touch_rules_stamp() -> None:
     _write_text(path, now_utc_iso() + "\n", mode=0o644)
 
 
-def _write_dnsmasq_config(clash_enabled: bool = False, clash_ready: bool = False) -> None:
-    """Generate dnsmasq configuration for frontend DNS forwarding.
-
-    Args:
-        clash_enabled: Whether Clash is configured
-        clash_ready: Whether Clash is ready (url-test groups have selected nodes)
-    """
-    # Only include Clash DNS (1053) if Clash is enabled AND ready
+def _write_dnsmasq_config(clash_enabled: bool = False) -> None:
+    """Generate dnsmasq configuration for frontend DNS forwarding."""
+    # Only include Clash DNS (1053) if Clash is enabled
     # dnsmasq uses # syntax for non-standard ports
-    if clash_enabled and clash_ready:
+    if clash_enabled:
         servers = """server=127.0.0.1#1153
 server=127.0.0.1#1053
 server=223.5.5.5
 server=119.29.29.29"""
-        status = "with Clash DNS"
-    elif clash_enabled:
-        # Clash enabled but not ready yet - don't include Clash DNS in forwarding list
-        servers = """server=127.0.0.1#1153
-server=223.5.5.5
-server=119.29.29.29"""
-        status = "Clash enabled but not ready (DNS not in forwarding list yet)"
     else:
         servers = """server=127.0.0.1#1153
 server=223.5.5.5
 server=119.29.29.29"""
-        status = "without Clash DNS"
 
     config = f"""# dnsmasq configuration for MosDNS frontend
 port=53
@@ -1373,17 +1303,9 @@ bogus-priv
 local-ttl=1
 """
     _write_text("/etc/dnsmasq.conf", config, mode=0o644)
-    return status
 
 
-def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready: bool = False) -> None:
-    """Reload MosDNS configuration.
-
-    Args:
-        node: Node configuration from etcd
-        global_cfg: Global configuration from etcd
-        clash_ready: Whether Clash is ready (url-test groups have selected nodes)
-    """
+def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
     out = _run_generator("gen_mosdns", payload)
     with open("/etc/mosdns/config.yaml", "w", encoding="utf-8") as f:
@@ -1400,20 +1322,27 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready:
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
 
     # Start dnsmasq first before downloading rules (so DNS is available during download)
-    # Only include Clash DNS in forwarding list if Clash is ready
-    status = _write_dnsmasq_config(clash_enabled=clash_enabled, clash_ready=clash_ready)
+    _write_dnsmasq_config(clash_enabled=clash_enabled)
     _s6_restart("dnsmasq")
-    print(f"[mosdns] dnsmasq started as frontend DNS on port 53 ({status})", flush=True)
+    if clash_enabled:
+        print("[mosdns] dnsmasq started as frontend DNS on port 53 (with Clash DNS)", flush=True)
+    else:
+        print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
 
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
-        # If Clash is enabled and ready, use it for downloading rules
-        if clash_enabled and clash_ready:
-            print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
-        elif clash_enabled:
-            print(f"[mosdns] Clash enabled but not ready, downloading rules directly (will retry after Clash ready)", flush=True)
-        else:
-            print(f"[mosdns] Clash not enabled, downloading rules directly", flush=True)
+        # If Clash is enabled, wait a bit for it to be ready
+        if clash_enabled:
+            # Check if Clash is running, if not, wait for it to start
+            for attempt in range(10):  # Wait up to 10 seconds
+                if clash_pid() is not None:
+                    print(f"[mosdns] Clash is ready, downloading rules via proxy", flush=True)
+                    time.sleep(1)  # Extra second for proxy to be fully ready
+                    break
+                print(f"[mosdns] Waiting for Clash to start... (attempt {attempt + 1}/10)", flush=True)
+                time.sleep(1)
+            else:
+                print(f"[mosdns] Clash not ready after 10s, downloading rules directly", flush=True)
 
         _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
@@ -1496,13 +1425,8 @@ def handle_commit() -> None:
 
     clash_domain = {k: v for k, v in node.items() if "/clash/" in k}
     global_clash = {k: v for k, v in global_cfg.items() if k.startswith("/global/clash/")}
-    clash_changed = changed("clash", {"node": clash_domain, "global": global_clash})
-
-    clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
-    clash_ready = False  # Track whether Clash is ready (url-test groups have selected nodes)
-
-    if clash_changed:
-        if not clash_enabled:
+    if changed("clash", {"node": clash_domain, "global": global_clash}):
+        if node.get(f"/nodes/{NODE_ID}/clash/enable") != "true":
             # Stop clash (mihomo) service
             try:
                 tproxy_remove()
@@ -1530,48 +1454,30 @@ def handle_commit() -> None:
                 except Exception:
                     pass
                 tproxy_enabled = False
-                with _tproxy_check_lock:
-                    _tproxy_check_enabled = False
 
             # Start clash if not running
             if not _s6_is_running("mihomo"):
                 _s6_start("mihomo")
-                # Wait for clash process to start
-                for attempt in range(10):  # Wait up to 10 seconds
-                    if clash_pid() is not None:
-                        print(f"[clash] process started (pid={clash_pid()})", flush=True)
-                        break
-                    print(f"[clash] waiting for process to start... (attempt {attempt + 1}/10)", flush=True)
-                    time.sleep(1)
-                else:
-                    print("[clash] failed to start after 10s", flush=True)
-                    raise RuntimeError("Clash failed to start")
+                # Wait a bit for clash to start
+                time.sleep(2)
 
             # Reload configuration
             reload_clash(out["config_yaml"])
 
-            # Wait for Clash to be ready (url-test groups have selected nodes)
-            print("[clash] waiting for url-test proxies to select nodes...", flush=True)
-            clash_ready = _wait_clash_ready(timeout=60)
-
-            # Apply tproxy ONLY after Clash is ready (to avoid network disruption)
+            # Apply tproxy if needed
             if new_mode == "tproxy":
-                if clash_ready:
-                    print("[clash] applying TPROXY (Clash is ready)", flush=True)
-                    lan_sources = _clash_lan_sources(node)
-                    tproxy_apply(
-                        out["tproxy_exclude"],
-                        _clash_exclude_src(node),
-                        _clash_exclude_ifaces(node),
-                        _clash_exclude_ports(node, global_cfg),
-                        lan_sources if lan_sources else None,
-                    )
-                    _set_cached_tproxy_exclude(out["tproxy_exclude"])
-                    tproxy_enabled = True
-                    with _tproxy_check_lock:
-                        _tproxy_check_enabled = True
-                else:
-                    print("[clash] WARNING: TPROXY not applied (Clash not ready), will retry on next check", flush=True)
+                lan_sources = _clash_lan_sources(node)
+                tproxy_apply(
+                    out["tproxy_exclude"],
+                    _clash_exclude_src(node),
+                    _clash_exclude_ifaces(node),
+                    _clash_exclude_ports(node, global_cfg),
+                    lan_sources if lan_sources else None,
+                )
+                _set_cached_tproxy_exclude(out["tproxy_exclude"])
+                tproxy_enabled = True
+                with _tproxy_check_lock:
+                    _tproxy_check_enabled = True
             else:
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = False
@@ -1581,33 +1487,16 @@ def handle_commit() -> None:
                 _clash_refresh_interval = max(0, int(out["refresh_interval_minutes"]))
                 _clash_refresh_next = time.time() + (_clash_refresh_interval * 60)
         did_apply = True
-    elif clash_enabled:
-        # Clash is enabled but not changed in this commit
-        # Check if it's ready (for MosDNS dependency)
-        clash_ready = _clash_is_ready()
-        if clash_ready:
-            print("[clash] already ready (url-test proxies have selected nodes)", flush=True)
-        else:
-            print("[clash] running but not ready yet (url-test still testing)", flush=True)
 
-    # MosDNS: start only after Clash is ready (if Clash is enabled)
     mosdns_enabled = node.get(f"/nodes/{NODE_ID}/mosdns/enable") == "true"
     mosdns_material = {
         "enabled": mosdns_enabled,
         "refresh": node.get(f"/nodes/{NODE_ID}/mosdns/refresh", ""),
         "global": {k: v for k, v in global_cfg.items() if k.startswith("/global/mosdns/")},
     }
-
-    # If Clash is enabled but not ready yet, skip MosDNS reload for now
-    # (it will be loaded after Clash is ready via periodic_reconcile_loop)
-    if clash_enabled and not clash_ready:
-        print("[mosdns] skipping reload (waiting for Clash to be ready)", flush=True)
-        # Only mark as changed if MosDNS actually changed, to avoid unnecessary retries
-        if changed("mosdns", mosdns_material):
-            did_apply = True
-    elif changed("mosdns", mosdns_material):
+    if changed("mosdns", mosdns_material):
         if mosdns_enabled:
-            reload_mosdns(node, global_cfg, clash_ready=clash_ready)
+            reload_mosdns(node, global_cfg)
         else:
             _s6_stop("mosdns")
             _s6_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
