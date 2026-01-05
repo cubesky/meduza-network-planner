@@ -146,7 +146,8 @@ def _get_bgp_control_flags(cfg: Dict[str, str]) -> Tuple[bool, bool]:
       Don't learn routes that this peer has learned from other ASes (AS_PATH length > 1).
       Routes learned from this peer are still advertised to iBGP and other eBGP neighbors.
       Example: A - B - C, if C sets no_transit for B, then C will only learn B's own routes,
-      not routes that B learned from A. But C will advertise B's routes to other neighbors.
+      not routes that B learned from A or any of B's customers. But C will advertise B's
+      routes to other neighbors.
 
     - no_forward (True): Only advertise locally-originated routes and iBGP routes to this peer.
       Don't advertise routes learned from other eBGP peers.
@@ -357,17 +358,16 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             peer_name = peer_ip.replace(".", "-")
 
             if no_transit:
-                # no_transit: Only accept routes with AS_PATH length <= 2
-                # AS_PATH = 1: Peer's own routes
-                # AS_PATH = 2: Peer's customer's routes (allow)
-                # AS_PATH > 2: Transit routes (deny)
-                lines.append(f"route-map RM-BGP-IN-{peer_name} deny 10")
+                # no_transit: Only accept routes with AS_PATH length = 1
+                # AS_PATH = 1: Peer's own routes (ACCEPT)
+                # AS_PATH >= 2: Routes learned from other ASes (DENY)
+                lines.append(f"route-map RM-BGP-IN-{peer_name} permit 10")
                 lines.append(" match ip address prefix-list PL-BGP-IN")
-                # Deny routes with AS_PATH length > 2 (transit routes)
-                lines.append(" match as-path 1")  # ^.+ .+ .+
-                lines.append(f"route-map RM-BGP-IN-{peer_name} permit 20")
+                # Only allow routes with AS_PATH length = 1 (peer's own routes)
+                lines.append(" match as-path 1")  # ^.+$
+                lines.append(f"route-map RM-BGP-IN-{peer_name} deny 20")
                 lines.append(" match ip address prefix-list PL-BGP-IN")
-                # Allow routes with AS_PATH length <= 2
+                # Deny all other routes from this peer (AS_PATH >= 2)
                 lines.append(f"route-map RM-BGP-IN-{peer_name} permit 30")
                 lines.append(" ! Allow all other routes")
                 lines.append("!")
@@ -375,9 +375,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
         # Generate AS_PATH filter list if needed (using pre-calculated value)
         if has_no_transit:
-            # AS_PATH filter list 1: Match routes with AS_PATH length > 2
-            # This indicates transit routes (peer is providing transit)
-            lines.append("bgp as-path access-list 1 permit ^.+ .+ .+")  # 3 or more ASNs
+            # AS_PATH filter list 1: Match routes with AS_PATH length = 1
+            # This indicates peer's own routes (directly originated)
+            lines.append("bgp as-path access-list 1 permit ^.+$")  # Exactly 1 ASN
             lines.append("!")
 
         # Generate outbound route-maps for peers with no_forward
