@@ -5,7 +5,8 @@
       "Bash(python generators/gen_clash.py:*)",
       "Bash(python:*)",
       "Bash(bash:*)",
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "Bash(grep:*)"
     ]
   }
 }

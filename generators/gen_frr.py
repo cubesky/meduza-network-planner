@@ -203,6 +203,10 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
             if no_transit or no_forward:
                 bgp_control_peers[peer_ip] = (no_transit, no_forward)
 
+    # Calculate control flag states for later use
+    has_no_forward = any(nf for _, (_, nf) in bgp_control_peers.items() if nf)
+    has_no_transit = any(nt for _, (nt, _) in bgp_control_peers.items() if nt)
+
     if internal_routing == "bgp":
         ospf_enable = False
 
@@ -333,8 +337,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         # Use communities to tag routes from eBGP peers (for no_forward filtering)
         COMMUNITY_EBGP_LEARNED = 9999  # Community for routes learned from eBGP peers
 
-        # Check if we need to tag eBGP routes
-        has_no_forward = any(nf for peer, (nt, nf) in bgp_control_peers.items() if nf)
+        # Check if we need to tag eBGP routes (using pre-calculated value)
         if has_no_forward:
             # Create community for eBGP-learned routes
             lines.append(f"bgp community-list standard EBGP_LEARNED permit {COMMUNITY_EBGP_LEARNED}")
@@ -370,8 +373,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append("!")
                 lines.append("")
 
-        # Generate AS_PATH filter list if needed
-        has_no_transit = any(nt for peer, (nt, nf) in bgp_control_peers.items() if nt)
+        # Generate AS_PATH filter list if needed (using pre-calculated value)
         if has_no_transit:
             # AS_PATH filter list 1: Match routes with AS_PATH length > 2
             # This indicates transit routes (peer is providing transit)
