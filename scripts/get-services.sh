@@ -1,14 +1,14 @@
-﻿#!/bin/bash
-# 蹇€熸煡鐪嬫墍鏈?s6 鏈嶅姟鐘舵€?
+#!/bin/bash
+# 快速查看所有 s6 服务状态
 # Usage: get-services
 
 set -euo pipefail
 
-# s6-overlay v3 鍛戒护璺緞 - 鏀寔 Docker 鍜?Podman
-# s6-overlay 灏嗗懡浠ゅ畨瑁呭湪 /command,闇€瑕佹坊鍔犲埌 PATH
+# s6-overlay v3 命令路径 - 支持 Docker 和 Podman
+# s6-overlay 将命令安装在 /command,需要添加到 PATH
 export PATH="/command:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# 妫€鏌ユ槸鍚﹀湪瀹瑰櫒鍐呰繍琛?
+# 检查是否在容器内运行
 if [[ ! -d /run/service ]]; then
     echo "Error: Not running in s6-overlay container or /run/service not found" >&2
     echo "" >&2
@@ -21,7 +21,7 @@ fi
 echo "=== s6 Services Status ===" >&2
 echo "" >&2
 
-# 1. 鍒楀嚭鎵€鏈?s6-rc 鏈嶅姟鐘舵€?
+# 1. 列出所有 s6-rc 服务状态
 echo "[s6-rc Service Database]" >&2
 if command -v s6-rc-db >/dev/null 2>&1; then
     s6-rc-db -l /run/service/db list all 2>/dev/null | sed 's/^/  /' || echo "  (database not available)" >&2
@@ -30,7 +30,7 @@ else
 fi
 echo "" >&2
 
-# 2. 鍒楀嚭褰撳墠杩愯鐨勬湇鍔?
+# 2. 列出当前运行的服务
 echo "[Currently Active Services]" >&2
 if command -v s6-rc >/dev/null 2>&1; then
     s6-rc -a list 2>/dev/null | sed 's/^/  /' || echo "  (unable to list active services)" >&2
@@ -39,25 +39,15 @@ else
 fi
 echo "" >&2
 
-# 3. 鏄剧ず姣忎釜鏈嶅姟鐨勮缁嗙姸鎬?
-dynamic_services=()
-if command -v s6-rc-db >/dev/null 2>&1; then
-    mapfile -t dynamic_services < <(s6-rc-db -l /run/service/db list all 2>/dev/null | grep -E '^(openvpn|wireguard)-' || true)
-else
-    mapfile -t dynamic_services < <(ls -1 /run/service 2>/dev/null | grep -E '^(openvpn|wireguard)-' || true)
-fi
-
-services=(dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor)
-services+=("${dynamic_services[@]}")
-
+# 3. 显示每个服务的详细状态
 echo "[Longrun Service Details]" >&2
-for service in "${services[@]}"; do
-    # s6-overlay v3 涓紝杩愯涓殑鏈嶅姟鍦?/run/service 涓?
+for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
+    # s6-overlay v3 中，运行中的服务在 /run/service 下
     service_path="/run/service/${service}"
     
-    # 妫€鏌ユ湇鍔℃槸鍚﹀瓨鍦ㄥ苟杩愯
+    # 检查服务是否存在并运行
     if [[ -d "$service_path" ]]; then
-        # 浣跨敤 s6-svstat 鑾峰彇鐘舵€?
+        # 使用 s6-svstat 获取状态
         if command -v s6-svstat >/dev/null 2>&1; then
             status=$(s6-svstat "$service_path" 2>&1 || echo "unknown")
             printf "  %-15s %s\n" "$service:" "$status"
@@ -65,7 +55,7 @@ for service in "${services[@]}"; do
             printf "  %-15s %s\n" "$service:" "running (s6-svstat unavailable)"
         fi
     else
-        # 妫€鏌ユ槸鍚﹀湪 s6-rc 鏁版嵁搴撲腑瀹氫箟
+        # 检查是否在 s6-rc 数据库中定义
         if s6-rc-db -l /run/service/db list all 2>/dev/null | grep -q "^${service}$"; then
             printf "  %-15s %s\n" "$service:" "defined but not running"
         else
@@ -75,11 +65,11 @@ for service in "${services[@]}"; do
 done
 echo "" >&2
 
-# 4. 鏄剧ず Pipeline 鐘舵€?
+# 4. 显示 Pipeline 状态
 echo "[Pipeline Services]" >&2
 for pipeline in dbus-pipeline avahi-pipeline watchfrr-pipeline watcher-pipeline mihomo-pipeline easytier-pipeline tinc-pipeline mosdns-pipeline dnsmasq-pipeline dns-monitor-pipeline; do
     if s6-rc-db -l /run/service/db list all 2>/dev/null | grep -q "^${pipeline}$"; then
-        # 妫€鏌ユ槸鍚︽縺娲?
+        # 检查是否激活
         if s6-rc -a list 2>/dev/null | grep -q "^${pipeline}$"; then
             printf "  %-25s %s\n" "$pipeline:" "active"
         else
@@ -89,7 +79,7 @@ for pipeline in dbus-pipeline avahi-pipeline watchfrr-pipeline watcher-pipeline 
 done
 echo "" >&2
 
-# 5. 鏄剧ず Bundle 鐘舵€?
+# 5. 显示 Bundle 状态
 echo "[Bundles]" >&2
 for bundle in default user; do
     if s6-rc-db -l /run/service/db list all 2>/dev/null | grep -q "^${bundle}$"; then
@@ -102,16 +92,16 @@ for bundle in default user; do
 done
 echo "" >&2
 
-# 鏄剧ず涓€浜涜绉婚櫎鐨勪唬鐮侀儴鍒嗙殑寮曠敤
+# 显示一些被移除的代码部分的引用
 if false; then
-    # 鏃т唬鐮佸紩鐢ㄧ偣
+    # 旧代码引用点
     service_path="old"
     pid="old"
 fi
 
-# 6. 鏄剧ず鏃ュ織鏂囦欢淇℃伅
+# 6. 显示日志文件信息
 echo "[Log Files]" >&2
-for service in "${services[@]}"; do
+for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
     log_dir="/var/log/${service}"
     log_file="${log_dir}/current"
     if [[ -f "$log_file" ]]; then
@@ -124,10 +114,10 @@ for service in "${services[@]}"; do
 done
 echo "" >&2
 
-# 7. 蹇€熸煡鐪嬫渶杩戠殑閿欒
+# 7. 快速查看最近的错误
 echo "[Recent Errors (last 3 from each log)]" >&2
 found_errors=0
-for service in "${services[@]}"; do
+for service in dbus avahi watchfrr watcher mihomo easytier tinc mosdns dnsmasq dns-monitor; do
     log_file="/var/log/${service}/current"
     if [[ -f "$log_file" ]]; then
         errors=$(grep -Ei "error|fail|fatal|exception" "$log_file" 2>/dev/null | tail -n 3)
@@ -150,4 +140,3 @@ echo "  - Follow logs: get-logs -f watcher" >&2
 if command -v s6-svstat >/dev/null 2>&1; then
     echo "  - Check service: s6-svstat /run/service/<service>" >&2
 fi
-
