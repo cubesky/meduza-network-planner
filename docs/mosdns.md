@@ -287,7 +287,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     # Start dnsmasq FIRST (before downloading rules)
     # Avahi and D-Bus are always running, no need to start them here
     _write_dnsmasq_config(clash_enabled=clash_enabled)
-    _s6_restart("dnsmasq")
+    _supervisor_restart("dnsmasq")
 
     # Download rules if needed
     if _should_refresh_rules(refresh_minutes):
@@ -295,7 +295,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
         _touch_rules_stamp()
 
     # Finally start MosDNS
-    _s6_restart("mosdns")
+    _supervisor_restart("mosdns")
 ```
 
 **Generator**: [generators/gen_mosdns.py](generators/gen_mosdns.py)

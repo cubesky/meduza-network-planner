@@ -5,6 +5,7 @@ set -euo pipefail
 
 mkdir -p /run/openvpn /run/easytier /run/clash /run/tinc /run/wireguard /run/dbus
 mkdir -p /etc/openvpn/generated /etc/clash /etc/tinc /etc/mosdns /etc/wireguard
+mkdir -p /etc/supervisor/conf.d
 
 # Ensure stable DNS before services start.
 /usr/local/bin/run-dns-monitor.sh --once
@@ -42,7 +43,4 @@ fi
 # FRR must be up before any transparent proxy rules are applied.
 /usr/lib/frr/frrinit.sh start
 
-# s6-overlay v3 initialization
-# The /init process will automatically set up the supervision tree
-# and start services based on the compiled database from /etc/s6-overlay/sv/
-exec /init
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf

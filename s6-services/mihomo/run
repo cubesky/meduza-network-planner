@@ -1,4 +1,0 @@
-#!/command/execlineb -P
-# s6-overlay service script for mihomo (Clash)
-fdmove -c 2 1
-exec /usr/local/bin/run-clash.sh

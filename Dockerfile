@@ -31,30 +31,13 @@ RUN apt-get update && apt-get install -y \
     procps \
     curl jq git python3 python3-pip \
     ca-certificates \
+    supervisor \
     dnsmasq \
     avahi-daemon dbus \
     unzip gzip \
     build-essential autoconf automake libtool pkg-config meson ninja-build \
     libssl-dev zlib1g-dev liblzo2-dev libncurses5-dev \
  && rm -rf /var/lib/apt/lists/*
-
-# --- s6-overlay ---
-# Install s6-overlay for process supervision
-ARG S6_OVERLAY_VERSION=v3.2.0.2
-RUN set -eux; \
-    PROXY="http://10.42.7.5:7890"; \
-    CURL_PROXY=""; \
-    if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
-      CURL_PROXY="--proxy ${PROXY}"; \
-    fi; \
-    ARCH="amd64"; \
-    URL="https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz"; \
-    curl -fL ${CURL_PROXY} "$URL" -o /tmp/s6-overlay-noarch.tar.xz; \
-    URL="https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz"; \
-    curl -fL ${CURL_PROXY} "$URL" -o /tmp/s6-overlay-x86_64.tar.xz; \
-    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
-    tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz; \
-    rm -f /tmp/s6-overlay-*.tar.xz
 
 # --- EasyTier ---
 # Release asset name: easytier-linux-x86_64-v<VER>.zip
@@ -148,7 +131,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY entrypoint.sh /entrypoint.sh
 COPY watcher.py /watcher.py
 COPY generators/ /generators/
-COPY s6-services/ /etc/s6-overlay/sv/
+COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY scripts/watchfrr-supervise.sh /usr/local/bin/watchfrr-supervise.sh
 COPY scripts/run-clash.sh /usr/local/bin/run-clash.sh
 COPY scripts/run-easytier.sh /usr/local/bin/run-easytier.sh
@@ -166,7 +149,6 @@ COPY scripts/tproxy.sh /usr/local/bin/tproxy.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/tproxy.sh \
     /usr/local/bin/watchfrr-supervise.sh /usr/local/bin/run-clash.sh /usr/local/bin/run-easytier.sh \
     /usr/local/bin/run-tinc.sh /usr/local/bin/run-mosdns.sh /usr/local/bin/run-dnsmasq.sh \
-    /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh \
-    /etc/s6-overlay/sv/*/run
+    /usr/local/bin/run-wireguard.sh /usr/local/bin/run-dns-monitor.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

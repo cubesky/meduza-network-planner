@@ -1,4 +1,0 @@
-#!/command/execlineb -P
-# s6-overlay service script for dns-monitor
-fdmove -c 2 1
-exec /usr/local/bin/run-dns-monitor.sh

@@ -35,7 +35,7 @@ ETCD_HOSTS_PREFIX = "/dns/hosts"
 UPDATE_TTL_SECONDS = int(os.environ.get("UPDATE_TTL_SECONDS", "60"))
 OPENVPN_STATUS_INTERVAL = int(os.environ.get("OPENVPN_STATUS_INTERVAL", "10"))
 WIREGUARD_STATUS_INTERVAL = int(os.environ.get("WIREGUARD_STATUS_INTERVAL", "10"))
-S6_RETRY_INTERVAL = int(os.environ.get("S6_RETRY_INTERVAL", "30"))
+SUPERVISOR_RETRY_INTERVAL = int(os.environ.get("SUPERVISOR_RETRY_INTERVAL", "30"))
 
 
 def sha(obj: Any) -> str:
@@ -234,11 +234,11 @@ def reload_easytier(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     os.makedirs("/etc/easytier", exist_ok=True)
     _write_if_changed("/etc/easytier/config.yaml", out["config_text"], mode=0o644)
     _write_if_changed("/run/easytier/args", "\n".join(out["args"]) + "\n", mode=0o644)
-    if _s6_is_running("easytier"):
+    if _supervisor_is_running("easytier"):
         if not _easytier_cli_reload():
-            _s6_restart("easytier")
+            _supervisor_restart("easytier")
     else:
-        _s6_start("easytier")
+        _supervisor_start("easytier")
 
 
 # ---------- Tinc (switch mode) ----------
@@ -313,16 +313,16 @@ def reload_tinc(node: Dict[str, str], all_nodes: Dict[str, str], global_cfg: Dic
                     removed_hosts = True
                 except Exception:
                     pass
-    if _s6_is_running("tinc"):
+    if _supervisor_is_running("tinc"):
         if changed_non_host or changed_host_existing or removed_hosts:
-            _s6_restart("tinc")
+            _supervisor_restart("tinc")
         elif new_host_files:
             if not _tinc_reload(netname):
-                _s6_restart("tinc")
+                _supervisor_restart("tinc")
     else:
-        _s6_start("tinc")
+        _supervisor_start("tinc")
 
-# ---------- OpenVPN (s6-overlay-managed) ----------
+# ---------- OpenVPN (supervisord-managed) ----------
 
 def _ovpn_status_key(name: str) -> str:
     return f"{UPDATE_BASE}/openvpn/{name}/status"
@@ -336,92 +336,48 @@ def _iface_exists(dev: str) -> bool:
         return False
 
 
-def _s6_status(name: str) -> str:
-    """Get status of an s6 service."""
-    try:
-        # s6-rc -a lists all active services
-        cp = subprocess.run(["s6-rc", "-a"], capture_output=True, text=True, timeout=5)
-        if cp.returncode != 0:
-            return "down"
-        # Check if service is in the list of active services
-        services = cp.stdout.strip().split() if cp.stdout.strip() else []
-        return "up" if name in services else "down"
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        return "down"
+def _supervisorctl(args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["supervisorctl", *args], capture_output=True, text=True)
 
 
-def _s6_status_all() -> Dict[str, str]:
-    """Get status of all s6 services."""
-    try:
-        # Get all active services
-        cp = subprocess.run(["s6-rc", "-a"], capture_output=True, text=True, timeout=5)
-        if cp.returncode != 0:
-            return {}
-        out: Dict[str, str] = {}
-        active_services = cp.stdout.strip().split() if cp.stdout.strip() else []
-        # Get all known services (compiled database)
-        all_cp = subprocess.run(["s6-rc", "list"], capture_output=True, text=True, timeout=5)
-        if all_cp.returncode == 0:
-            for svc in all_cp.stdout.strip().split():
-                out[svc] = "up" if svc in active_services else "down"
-        return out
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+def _supervisor_status(name: str) -> str:
+    cp = _supervisorctl(["status", name])
+    if cp.returncode != 0:
+        return ""
+    parts = cp.stdout.strip().split()
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
+def _supervisor_status_all() -> Dict[str, str]:
+    cp = _supervisorctl(["status"])
+    if cp.returncode != 0:
         return {}
+    out: Dict[str, str] = {}
+    for line in cp.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        name, state = parts[0], parts[1]
+        out[name] = state
+    return out
 
 
-def _s6_start(name: str) -> None:
-    """Start an s6 service."""
-    subprocess.run(["s6-rc", "-u", name], capture_output=True)
+def _supervisor_start(name: str) -> None:
+    _supervisorctl(["start", name])
 
 
-def _s6_stop(name: str) -> None:
-    """Stop an s6 service."""
-    subprocess.run(["s6-rc", "-d", name], capture_output=True)
+def _supervisor_stop(name: str) -> None:
+    _supervisorctl(["stop", name])
 
 
-def _s6_restart(name: str) -> None:
-    """Restart an s6 service."""
-    # s6-rc -r restarts a service
-    subprocess.run(["s6-rc", "-r", name], capture_output=True)
+def _supervisor_restart(name: str) -> None:
+    _supervisorctl(["restart", name])
 
 
-def _s6_is_running(name: str) -> bool:
-    """Check if an s6 service is running."""
-    return _s6_status(name) == "up"
-
-
-def _s6_create_dynamic_service(name: str, command: str) -> None:
-    """Create a dynamic s6 service directory."""
-    service_dir = f"/etc/s6-overlay/sv/{name}"
-    os.makedirs(service_dir, exist_ok=True)
-    run_script = f"""#!/command/execlineb -P
-# s6-overlay service script for {name}
-fdmove -c 2 1
-exec {command}
-"""
-    with open(os.path.join(service_dir, "run"), "w") as f:
-        f.write(run_script)
-    os.chmod(os.path.join(service_dir, "run"), 0o755)
-
-
-def _s6_remove_dynamic_service(name: str) -> None:
-    """Remove a dynamic s6 service."""
-    service_dir = f"/etc/s6-overlay/sv/{name}"
-    if os.path.exists(service_dir):
-        # Stop service first
-        _s6_stop(name)
-        # Remove service directory
-        shutil.rmtree(service_dir)
-
-
-def _s6_reload_services() -> None:
-    """Reload s6 services database after adding/removing services."""
-    try:
-        subprocess.run(["s6-rc-compile", "/etc/s6-overlay/compiled", "/etc/s6-overlay/sv"],
-                       capture_output=True, check=False, timeout=30)
-    except Exception as e:
-        print(f"[s6] failed to reload services: {e}", flush=True)
-
+def _supervisor_is_running(name: str) -> bool:
+    return _supervisor_status(name) == "RUNNING"
 
 
 def _easytier_cli_reload() -> bool:
@@ -451,8 +407,8 @@ def _tinc_reload(netname: str) -> bool:
 
 
 def _compute_openvpn_status(name: str, dev: str) -> str:
-    state = _s6_status(f"openvpn-{name}")
-    if state != "up":
+    state = _supervisor_status(f"openvpn-{name}")
+    if state != "RUNNING":
         return "down"
     if _iface_exists(dev):
         return "up"
@@ -465,6 +421,21 @@ def _write_openvpn_status(name: str, status: str) -> None:
     except Exception as e:
         print(f"[openvpn-status] failed to write {name}: {e}", flush=True)
 
+
+def _openvpn_program_conf(name: str, dev: str) -> str:
+    return "\n".join([
+        f"[program:openvpn-{name}]",
+        f"command=openvpn --config /etc/openvpn/generated/{name}.conf",
+        "autostart=true",
+        "autorestart=true",
+        f"stdout_logfile=/var/log/openvpn.{name}.out.log",
+        f"stderr_logfile=/var/log/openvpn.{name}.err.log",
+        "stdout_logfile_maxbytes=5MB",
+        "stdout_logfile_backups=2",
+        "stderr_logfile_maxbytes=5MB",
+        "stderr_logfile_backups=2",
+        "",
+    ])
 
 
 def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
@@ -491,30 +462,26 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
                 changed = True
         if _write_if_changed(f"/etc/openvpn/generated/{name}.conf", cfg):
             changed = True
-        # Create or update s6 service
-        _s6_create_dynamic_service(f"openvpn-{name}",
-                                    f"openvpn --config /etc/openvpn/generated/{name}.conf")
+        if _write_if_changed(f"/etc/supervisor/conf.d/openvpn-{name}.conf", _openvpn_program_conf(name, dev)):
+            changed = True
 
     with _ovpn_lock:
         _ovpn_cfg_names.extend(sorted(enabled))
 
-    # Remove old services
-    for path in glob.glob("/etc/s6-overlay/sv/openvpn-*"):
-        svc_name = os.path.basename(path)
-        if svc_name.startswith("openvpn-"):
-            name = svc_name[8:]  # remove "openvpn-" prefix
-            if name not in active:
-                try:
-                    _s6_remove_dynamic_service(svc_name)
-                    changed = True
-                except Exception:
-                    pass
+    for path in glob.glob("/etc/supervisor/conf.d/openvpn-*.conf"):
+        name = os.path.basename(path).split("openvpn-")[-1].split(".conf")[0]
+        if name not in active:
+            try:
+                os.remove(path)
+                changed = True
+            except Exception:
+                pass
 
-    if changed:
-        _s6_reload_services()
+    _supervisorctl(["reread"])
+    _supervisorctl(["update"])
 
     for name in enabled:
-        _s6_restart(f"openvpn-{name}")
+        _supervisor_restart(f"openvpn-{name}")
         _write_openvpn_status(name, "connecting")
 
     return changed, sorted(enabled)
@@ -537,8 +504,8 @@ def _wg_status_key(name: str) -> str:
 
 
 def _compute_wireguard_status(name: str, dev: str) -> str:
-    state = _s6_status(f"wireguard-{name}")
-    if state != "up":
+    state = _supervisor_status(f"wireguard-{name}")
+    if state != "RUNNING":
         return "down"
     if _iface_exists(dev):
         return "up"
@@ -551,6 +518,21 @@ def _write_wireguard_status(name: str, status: str) -> None:
     except Exception as e:
         print(f"[wireguard-status] failed to write {name}: {e}", flush=True)
 
+
+def _wireguard_program_conf(name: str, dev: str) -> str:
+    return "\n".join([
+        f"[program:wireguard-{name}]",
+        f"command=/usr/local/bin/run-wireguard.sh {dev}",
+        "autostart=true",
+        "autorestart=true",
+        f"stdout_logfile=/var/log/wireguard.{name}.out.log",
+        f"stderr_logfile=/var/log/wireguard.{name}.err.log",
+        "stdout_logfile_maxbytes=5MB",
+        "stdout_logfile_backups=2",
+        "stderr_logfile_maxbytes=5MB",
+        "stderr_logfile_backups=2",
+        "",
+    ])
 
 
 def reload_wireguard(node: Dict[str, str]) -> Tuple[bool, List[str]]:
@@ -574,30 +556,26 @@ def reload_wireguard(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         _wg_devs[name] = dev
         if _write_if_changed(f"/etc/wireguard/{dev}.conf", cfg, mode=0o600):
             changed = True
-        # Create or update s6 service
-        _s6_create_dynamic_service(f"wireguard-{name}",
-                                    f"/usr/local/bin/run-wireguard.sh {dev}")
+        if _write_if_changed(f"/etc/supervisor/conf.d/wireguard-{name}.conf", _wireguard_program_conf(name, dev)):
+            changed = True
 
     with _wg_lock:
         _wg_cfg_names.extend(sorted(enabled))
 
-    # Remove old services
-    for path in glob.glob("/etc/s6-overlay/sv/wireguard-*"):
-        svc_name = os.path.basename(path)
-        if svc_name.startswith("wireguard-"):
-            name = svc_name[10:]  # remove "wireguard-" prefix
-            if name not in active:
-                try:
-                    _s6_remove_dynamic_service(svc_name)
-                    changed = True
-                except Exception:
-                    pass
+    for path in glob.glob("/etc/supervisor/conf.d/wireguard-*.conf"):
+        name = os.path.basename(path).split("wireguard-")[-1].split(".conf")[0]
+        if name not in active:
+            try:
+                os.remove(path)
+                changed = True
+            except Exception:
+                pass
 
-    if changed:
-        _s6_reload_services()
+    _supervisorctl(["reread"])
+    _supervisorctl(["update"])
 
     for name in enabled:
-        _s6_restart(f"wireguard-{name}")
+        _supervisor_restart(f"wireguard-{name}")
         _write_wireguard_status(name, "connecting")
 
     return changed, sorted(enabled)
@@ -640,7 +618,7 @@ def monitor_children_loop():
 
             if mesh_type == "tinc":
                 if node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true":
-                    if _s6_status("tinc") != "up":
+                    if _supervisor_status("tinc") != "RUNNING":
                         key = "tinc"
                         if should_try(key):
                             try:
@@ -650,7 +628,7 @@ def monitor_children_loop():
                                 on_fail(key)
             else:
                 if node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true":
-                    if _s6_status("easytier") != "up":
+                    if _supervisor_status("easytier") != "RUNNING":
                         key = "easytier"
                         if should_try(key):
                             try:
@@ -659,36 +637,38 @@ def monitor_children_loop():
                             except Exception:
                                 on_fail(key)
 
-            # OpenVPN instances are managed by s6-overlay now.
+            # OpenVPN instances are managed by supervisord now.
         except Exception:
             continue
 
 
-def s6_retry_loop():
+def supervisor_retry_loop():
     backoffs: Dict[str, Backoff] = {}
     next_time: Dict[str, float] = {}
     while True:
-        time.sleep(max(5, S6_RETRY_INTERVAL))
+        time.sleep(max(5, SUPERVISOR_RETRY_INTERVAL))
         try:
-            statuses = _s6_status_all()
+            statuses = _supervisor_status_all()
             now = time.time()
             for name, state in statuses.items():
                 if name == "watcher":
                     continue
-                # s6-overlay uses "down" for stopped services
-                # We only retry services that should be running but are down
-                if state == "up":
+                if state != "FATAL":
                     if name in backoffs:
                         backoffs[name].reset()
                         next_time[name] = 0
                     continue
-                # Service is down - check if it should be running
-                # For now, we'll skip the retry logic since s6 handles restarts automatically
-                # This loop is mainly for logging and monitoring
-                if state == "down" and name not in backoffs:
-                    print(f"[s6-retry] service {name} is down", flush=True)
-        except Exception as e:
-            print(f"[s6-retry] error: {e}", flush=True)
+                if now < next_time.get(name, 0):
+                    continue
+                if name == "mosdns":
+                    _supervisor_stop(name)
+                    time.sleep(2)
+                    _supervisor_start(name)
+                else:
+                    _supervisor_restart(name)
+                b = backoffs.setdefault(name, Backoff())
+                next_time[name] = now + b.next_sleep()
+        except Exception:
             continue
 
 
@@ -1273,7 +1253,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
 
     # Start dnsmasq first before downloading rules (so DNS is available during download)
     _write_dnsmasq_config(clash_enabled=clash_enabled)
-    _s6_restart("dnsmasq")
+    _supervisor_restart("dnsmasq")
     if clash_enabled:
         print("[mosdns] dnsmasq started as frontend DNS on port 53 (with Clash DNS)", flush=True)
     else:
@@ -1297,7 +1277,7 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
         _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
 
-    _s6_restart("mosdns")
+    _supervisor_restart("mosdns")
 
 
 # ---------- reconcile ----------
@@ -1323,7 +1303,7 @@ def handle_commit() -> None:
 
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
     if mesh_type == "tinc":
-        _s6_stop("easytier")
+        _supervisor_stop("easytier")
         all_nodes = load_all_nodes()
         tinc_domain = {k: v for k, v in all_nodes.items() if "/tinc/" in k}
         global_tinc = {k: v for k, v in global_cfg.items() if k == "/global/mesh_type" or k.startswith("/global/tinc/")}
@@ -1331,17 +1311,17 @@ def handle_commit() -> None:
             if node.get(f"/nodes/{NODE_ID}/tinc/enable") == "true":
                 reload_tinc(node, all_nodes, global_cfg)
             else:
-                _s6_stop("tinc")
+                _supervisor_stop("tinc")
             did_apply = True
     else:
-        _s6_stop("tinc")
+        _supervisor_stop("tinc")
         easytier_domain = {k: v for k, v in node.items() if "/easytier/" in k}
         global_easy = {k: v for k, v in global_cfg.items() if k.startswith("/global/easytier/")}
         if changed("easytier", {"node": easytier_domain, "global": global_easy}):
             if node.get(f"/nodes/{NODE_ID}/easytier/enable") == "true":
                 reload_easytier(node, global_cfg)
             else:
-                _s6_stop("easytier")
+                _supervisor_stop("easytier")
             did_apply = True
 
     openvpn_domain = {k: v for k, v in node.items() if "/openvpn/" in k}
@@ -1384,7 +1364,7 @@ def handle_commit() -> None:
                 pass
             tproxy_enabled = False
             try:
-                _s6_stop("mihomo")
+                _supervisor_stop("mihomo")
             except Exception:
                 pass
             with _clash_refresh_lock:
@@ -1406,8 +1386,8 @@ def handle_commit() -> None:
                 tproxy_enabled = False
 
             # Start clash if not running
-            if not _s6_is_running("mihomo"):
-                _s6_start("mihomo")
+            if not _supervisor_is_running("mihomo"):
+                _supervisor_start("mihomo")
                 # Wait a bit for clash to start
                 time.sleep(2)
 
@@ -1446,8 +1426,8 @@ def handle_commit() -> None:
         if mosdns_enabled:
             reload_mosdns(node, global_cfg)
         else:
-            _s6_stop("mosdns")
-            _s6_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
+            _supervisor_stop("mosdns")
+            _supervisor_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
         did_apply = True
 
     # etcd_hosts: process on every /commit (not watched separately)
@@ -1590,7 +1570,7 @@ def main() -> None:
     threading.Thread(target=openvpn_status_loop, daemon=True).start()
     threading.Thread(target=wireguard_status_loop, daemon=True).start()
     threading.Thread(target=monitor_children_loop, daemon=True).start()
-    threading.Thread(target=s6_retry_loop, daemon=True).start()
+    threading.Thread(target=supervisor_retry_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()
