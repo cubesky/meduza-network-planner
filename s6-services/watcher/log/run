@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /command/logutil-service /var/log/watcher
+exec logutil-service /var/log/watcher
