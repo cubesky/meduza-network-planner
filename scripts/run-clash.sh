@@ -77,14 +77,11 @@ elif [ -f "${PROXY_IPS_FILE}" ]; then
     echo "[ok] ipset created" >&2
 
     if command -v iptables >/dev/null 2>&1; then
-        if iptables -t mangle -n -L CLASH_TPROXY >/dev/null 2>&1; then
-            if ! iptables -t mangle -C CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN >/dev/null 2>&1; then
-                iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN
-                iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers dst -j RETURN
-                echo "[ok] iptables rules added for proxy servers" >&2
-            fi
-        else
-            echo "error: iptables chain CLASH_TPROXY not found, skipping rules" >&2
+        IPTABLES_CHECK="iptables -t mangle -C CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN 2>/dev/null"
+        if ! $IPTABLES_CHECK; then
+            iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers src -j RETURN
+            iptables -t mangle -I CLASH_TPROXY -m set --match-set proxy-servers dst -j RETURN
+            echo "[ok] iptables rules added for proxy servers" >&2
         fi
     else
         echo "error: iptables not found, skipping iptables rules" >&2
@@ -114,3 +111,4 @@ fi
 # Clean up PID file on exit
 rm -f "${PID_FILE}"
 exit ${EXIT_CODE}
+
