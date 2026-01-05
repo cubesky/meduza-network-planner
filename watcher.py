@@ -1,8 +1,6 @@
 ﻿import os
 import time
 import hashlib
-import signal
-import socket
 import glob
 import subprocess
 import json
@@ -413,27 +411,7 @@ def _s6_status_all() -> Dict[str, str]:
                     out[svc] = "up" if svc in active_services else "down"
         return out
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-    return {}
-
-
-def _s6_svstat_state(name: str) -> Optional[str]:
-    service_path = f"/run/service/{name}"
-    if not os.path.isdir(service_path):
-        return None
-    if not shutil.which("s6-svstat"):
-        return None
-    try:
-        cp = subprocess.run(["s6-svstat", service_path], capture_output=True, text=True, timeout=5)
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        return None
-    if cp.returncode != 0:
-        return None
-    out = cp.stdout.strip()
-    if out.startswith("up"):
-        return "up"
-    if out.startswith("down"):
-        return "down"
-    return None
+        return {}
 
 
 def _s6_rc(cmd: str, target: str) -> bool:
@@ -443,74 +421,6 @@ def _s6_rc(cmd: str, target: str) -> bool:
         print(f"[s6] {cmd} {target} failed: {msg}", flush=True)
         return False
     return True
-
-
-def _file_nonempty(path: str) -> bool:
-    try:
-        return os.path.getsize(path) > 0
-    except OSError:
-        return False
-
-
-def _port_available(port: int) -> bool:
-    for socktype in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
-        sock = socket.socket(socket.AF_INET, socktype)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", port))
-        except OSError:
-            return False
-        finally:
-            sock.close()
-    return True
-
-
-def _proc_comm(pid: int) -> Optional[str]:
-    try:
-        with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return None
-
-
-def _proc_ppid(pid: int) -> Optional[int]:
-    try:
-        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("PPid:"):
-                    return int(line.split()[1])
-    except Exception:
-        return None
-    return None
-
-
-def _dnsmasq_pids() -> List[int]:
-    pids: List[int] = []
-    try:
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            pid = int(name)
-            if _proc_comm(pid) == "dnsmasq":
-                pids.append(pid)
-    except Exception:
-        return []
-    return pids
-
-
-def _kill_stray_dnsmasq() -> bool:
-    killed = False
-    for pid in _dnsmasq_pids():
-        ppid = _proc_ppid(pid)
-        if ppid and _proc_comm(ppid) == "s6-supervise":
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            print(f"[s6-retry] stopped stray dnsmasq (pid={pid})", flush=True)
-            killed = True
-        except Exception as e:
-            print(f"[s6-retry] failed to stop stray dnsmasq (pid={pid}): {e}", flush=True)
-    return killed
 
 
 def _s6_start(name: str) -> None:
@@ -539,30 +449,24 @@ def _s6_is_running(name: str) -> bool:
     return _s6_status(name) == "up"
 
 
-def _s6_create_dynamic_service(name: str, command: str) -> bool:
-    """Create or update a dynamic s6 service directory. Returns True if changed."""
+def _s6_create_dynamic_service(name: str, command: str) -> None:
+    """Create a dynamic s6 service directory."""
     service_dir = f"/etc/s6-overlay/s6-rc.d/{name}"
-    changed = False
-    if not os.path.isdir(service_dir):
-        changed = True
     os.makedirs(service_dir, exist_ok=True)
-    if _write_if_changed(os.path.join(service_dir, "type"), "longrun\n"):
-        changed = True
+    with open(os.path.join(service_dir, "type"), "w") as f:
+        f.write("longrun\n")
     deps_dir = os.path.join(service_dir, "dependencies.d")
     os.makedirs(deps_dir, exist_ok=True)
-    base_dep = os.path.join(deps_dir, "base")
-    if not os.path.exists(base_dep):
-        open(base_dep, "a").close()
-        changed = True
+    open(os.path.join(deps_dir, "base"), "a").close()
     run_script = f"""#!/command/execlineb -P
 # s6-overlay service script for {name}
 with-contenv
 fdmove -c 2 1
 exec {command}
 """
-    if _write_if_changed(os.path.join(service_dir, "run"), run_script, mode=0o755):
-        changed = True
-    return changed
+    with open(os.path.join(service_dir, "run"), "w") as f:
+        f.write(run_script)
+    os.chmod(os.path.join(service_dir, "run"), 0o755)
 
 
 def _s6_remove_dynamic_service(name: str) -> None:
@@ -672,11 +576,8 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         if _write_if_changed(f"/etc/openvpn/generated/{name}.conf", cfg):
             changed = True
         # Create or update s6 service
-        if _s6_create_dynamic_service(
-            f"openvpn-{name}",
-            f"openvpn --config /etc/openvpn/generated/{name}.conf",
-        ):
-            changed = True
+        _s6_create_dynamic_service(f"openvpn-{name}",
+                                    f"openvpn --config /etc/openvpn/generated/{name}.conf")
 
     with _ovpn_lock:
         _ovpn_cfg_names.extend(sorted(enabled))
@@ -758,11 +659,8 @@ def reload_wireguard(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         if _write_if_changed(f"/etc/wireguard/{dev}.conf", cfg, mode=0o600):
             changed = True
         # Create or update s6 service
-        if _s6_create_dynamic_service(
-            f"wireguard-{name}",
-            f"/usr/local/bin/run-wireguard.sh {dev}",
-        ):
-            changed = True
+        _s6_create_dynamic_service(f"wireguard-{name}",
+                                    f"/usr/local/bin/run-wireguard.sh {dev}")
 
     with _wg_lock:
         _wg_cfg_names.extend(sorted(enabled))
@@ -902,53 +800,28 @@ def s6_retry_loop():
 
             for name, want in desired.items():
                 state = _s6_status(name)
-                proc_state = _s6_svstat_state(name)
-                actual_state = proc_state or state
                 if want is None:
                     on_ok(name)
                     continue
                 if want:
-                    if name == "mosdns" and not _file_nonempty("/etc/mosdns/config.yaml"):
-                        if actual_state == "up":
-                            print("[s6-retry] mosdns config missing, stopping service", flush=True)
-                            _s6_stop(name)
-                        print("[s6-retry] mosdns config missing, skipping start", flush=True)
-                        on_fail(name)
-                        continue
-                    if name == "dnsmasq":
-                        if not _file_nonempty("/etc/dnsmasq.conf"):
-                            if actual_state == "up":
-                                print("[s6-retry] dnsmasq config missing, stopping service", flush=True)
-                                _s6_stop(name)
-                            print("[s6-retry] dnsmasq config missing, skipping start", flush=True)
-                            on_fail(name)
-                            continue
-                        if actual_state != "up" and not _port_available(53):
-                            _kill_stray_dnsmasq()
-                            if not _port_available(53):
-                                print("[s6-retry] port 53 in use, stopping dnsmasq and skipping start", flush=True)
-                                _s6_stop(name)
-                                on_fail(name)
-                                continue
-                            on_fail(name)
-                    if actual_state != "up" and should_try(name):
+                    if state != "up" and should_try(name):
                         print(f"[s6-retry] starting {name} (desired up)", flush=True)
                         _s6_start(name)
                         if _s6_status(name) == "up":
                             on_ok(name)
                         else:
                             on_fail(name)
-                    elif actual_state == "up":
+                    elif state == "up":
                         on_ok(name)
                 else:
-                    if actual_state == "up" and should_try(name):
+                    if state == "up" and should_try(name):
                         print(f"[s6-retry] stopping {name} (desired down)", flush=True)
                         _s6_stop(name)
                         if _s6_status(name) == "up":
                             on_fail(name)
                         else:
                             on_ok(name)
-                    elif actual_state != "up":
+                    elif state != "up":
                         on_ok(name)
 
             with _ovpn_lock:
@@ -1692,14 +1565,9 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str], clash_ready:
 
     # Start dnsmasq first before downloading rules (so DNS is available during download)
     # Only include Clash DNS in forwarding list if Clash is ready
-      status = _write_dnsmasq_config(clash_enabled=clash_enabled, clash_ready=clash_ready)
-      if not _port_available(53):
-          _kill_stray_dnsmasq()
-      if _port_available(53):
-          _s6_restart("dnsmasq")
-          print(f"[mosdns] dnsmasq started as frontend DNS on port 53 ({status})", flush=True)
-      else:
-          print("[mosdns] port 53 in use, skipping dnsmasq restart", flush=True)
+    status = _write_dnsmasq_config(clash_enabled=clash_enabled, clash_ready=clash_ready)
+    _s6_restart("dnsmasq")
+    print(f"[mosdns] dnsmasq started as frontend DNS on port 53 ({status})", flush=True)
 
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
