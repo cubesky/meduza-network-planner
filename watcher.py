@@ -10,7 +10,7 @@ import shutil
 import threading
 import random
 import signal
-import uuid
+import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -602,27 +602,14 @@ def _s6_reload_services() -> None:
                 return
 
             # Clean up any orphaned temporary directories from previous runs
-            # Do this before creating new ones to avoid conflicts
-            patterns = ["/run/s6-rc-source-*", "/run/s6-rc-compiled-*"]
-            cleaned_count = 0
-            for pattern in patterns:
+            for pattern in ["/run/s6-rc-source-*", "/run/s6-rc-compiled-*"]:
                 for path in glob.glob(pattern):
                     try:
                         shutil.rmtree(path, ignore_errors=True)
-                        cleaned_count += 1
-                    except Exception as e:
-                        print(f"[s6] warning: failed to clean {path}: {e}", flush=True)
-            if cleaned_count > 0:
-                print(f"[s6] cleaned {cleaned_count} orphaned temp directories", flush=True)
+                    except Exception:
+                        pass
 
-            # Use a unique suffix to avoid conflicts
-            import uuid
-            unique_suffix = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-            tmp_source_dir = os.path.join("/run", f"s6-rc-source-{unique_suffix}")
-            os.makedirs(tmp_source_dir, exist_ok=False)
-            compiled_dir = os.path.join("/run", f"s6-rc-compiled-{unique_suffix}")
-            # Don't create compiled_dir - let s6-rc-compile create it
-            # This ensures it's a fresh empty directory
+            tmp_source_dir = tempfile.mkdtemp(prefix="s6-rc-source-", dir="/run")
             for src in sources:
                 shutil.copytree(src, tmp_source_dir, dirs_exist_ok=True)
             source_dir = tmp_source_dir
@@ -632,7 +619,7 @@ def _s6_reload_services() -> None:
                 _write_if_changed(os.path.join(base_dir, "type"), "bundle\n")
                 print("[s6] base service missing; created fallback bundle", flush=True)
 
-            # compiled_dir already created above with unique suffix
+            compiled_dir = tempfile.mkdtemp(prefix="s6-rc-compiled-", dir="/run")
             compile_cp = subprocess.run(
                 ["s6-rc-compile", compiled_dir, source_dir],
                 capture_output=True,
