@@ -1606,9 +1606,8 @@ def handle_commit() -> None:
                 with _tproxy_check_lock:
                     _tproxy_check_enabled = False
 
-            # Write config before starting to avoid a missing-config startup failure.
+            # Start clash if not running
             if not _s6_is_running("mihomo"):
-                reload_clash(out["config_yaml"])
                 _s6_start("mihomo")
                 # Wait for clash process to start
                 for attempt in range(10):  # Wait up to 10 seconds
@@ -1620,9 +1619,9 @@ def handle_commit() -> None:
                 else:
                     print("[clash] failed to start after 10s", flush=True)
                     raise RuntimeError("Clash failed to start")
-            else:
-                # Reload configuration when already running.
-                reload_clash(out["config_yaml"])
+
+            # Reload configuration
+            reload_clash(out["config_yaml"])
 
             # Wait for Clash to be ready (url-test groups have selected nodes)
             print("[clash] waiting for url-test proxies to select nodes...", flush=True)
