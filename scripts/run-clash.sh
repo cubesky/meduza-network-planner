@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 CFG="/etc/clash/config.yaml"
 DATA_DIR="/data/clash"
@@ -14,6 +14,7 @@ if [ ! -s "${CFG}" ]; then
     exit 1
 fi
 
+# 1. 下载 GeoX 文件如果配置了
 if ! python3 - <<'PY'
 import os
 import sys
@@ -51,12 +52,14 @@ then
     exit 1
 fi
 
+# 2. 预处理 proxy-provider: 下载并提取 IP
 echo "[*] 预处理 proxy-providers..." >&2
 if ! python3 /usr/local/bin/preprocess-clash.py "${CFG}" "${PROVIDERS_DIR}"; then
     echo "error: preprocess-clash failed" >&2
     exit 1
 fi
 
+# 3. 如果存在代理服务器 IP 列表,创建 ipset
 PROXY_IPS_FILE="${PROVIDERS_DIR}/proxy_servers.txt"
 if ! command -v ipset >/dev/null 2>&1; then
     echo "error: ipset not found, skipping ipset/iptables rules" >&2
