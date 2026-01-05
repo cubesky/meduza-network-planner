@@ -364,7 +364,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append(f"route-map RM-BGP-IN-{peer_name} deny 10")
                 lines.append(" match ip address prefix-list PL-BGP-IN")
                 # Deny routes with AS_PATH length > 2 (transit routes)
-                lines.append(" match as-path list 1")  # ^.+ .+ .+
+                lines.append(" match as-path 1")  # ^.+ .+ .+
                 lines.append(f"route-map RM-BGP-IN-{peer_name} permit 20")
                 lines.append(" match ip address prefix-list PL-BGP-IN")
                 # Allow routes with AS_PATH length <= 2
@@ -377,7 +377,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         if has_no_transit:
             # AS_PATH filter list 1: Match routes with AS_PATH length > 2
             # This indicates transit routes (peer is providing transit)
-            lines.append("ip as-path access-list 1 permit ^.+ .+ .+")  # 3 or more ASNs
+            lines.append("bgp as-path access-list 1 permit ^.+ .+ .+")  # 3 or more ASNs
             lines.append("!")
 
         # Generate outbound route-maps for peers with no_forward
