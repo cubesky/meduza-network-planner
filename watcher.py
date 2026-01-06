@@ -2108,6 +2108,28 @@ def handle_commit() -> None:
 
     did_apply = False
 
+    # ========== dnsmasq: START FIRST (priority) ==========
+    # dnsmasq must start before all other services to provide DNS immediately
+    # Additional upstreams (MosDNS/Clash) will be added when they become ready
+    dnsmasq_enabled = node.get(f"/nodes/{NODE_ID}/dnsmasq/enable", "false") == "true"
+    dnsmasq_material = {
+        "enabled": dnsmasq_enabled,
+    }
+    if changed("dnsmasq", dnsmasq_material):
+        print(f"[dnsmasq] Configuration changed: enabled={dnsmasq_enabled}", flush=True)
+        if dnsmasq_enabled:
+            # Start dnsmasq with base configuration (fallback DNS only)
+            # Additional upstreams will be added when MosDNS/Clash become ready
+            print("[dnsmasq] dnsmasq enabled, starting FIRST...", flush=True)
+            start_dnsmasq()
+        else:
+            # Stop dnsmasq when explicitly disabled
+            print("[dnsmasq] dnsmasq disabled, stopping...", flush=True)
+            _supervisor_stop("dnsmasq")
+            print("[dnsmasq] Stopped", flush=True)
+        did_apply = True
+    # ========== dnsmasq: START FIRST (priority) ==========
+
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
     if mesh_type == "tinc":
         _supervisor_stop("easytier")
@@ -2267,26 +2289,6 @@ def handle_commit() -> None:
         else:
             _supervisor_stop("mosdns")
             # Note: Don't stop dnsmasq here, it's controlled independently
-        did_apply = True
-
-    # dnsmasq: independent control (must be enabled separately)
-    # dnsmasq starts first with base upstreams, then gets updated when MosDNS/Clash become ready
-    dnsmasq_enabled = node.get(f"/nodes/{NODE_ID}/dnsmasq/enable", "false") == "true"
-    dnsmasq_material = {
-        "enabled": dnsmasq_enabled,
-    }
-    if changed("dnsmasq", dnsmasq_material):
-        print(f"[dnsmasq] Configuration changed: enabled={dnsmasq_enabled}", flush=True)
-        if dnsmasq_enabled:
-            # Start dnsmasq with base configuration (fallback DNS only)
-            # Additional upstreams will be added when MosDNS/Clash become ready
-            print("[dnsmasq] dnsmasq enabled, starting...", flush=True)
-            start_dnsmasq()
-        else:
-            # Stop dnsmasq when explicitly disabled
-            print("[dnsmasq] dnsmasq disabled, stopping...", flush=True)
-            _supervisor_stop("dnsmasq")
-            print("[dnsmasq] Stopped", flush=True)
         did_apply = True
 
     # etcd_hosts: process on every /commit (not watched separately)
