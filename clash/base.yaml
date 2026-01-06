@@ -19,8 +19,13 @@ dns:
   enable: true
   listen: 127.0.0.1:1053
 
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+
 proxy-groups:
-  - name: "Dummy"
+  - name: "DUMMY-GROUPS"
     type: url-test
     url: "http://www.gstatic.com/generate_204"
     interval: 3600

@@ -57,6 +57,12 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     merged = dict(base)
     merged.update(sub_conf)
 
+    # Filter out DUMMY-GROUPS from proxy-groups
+    if "proxy-groups" in merged:
+        proxy_groups = merged["proxy-groups"]
+        if isinstance(proxy_groups, list):
+            merged["proxy-groups"] = [pg for pg in proxy_groups if pg.get("name") != "DUMMY-GROUPS"]
+
     dns_cfg = merged.get("dns")
     if not isinstance(dns_cfg, dict):
         dns_cfg = {}
