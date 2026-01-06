@@ -1956,15 +1956,23 @@ def _update_dnsmasq_upstreams(add_mosdns: bool = False, add_clash: bool = False)
     Args:
         add_mosdns: Whether to add MosDNS (127.0.0.1#1153) as upstream
         add_clash: Whether to add Clash DNS (127.0.0.1#1053) as upstream
+
+    Note:
+        Fallback DNS servers (223.5.5.5, 119.29.29.29) are only added when BOTH
+        MosDNS and Clash DNS are NOT active. When both are available, they provide
+        complete DNS coverage and fallback servers are unnecessary.
     """
     servers_lines = []
     if add_mosdns:
         servers_lines.append("server=127.0.0.1#1153")
     if add_clash:
         servers_lines.append("server=127.0.0.1#1053")
-    # Always add fallback DNS servers
-    servers_lines.append("server=223.5.5.5")
-    servers_lines.append("server=119.29.29.29")
+
+    # Only add fallback DNS servers when BOTH MosDNS and Clash DNS are inactive
+    # If both are active, they provide complete DNS coverage without needing fallback
+    if not (add_mosdns and add_clash):
+        servers_lines.append("server=223.5.5.5")
+        servers_lines.append("server=119.29.29.29")
 
     servers = "\n".join(servers_lines)
 
@@ -1997,7 +2005,11 @@ local-ttl=1
             upstreams.append("MosDNS")
         if add_clash:
             upstreams.append("Clash DNS")
-        upstreams.append("Fallback DNS")
+        # Only add fallback DNS to the list when it's actually enabled
+        if not (add_mosdns and add_clash):
+            upstreams.append("Fallback DNS")
+        else:
+            upstreams.append("Fallback DNS (auto-disabled - both MosDNS and Clash DNS active)")
         print(f"[dnsmasq] Upstreams updated: {', '.join(upstreams)}", flush=True)
     except Exception as e:
         print(f"[dnsmasq] Failed to reload upstreams: {e}", flush=True)
