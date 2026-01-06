@@ -712,6 +712,25 @@ def clash_refresh_loop():
             # Hot reload: update config and send HUP signal instead of restarting
             reload_clash(out["config_yaml"], api_controller=out.get("api_controller", ""), api_secret=out.get("api_secret", ""))
 
+            # Wait for Clash to complete health checks on proxy-providers
+            # This ensures provider files are downloaded and health-checked before IP extraction
+            # We wait INDEFINITELY until health checks complete (no timeout)
+            print("[clash-refresh] Waiting for Clash proxy-provider health checks to complete (indefinite wait)...", flush=True)
+            start_time = time.time()
+            while True:
+                if clash_health_check():
+                    elapsed = time.time() - start_time
+                    print(f"[clash-refresh] Clash health check passed after {elapsed:.1f}s", flush=True)
+                    break
+                time.sleep(2)
+
+            # Trigger async IP refresh from proxy-provider files
+            # This extracts IPs from proxy-provider YAML files and base64-encoded subscription files
+            # and updates the ipset to exclude proxy server IPs from TProxy
+            if tproxy_enabled:
+                print("[clash-refresh] Triggering async ipset refresh after subscription update...", flush=True)
+                threading.Thread(target=_update_proxy_ips_async, daemon=True).start()
+
             # Update tproxy rules if mode changed
             if out["mode"] == "tproxy":
                 # If previously not in tproxy mode, remove old rules first
@@ -822,7 +841,7 @@ def clash_proxy_ips_monitor_loop():
     This ensures that proxy server IP changes are reflected in TProxy exclusions.
     Runs every 5 minutes when TProxy is enabled.
     """
-    global tproxy_enabled, _proxy_ips_enabled
+    global tproxy_enabled, _proxy_ips_enabled, _cached_proxy_ips
 
     while True:
         time.sleep(300)  # Check every 5 minutes
@@ -1077,22 +1096,34 @@ def _get_proxy_ips_from_providers(providers: List[Dict]) -> Set[str]:
     Returns:
         Set of unique IP addresses
     """
+    import os
+
     all_ips = set()
+    clash_config_dir = "/etc/clash"
 
     for provider in providers:
-        # Get provider file path
+        # Get provider file path (may be relative like "./providers/CNIX.yaml")
         provider_path = provider.get("path", "")
         if not provider_path:
             continue
 
-        # Read provider file from Clash config directory
-        full_path = f"/etc/clash/{provider_path}"
+        # Resolve path relative to Clash config directory
+        # If path starts with "./", it's relative to config dir
+        if provider_path.startswith("./"):
+            full_path = os.path.normpath(os.path.join(clash_config_dir, provider_path))
+        elif provider_path.startswith("/"):
+            # Absolute path
+            full_path = provider_path
+        else:
+            # Relative path without leading "./"
+            full_path = os.path.normpath(os.path.join(clash_config_dir, provider_path))
+
         try:
             with open(full_path, "r", encoding="utf-8") as f:
                 content = f.read()
                 ips = _extract_ips_from_subscription(content)
                 all_ips.update(ips)
-                print(f"[clash] Extracted {len(ips)} IPs from provider {provider_path}", flush=True)
+                print(f"[clash] Extracted {len(ips)} IPs from provider {provider_path} (full: {full_path})", flush=True)
         except Exception as e:
             print(f"[clash] Failed to read provider file {full_path}: {e}", flush=True)
 
@@ -1101,55 +1132,44 @@ def _get_proxy_ips_from_providers(providers: List[Dict]) -> Set[str]:
 
 def _get_all_proxy_ips() -> Set[str]:
     """
-    Get all proxy server IPs from Clash configuration.
+    Get all proxy server IPs from Clash configuration file.
+
+    Reads directly from /etc/clash/config.yaml to extract proxy IPs from:
+    1. proxy-providers (external YAML files)
+    2. proxies (inline proxy definitions)
 
     Returns:
         Set of unique IP addresses
     """
+    import yaml as yaml_lib
+
     try:
-        proxies_data = _clash_api_request("/proxies")
-        if not proxies_data:
+        # Read Clash config file
+        with open("/etc/clash/config.yaml", "r", encoding="utf-8") as f:
+            config = yaml_lib.safe_load(f)
+
+        if not isinstance(config, dict):
             return set()
 
-        proxies = proxies_data.get("proxies", {})
         all_ips = set()
-        provider_ips = set()
-        direct_ips = set()
 
-        # Extract IPs from providers
-        for name, proxy in proxies.items():
-            if proxy.get("type") == "Selector" or proxy.get("type") == "URLTest":
-                # Get all proxies from the selector/url-test group
-                all_now = proxy.get("all", [])
-                for proxy_name in all_now:
-                    if proxy_name in proxies:
-                        p = proxies[proxy_name]
-                        # Get IP from server field
-                        server = p.get("server", "")
-                        if server and _is_ip_address(server):
-                            direct_ips.add(server)
-                        elif server:
-                            # Try to resolve hostname
-                            try:
-                                import socket
-                                addr_info = socket.getaddrinfo(server, None)
-                                for info in addr_info:
-                                    ip = info[4][0]
-                                    direct_ips.add(ip)
-                            except Exception:
-                                pass
+        # Extract IPs from proxy-providers (external files)
+        proxy_providers = config.get("proxy-providers", {})
+        if proxy_providers:
+            print(f"[clash] Found {len(proxy_providers)} proxy-providers in config", flush=True)
+            provider_ips = _get_proxy_ips_from_providers(list(proxy_providers.values()))
+            all_ips.update(provider_ips)
 
-        # Extract IPs from provider files
-        providers = proxies_data.get("providers", {})
-        if providers:
-            provider_ips = _get_proxy_ips_from_providers(list(providers.values()))
-
-        all_ips.update(direct_ips)
-        all_ips.update(provider_ips)
+        # Extract IPs from inline proxies
+        proxies = config.get("proxies", [])
+        if proxies:
+            print(f"[clash] Found {len(proxies)} inline proxies in config", flush=True)
+            inline_ips = _extract_ips_from_proxies(proxies)
+            all_ips.update(inline_ips)
 
         return all_ips
     except Exception as e:
-        print(f"[clash] Failed to get proxy IPs: {e}", flush=True)
+        print(f"[clash] Failed to get proxy IPs from config file: {e}", flush=True)
         return set()
 
 
