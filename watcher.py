@@ -1900,21 +1900,60 @@ def _touch_rules_stamp() -> None:
     _write_text(path, now_utc_iso() + "\n", mode=0o644)
 
 
-def _write_dnsmasq_config(clash_enabled: bool = False) -> None:
-    """Generate dnsmasq configuration for frontend DNS forwarding."""
-    # Only include Clash DNS (1053) if Clash is enabled
-    # dnsmasq uses # syntax for non-standard ports
-    if clash_enabled:
-        servers = """server=127.0.0.1#1153
-server=127.0.0.1#1053
-server=223.5.5.5
-server=119.29.29.29"""
-    else:
-        servers = """server=127.0.0.1#1153
-server=223.5.5.5
-server=119.29.29.29"""
+def _write_dnsmasq_base_config() -> None:
+    """
+    Generate base dnsmasq configuration with only fallback DNS servers.
 
-    config = f"""# dnsmasq configuration for MosDNS frontend
+    dnsmasq will start with minimal upstream servers (223.5.5.5, 119.29.29.29).
+    Additional upstreams (MosDNS, Clash DNS) will be added dynamically when those services become ready.
+    """
+    config = """# dnsmasq configuration - base startup
+# Additional upstreams will be added when services become ready
+port=53
+no-resolv
+# Initial fallback DNS servers (always available)
+server=223.5.5.5
+server=119.29.29.29
+addn-hosts=/etc/etcd_hosts
+bogus-priv
+strict-order
+keep-in-foreground
+log-queries=extra
+# Enable mDNS (Multicast DNS) via Avahi
+enable-dbus=org.freedesktop.Avahi
+# Enable reverse DNS (PTR records for local networks)
+# Allow RFC 1918 private IP reverse lookups
+bogus-priv
+# Enable DHCP reverse lookup for local names
+local-ttl=1
+"""
+    _write_text("/etc/dnsmasq.conf", config, mode=0o644)
+
+
+def _update_dnsmasq_upstreams(add_mosdns: bool = False, add_clash: bool = False) -> None:
+    """
+    Update dnsmasq upstream servers by rewriting config and reloading.
+
+    This function is called when MosDNS or Clash becomes ready to add them as upstreams.
+
+    Args:
+        add_mosdns: Whether to add MosDNS (127.0.0.1#1153) as upstream
+        add_clash: Whether to add Clash DNS (127.0.0.1#1053) as upstream
+    """
+    servers_lines = []
+    if add_mosdns:
+        servers_lines.append("server=127.0.0.1#1153")
+    if add_clash:
+        servers_lines.append("server=127.0.0.1#1053")
+    # Always add fallback DNS servers
+    servers_lines.append("server=223.5.5.5")
+    servers_lines.append("server=119.29.29.29")
+
+    servers = "\n".join(servers_lines)
+
+    # Read existing config to preserve comments and settings
+    config = f"""# dnsmasq configuration - upstreams updated
+# Active upstreams: MosDNS={add_mosdns}, Clash={add_clash}
 port=53
 no-resolv
 {servers}
@@ -1933,20 +1972,50 @@ local-ttl=1
 """
     _write_text("/etc/dnsmasq.conf", config, mode=0o644)
 
+    # Reload dnsmasq to apply new upstreams
+    try:
+        run("kill -HUP $(cat /var/run/supervisord.pid 2>/dev/null && supervisorctl pid dnsmasq) 2>/dev/null || supervisorctl signal HUP dnsmasq")
+        upstreams = []
+        if add_mosdns:
+            upstreams.append("MosDNS")
+        if add_clash:
+            upstreams.append("Clash DNS")
+        upstreams.append("Fallback DNS")
+        print(f"[dnsmasq] Upstreams updated: {', '.join(upstreams)}", flush=True)
+    except Exception as e:
+        print(f"[dnsmasq] Failed to reload upstreams: {e}", flush=True)
+
+
+def _write_dnsmasq_config(clash_enabled: bool = False, mosdns_enabled: bool = False) -> None:
+    """
+    Legacy function - kept for compatibility, but should use _update_dnsmasq_upstreams() instead.
+    """
+    _update_dnsmasq_upstreams(add_mosdns=mosdns_enabled, add_clash=clash_enabled)
+
+
+def start_dnsmasq() -> None:
+    """
+    Start dnsmasq with base configuration (fallback DNS only).
+
+    This should be called first when dnsmasq is enabled.
+    Additional upstreams will be added when MosDNS/Clash become ready.
+    """
+    _write_dnsmasq_base_config()
+    _supervisor_restart("dnsmasq")
+    print("[dnsmasq] Started with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+
 
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     """
-    Reload MosDNS configuration with sequential startup logic.
+    Reload MosDNS configuration and update dnsmasq upstream when ready.
 
-    Startup sequence when both Clash and MosDNS are enabled:
-    1. Start Dnsmasq (frontend DNS)
-    2. Wait INDEFINITELY for Mihomo to become healthy (NO TIMEOUT if Clash enabled)
-    3. Download MosDNS rules via Mihomo proxy
-    4. Start MosDNS
-    5. Apply TProxy (if Clash is in TProxy mode and Mihomo is healthy)
+    Startup sequence:
+    1. Wait INDEFINITELY for Mihomo to become healthy (if Clash enabled)
+    2. Download MosDNS rules via Mihomo proxy
+    3. Start MosDNS
+    4. Update dnsmasq upstream to include MosDNS (if dnsmasq is enabled)
 
-    Note: If Clash is enabled, MosDNS will wait indefinitely for Mihomo to become healthy.
-    There is NO timeout - MosDNS cannot start until Clash is ready.
+    Note: dnsmasq is managed independently and must be enabled separately.
     """
     payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": {}}
     out = _run_generator("gen_mosdns", payload)
@@ -1960,24 +2029,16 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
     _write_text("/etc/mosdns/etcd_global.txt", out.get("global", ""), mode=0o644)
     print("[mosdns] wrote etcd text files (local, block, ddns, global)", flush=True)
 
-    # Check if Clash is enabled to configure dnsmasq accordingly
+    # Check if Clash is enabled
     clash_enabled = node.get(f"/nodes/{NODE_ID}/clash/enable") == "true"
 
-    # Step 1: Start dnsmasq first (frontend DNS on port 53)
-    _write_dnsmasq_config(clash_enabled=clash_enabled)
-    _supervisor_restart("dnsmasq")
-    if clash_enabled:
-        print("[mosdns] dnsmasq started as frontend DNS on port 53 (with Clash DNS)", flush=True)
-    else:
-        print("[mosdns] dnsmasq started as frontend DNS on port 53", flush=True)
-
-    # Step 2: If Clash is enabled, wait INDEFINITELY for Mihomo to become healthy
+    # Step 1: If Clash is enabled, wait INDEFINITELY for Mihomo to become healthy
     if clash_enabled:
         print("[mosdns] Waiting for Mihomo to become healthy (no timeout - will wait indefinitely)...", flush=True)
         wait_for_clash_healthy_infinite()
         print("[mosdns] Mihomo is healthy, proceeding with MosDNS setup", flush=True)
 
-    # Step 3: Download rules (MUST use Clash proxy if Clash is enabled)
+    # Step 2: Download rules (MUST use Clash proxy if Clash is enabled)
     refresh_minutes = out["refresh_minutes"]
     if _should_refresh_rules(refresh_minutes):
         if clash_enabled:
@@ -1988,9 +2049,15 @@ def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
         _download_rules_with_backoff(out.get("rules", {}))
         _touch_rules_stamp()
 
-    # Step 4: Start MosDNS
+    # Step 3: Start MosDNS
     _supervisor_restart("mosdns")
     print("[mosdns] MosDNS started", flush=True)
+
+    # Step 4: Update dnsmasq upstream to include MosDNS (if dnsmasq is enabled)
+    dnsmasq_enabled = node.get(f"/nodes/{NODE_ID}/dnsmasq/enable", "false") == "true"
+    if dnsmasq_enabled:
+        print("[mosdns] Updating dnsmasq upstream to include MosDNS", flush=True)
+        _update_dnsmasq_upstreams(add_mosdns=True, add_clash=clash_enabled)
 
 
 # ---------- reconcile ----------
@@ -2148,6 +2215,13 @@ def handle_commit() -> None:
                 with _clash_monitoring_lock:
                     _clash_monitoring_enabled = False
 
+            # Update dnsmasq upstream to include Clash DNS (if dnsmasq is enabled)
+            dnsmasq_enabled = node.get(f"/nodes/{NODE_ID}/dnsmasq/enable", "false") == "true"
+            if dnsmasq_enabled:
+                mosdns_enabled = node.get(f"/nodes/{NODE_ID}/mosdns/enable") == "true"
+                print("[clash] Updating dnsmasq upstream to include Clash DNS", flush=True)
+                _update_dnsmasq_upstreams(add_mosdns=mosdns_enabled, add_clash=True)
+
             with _clash_refresh_lock:
                 _clash_refresh_enable = out["refresh_enable"]
                 _clash_refresh_interval = max(0, int(out["refresh_interval_minutes"]))
@@ -2165,7 +2239,23 @@ def handle_commit() -> None:
             reload_mosdns(node, global_cfg)
         else:
             _supervisor_stop("mosdns")
-            _supervisor_stop("dnsmasq")  # Stop dnsmasq when MosDNS is disabled
+            # Note: Don't stop dnsmasq here, it's controlled independently
+        did_apply = True
+
+    # dnsmasq: independent control (must be enabled separately)
+    # dnsmasq starts first with base upstreams, then gets updated when MosDNS/Clash become ready
+    dnsmasq_enabled = node.get(f"/nodes/{NODE_ID}/dnsmasq/enable", "false") == "true"
+    dnsmasq_material = {
+        "enabled": dnsmasq_enabled,
+    }
+    if changed("dnsmasq", dnsmasq_material):
+        if dnsmasq_enabled:
+            # Start dnsmasq with base configuration (fallback DNS only)
+            # Additional upstreams will be added when MosDNS/Clash become ready
+            start_dnsmasq()
+        else:
+            # Stop dnsmasq when explicitly disabled
+            _supervisor_stop("dnsmasq")
         did_apply = True
 
     # etcd_hosts: process on every /commit (not watched separately)
