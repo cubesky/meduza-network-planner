@@ -379,6 +379,23 @@ def _supervisor_status_all() -> Dict[str, str]:
     return out
 
 
+def _supervisor_is_available() -> bool:
+    """
+    Check if supervisor is in a valid state to accept commands.
+    Returns False if supervisor is in SHUTDOWN_STATE or similar.
+    """
+    try:
+        # Try to get supervisor status - if it fails with SHUTDOWN_STATE, supervisor is shutting down
+        cp = _supervisorctl(["status"])
+        if cp.returncode != 0:
+            error = (cp.stderr or "").strip()
+            if "SHUTDOWN_STATE" in error:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _supervisor_start(name: str) -> None:
     _supervisorctl(["start", name])
 
@@ -1974,7 +1991,7 @@ local-ttl=1
 
     # Reload dnsmasq to apply new upstreams
     try:
-        run("kill -HUP $(cat /var/run/supervisord.pid 2>/dev/null && supervisorctl pid dnsmasq) 2>/dev/null || supervisorctl signal HUP dnsmasq")
+        run("supervisorctl signal HUP dnsmasq")
         upstreams = []
         if add_mosdns:
             upstreams.append("MosDNS")
