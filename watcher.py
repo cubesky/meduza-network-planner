@@ -712,24 +712,8 @@ def clash_refresh_loop():
             # Hot reload: update config and send HUP signal instead of restarting
             reload_clash(out["config_yaml"], api_controller=out.get("api_controller", ""), api_secret=out.get("api_secret", ""))
 
-            # Wait for Clash to complete health checks on proxy-providers
-            # This ensures provider files are downloaded and health-checked before IP extraction
-            # We wait INDEFINITELY until health checks complete (no timeout)
-            print("[clash-refresh] Waiting for Clash proxy-provider health checks to complete (indefinite wait)...", flush=True)
-            start_time = time.time()
-            while True:
-                if clash_health_check():
-                    elapsed = time.time() - start_time
-                    print(f"[clash-refresh] Clash health check passed after {elapsed:.1f}s", flush=True)
-                    break
-                time.sleep(2)
-
-            # Trigger async IP refresh from proxy-provider files
-            # This extracts IPs from proxy-provider YAML files and base64-encoded subscription files
-            # and updates the ipset to exclude proxy server IPs from TProxy
-            if tproxy_enabled:
-                print("[clash-refresh] Triggering async ipset refresh after subscription update...", flush=True)
-                threading.Thread(target=_update_proxy_ips_async, daemon=True).start()
+            # No need to wait for health check - the continuous monitoring loop will refresh ipset
+            print("[clash-refresh] Config reloaded, ipset will be refreshed by continuous monitoring loop", flush=True)
 
             # Update tproxy rules if mode changed
             if out["mode"] == "tproxy":
@@ -839,12 +823,15 @@ def clash_proxy_ips_monitor_loop():
     Monitor proxy provider IPs and update ipset periodically.
 
     This ensures that proxy server IP changes are reflected in TProxy exclusions.
-    Runs every 5 minutes when TProxy is enabled.
+    Runs every 1 minute when TProxy is enabled - continuously polls for updates.
+
+    Reads directly from /etc/clash/config.yaml and provider files to detect
+    IP changes without waiting for Clash health checks or API availability.
     """
     global tproxy_enabled, _proxy_ips_enabled, _cached_proxy_ips
 
     while True:
-        time.sleep(300)  # Check every 5 minutes
+        time.sleep(60)  # Check every 1 minute
 
         if not tproxy_enabled or not _proxy_ips_enabled:
             continue
@@ -852,7 +839,7 @@ def clash_proxy_ips_monitor_loop():
         try:
             print("[clash-proxy-ips] Checking for proxy IP updates...", flush=True)
 
-            # Get current IPs
+            # Get current IPs from config file and provider files
             current_ips = _get_all_proxy_ips()
 
             with _proxy_ips_lock:
@@ -913,13 +900,13 @@ def reload_frr_smooth(conf_text: str) -> None:
 
 def _extract_ips_from_proxies(proxies: List[Dict]) -> Set[str]:
     """
-    Extract IP addresses from proxy configurations.
+    Extract IPv4 addresses from proxy configurations.
 
     Args:
         proxies: List of proxy dictionaries from Clash API
 
     Returns:
-        Set of unique IP addresses found
+        Set of unique IPv4 addresses found
     """
     ips = set()
 
@@ -929,18 +916,16 @@ def _extract_ips_from_proxies(proxies: List[Dict]) -> Set[str]:
         if not server:
             continue
 
-        # Check if server is an IP address (not a hostname)
-        # IPv4 format: x.x.x.x
-        # IPv6 format: [:::] or compressed
-        if _is_ip_address(server):
+        # Check if server is an IPv4 address (not a hostname or IPv6)
+        if _is_ipv4_address(server):
             ips.add(server)
             continue
 
-        # Try to resolve hostname to IP
+        # Try to resolve hostname to IPv4 addresses only
         try:
             import socket
-            # Get both IPv4 and IPv6 addresses
-            addr_info = socket.getaddrinfo(server, None)
+            # Get only IPv4 addresses (socket.AF_INET)
+            addr_info = socket.getaddrinfo(server, None, socket.AF_INET)
             for info in addr_info:
                 ip = info[4][0]
                 ips.add(ip)
@@ -950,12 +935,12 @@ def _extract_ips_from_proxies(proxies: List[Dict]) -> Set[str]:
     return ips
 
 
-def _is_ip_address(addr: str) -> bool:
-    """Check if address is an IP address (IPv4 or IPv6)."""
+def _is_ipv4_address(addr: str) -> bool:
+    """Check if address is an IPv4 address."""
     import ipaddress
     try:
-        ipaddress.ip_address(addr.strip())
-        return True
+        ip_obj = ipaddress.ip_address(addr.strip())
+        return isinstance(ip_obj, ipaddress.IPv4Address)
     except ValueError:
         return False
 
@@ -1041,13 +1026,13 @@ def _extract_ips_from_subscription(content: str) -> Set[str]:
                         # Format: base64(info)@server:port or uuid@server:port
                         creds, server_part = rest.rsplit("@", 1)
                         server = server_part.split(":")[0]
-                        if _is_ip_address(server):
+                        if _is_ipv4_address(server):
                             ips.add(server)
                         else:
-                            # Try to resolve hostname
+                            # Try to resolve hostname to IPv4 only
                             try:
                                 import socket
-                                addr_info = socket.getaddrinfo(server, None)
+                                addr_info = socket.getaddrinfo(server, None, socket.AF_INET)
                                 for info in addr_info:
                                     ip = info[4][0]
                                     ips.add(ip)
