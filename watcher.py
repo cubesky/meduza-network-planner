@@ -1923,8 +1923,6 @@ bogus-priv
 strict-order
 keep-in-foreground
 log-queries=extra
-# Disable IPv6 - only return IPv4 addresses
-filter-aaaa
 # Enable mDNS (Multicast DNS) via Avahi
 enable-dbus=org.freedesktop.Avahi
 # Enable reverse DNS (PTR records for local networks)
