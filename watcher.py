@@ -2000,9 +2000,36 @@ def start_dnsmasq() -> None:
     This should be called first when dnsmasq is enabled.
     Additional upstreams will be added when MosDNS/Clash become ready.
     """
+    print("[dnsmasq] ===== STARTING DNSTASQ =====", flush=True)
     _write_dnsmasq_base_config()
-    _supervisor_restart("dnsmasq")
-    print("[dnsmasq] Started with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+
+    # Check if dnsmasq is already running
+    if _supervisor_is_running("dnsmasq"):
+        print("[dnsmasq] Already running, reloading config with HUP signal", flush=True)
+        # Already running, reload config with HUP signal
+        try:
+            run("supervisorctl signal HUP dnsmasq")
+            print("[dnsmasq] Successfully reloaded with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+        except Exception as e:
+            print(f"[dnsmasq] Failed to reload: {e}, restarting...", flush=True)
+            _supervisor_restart("dnsmasq")
+            print("[dnsmasq] Successfully restarted with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+    else:
+        print("[dnsmasq] Not running, starting service via supervisorctl start...", flush=True)
+        # Not running, start it
+        try:
+            _supervisor_start("dnsmasq")
+            time.sleep(1)  # Give it a moment to start
+            # Verify it started successfully
+            if _supervisor_is_running("dnsmasq"):
+                print("[dnsmasq] ✓ Successfully started with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+            else:
+                status = _supervisor_status("dnsmasq")
+                print(f"[dnsmasq] ✗ Failed to start! Status: {status}", flush=True)
+                raise RuntimeError(f"dnsmasq failed to start, status: {status}")
+        except Exception as e:
+            print(f"[dnsmasq] ✗ Failed to start: {e}", flush=True)
+            raise
 
 
 def reload_mosdns(node: Dict[str, str], global_cfg: Dict[str, str]) -> None:
@@ -2249,13 +2276,17 @@ def handle_commit() -> None:
         "enabled": dnsmasq_enabled,
     }
     if changed("dnsmasq", dnsmasq_material):
+        print(f"[dnsmasq] Configuration changed: enabled={dnsmasq_enabled}", flush=True)
         if dnsmasq_enabled:
             # Start dnsmasq with base configuration (fallback DNS only)
             # Additional upstreams will be added when MosDNS/Clash become ready
+            print("[dnsmasq] dnsmasq enabled, starting...", flush=True)
             start_dnsmasq()
         else:
             # Stop dnsmasq when explicitly disabled
+            print("[dnsmasq] dnsmasq disabled, stopping...", flush=True)
             _supervisor_stop("dnsmasq")
+            print("[dnsmasq] Stopped", flush=True)
         did_apply = True
 
     # etcd_hosts: process on every /commit (not watched separately)
