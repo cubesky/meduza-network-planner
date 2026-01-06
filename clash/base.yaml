@@ -23,11 +23,3 @@ sniffer:
   enable: true
   force-dns-mapping: true
   parse-pure-ip: true
-
-proxy-groups:
-  - name: "DUMMY-GROUPS"
-    type: url-test
-    url: "http://www.gstatic.com/generate_204"
-    interval: 3600
-    proxies:
-      - REJECT
