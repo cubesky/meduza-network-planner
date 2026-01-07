@@ -1249,13 +1249,18 @@ def _get_proxy_ips_from_providers(providers: List[Dict]) -> Set[str]:
             full_path = os.path.normpath(os.path.join(clash_config_dir, provider_path))
 
         try:
+            # Check if file exists first (may not be downloaded yet)
+            if not os.path.exists(full_path):
+                print(f"[clash] Provider file {provider_path} not found (full: {full_path}), skipping - will retry on next scan", flush=True)
+                continue
+
             with open(full_path, "r", encoding="utf-8") as f:
                 content = f.read()
                 ips = _extract_ips_from_subscription(content)
                 all_ips.update(ips)
                 print(f"[clash] Extracted {len(ips)} IPs from provider {provider_path} (full: {full_path})", flush=True)
         except Exception as e:
-            print(f"[clash] Failed to read provider file {full_path}: {e}", flush=True)
+            print(f"[clash] Failed to read provider file {full_path}: {e}, skipping - will retry on next scan", flush=True)
 
     return all_ips
 
