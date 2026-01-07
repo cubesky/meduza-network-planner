@@ -1013,57 +1013,177 @@ def _extract_ips_from_subscription(content: str) -> Set[str]:
     """
     Extract IPs from various subscription formats.
 
+    Supports:
+    1. Standard YAML with proxies: list
+    2. Base64-encoded YAML
+    3. Base64-encoded single-line URLs (ss://, vless://, etc.)
+    4. Plain text newline-separated URLs
+
     Args:
         content: Subscription content (YAML, base64 YAML, or ss:// / vless:// URLs)
 
     Returns:
         Set of unique IP addresses
     """
+    import base64
     ips = set()
 
-    # Try to parse as YAML first (may be base64 encoded)
-    yaml_ips = _extract_ips_from_yaml(content)
+    content = content.strip()
+
+    # Step 1: Try to decode as base64 (many subscriptions are base64 encoded)
+    decoded_content = content
+    try:
+        decoded = base64.b64decode(content)
+        # Check if it's valid UTF-8
+        try:
+            decoded_content = decoded.decode("utf-8")
+            print(f"[clash] Content was base64 encoded", flush=True)
+        except UnicodeDecodeError:
+            # Not valid UTF-8, use original
+            decoded_content = content
+    except Exception:
+        # Not base64, use original
+        decoded_content = content
+
+    # Step 2: Try to parse as YAML (with proxies list)
+    yaml_ips = _extract_ips_from_yaml(decoded_content)
     if yaml_ips:
         ips.update(yaml_ips)
+        print(f"[clash] Extracted {len(yaml_ips)} IPs from YAML format", flush=True)
+        return ips
 
-    # Try to parse as newline-separated URLs
-    for line in content.strip().split("\n"):
+    # Step 3: If YAML parsing failed, try as URL list
+    # Split by newlines and process each line
+    lines = decoded_content.split("\n")
+    url_count = 0
+    for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        # Parse ss:// or vless:// URLs
-        if line.startswith("ss://") or line.startswith("vless://"):
+        # Detect proxy URLs
+        if line.startswith(("ss://", "vless://", "vmess://", "trojan://", "trojan-go://")):
+            url_count += 1
             try:
-                import base64
-                # ss:// format: ss://base64(info)@server:port...
-                # vless:// format: vless://uuid@server:port?params
-                if "://" in line:
-                    _, rest = line.split("://", 1)
-                    # Remove protocol prefix
-                    rest = rest.split("?")[0]  # Remove query params
-                    rest = rest.split("#")[0]  # Remove fragment
+                server = _extract_server_from_url(line)
+                if server:
+                    if _is_ipv4_address(server):
+                        ips.add(server)
+                        print(f"[clash] URL #{url_count}: found IP {server}", flush=True)
+                    else:
+                        # Try to resolve hostname
+                        try:
+                            import socket
+                            addr_info = socket.getaddrinfo(server, None, socket.AF_INET)
+                            for info in addr_info:
+                                ip = info[4][0]
+                                ips.add(ip)
+                                print(f"[clash] URL #{url_count}: resolved {server} -> {ip}", flush=True)
+                        except Exception as e:
+                            print(f"[clash] URL #{url_count}: failed to resolve {server}: {e}", flush=True)
+            except Exception as e:
+                print(f"[clash] URL #{url_count}: failed to parse: {e}", flush=True)
 
-                    if "@" in rest:
-                        # Format: base64(info)@server:port or uuid@server:port
-                        creds, server_part = rest.rsplit("@", 1)
-                        server = server_part.split(":")[0]
-                        if _is_ipv4_address(server):
-                            ips.add(server)
-                        else:
-                            # Try to resolve hostname to IPv4 only
-                            try:
-                                import socket
-                                addr_info = socket.getaddrinfo(server, None, socket.AF_INET)
-                                for info in addr_info:
-                                    ip = info[4][0]
-                                    ips.add(ip)
-                            except Exception:
-                                pass
+    if url_count > 0:
+        print(f"[clash] Processed {url_count} URLs, extracted {len(ips)} unique IPs", flush=True)
+
+    return ips
+
+
+def _extract_server_from_url(url: str) -> Optional[str]:
+    """
+    Extract server address from proxy URL.
+
+    Supports:
+    - ss:// (base64 or plain)
+    - vless://
+    - vmess:// (base64 JSON)
+    - trojan://
+    - trojan-go://
+
+    Args:
+        url: Proxy URL string
+
+    Returns:
+        Server address (IP or hostname), or None if extraction fails
+    """
+    import base64
+
+    try:
+        # Split protocol
+        if "://" not in url:
+            return None
+
+        protocol, rest = url.split("://", 1)
+
+        # Remove query parameters and fragment
+        rest = rest.split("?")[0]
+        rest = rest.split("#")[0]
+
+        # Parse based on protocol
+        if protocol in ("vless", "trojan", "trojan-go"):
+            # Format: uuid@server:port or password@server:port
+            if "@" in rest:
+                _, server_part = rest.rsplit("@", 1)
+                server = server_part.split(":")[0]
+                return server
+
+        elif protocol == "ss":
+            # ss:// can be:
+            # 1. ss://base64(method:password@server:port)
+            # 2. ss://base64(method:password)@server:port
+            # 3. ss://method:password@server:port (plain, not base64)
+
+            # Try to find @ in the rest
+            if "@" in rest:
+                # Might be format 2 or plain format
+                parts = rest.split("@")
+                if len(parts) >= 2:
+                    # Last @ separates credentials from server:port
+                    server_part = parts[-1]
+                    server = server_part.split(":")[0]
+                    # Check if server looks like base64 (if only 1 part before @)
+                    if len(parts) == 2:
+                        # Try to decode the first part as base64
+                        creds = parts[0]
+                        try:
+                            base64.b64decode(creds).decode("utf-8")
+                            # If it decodes successfully and contains :, it was base64
+                            # Server is already extracted
+                            return server
+                        except Exception:
+                            # Not base64, server is already correct
+                            return server
+                    return server
+
+            # Try base64 decode of entire rest (format 1)
+            try:
+                decoded = base64.b64decode(rest).decode("utf-8")
+                # Format: method:password@server:port
+                if "@" in decoded:
+                    _, server_part = decoded.split("@", 1)
+                    server = server_part.split(":")[0]
+                    return server
             except Exception:
                 pass
 
-    return ips
+        elif protocol == "vmess":
+            # vmess://base64(json)
+            try:
+                # vmess JSON is base64 encoded after ://
+                json_str = base64.b64decode(rest).decode("utf-8")
+                import json
+                data = json.loads(json_str)
+                # vmess JSON has 'address' or 'add' field for server
+                server = data.get("address") or data.get("add")
+                return server
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"[clash] Error parsing URL {protocol}: {e}", flush=True)
+
+    return None
 
 
 def _download_provider_content(url: str) -> Optional[str]:
