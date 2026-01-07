@@ -239,6 +239,7 @@ The `watcher.py` is the central orchestrator:
 /nodes/<NODE_ID>/clash/refresh/enable
 /nodes/<NODE_ID>/clash/refresh/interval_minutes
 /nodes/<NODE_ID>/clash/exclude_tproxy_port       # Ports to exclude from TPROXY
+/nodes/<NODE_ID>/clash/tproxy_protocol           # "tcp" | "udp" | "tcp+udp" (default)
 ```
 
 #### MosDNS Configuration
@@ -537,6 +538,13 @@ These settings are **always enforced** regardless of subscription configuration 
 - Traffic **originating from** CIDRs in `/nodes/<NODE_ID>/private_lan` is also proxied
 - All other source networks bypass the proxy automatically
 - Empty LAN list = no traffic is proxied
+
+**Protocol Filtering** (controlled by `/nodes/<NODE_ID>/clash/tproxy_protocol`):
+- **tcp+udp** (default): Proxy both TCP and UDP traffic
+- **tcp**: Proxy only TCP traffic, UDP bypasses the proxy
+- **udp**: Proxy only UDP traffic, TCP bypasses the proxy
+
+This allows fine-grained control over which protocols are proxied through TPROXY mode.
 
 **Exclusions** (applied to all traffic):
 

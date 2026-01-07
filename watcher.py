@@ -746,6 +746,7 @@ def clash_refresh_loop():
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
+                    out.get("tproxy_protocol", "tcp+udp"),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
@@ -804,12 +805,16 @@ def clash_crash_monitor_loop():
                         print("[clash-monitor] Re-initializing proxy IP ipset...", flush=True)
                         _ensure_proxy_ipset()
 
+                        # Get TPROXY protocol setting
+                        tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
+
                         tproxy_apply(
                             proxy_dst,
                             _clash_exclude_src(node),
                             _clash_exclude_ifaces(node),
                             [],  # No individual IPs, using ipset
                             _clash_exclude_ports(node, global_cfg),
+                            tproxy_protocol,
                         )
                         print("[clash-monitor] TProxy reapplied successfully", flush=True)
 
@@ -1621,6 +1626,7 @@ def tproxy_apply(
     exclude_ifaces: List[str],
     exclude_ips: List[str],
     exclude_ports: List[str],
+    protocol: str = "tcp+udp",
 ) -> None:
     """
     Apply TPROXY rules in include mode (only proxy specified destinations).
@@ -1631,6 +1637,7 @@ def tproxy_apply(
         exclude_ifaces: Interfaces to bypass proxy
         exclude_ips: Proxy server IPs to bypass (to prevent proxy loops)
         exclude_ports: Ports to bypass proxy
+        protocol: Protocol to proxy - "tcp", "udp", or "tcp+udp" (default)
     """
     run(
         f"PROXY_CIDRS='{ ' '.join(proxy_dst) }' "
@@ -1639,6 +1646,7 @@ def tproxy_apply(
         f"EXCLUDE_IPS='{ ' '.join(exclude_ips) }' "
         f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
         f"PROXY_IPSET_NAME='{PROXY_IPSET_NAME}' "
+        f"PROTOCOL='{protocol}' "
         f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
         f"/usr/local/bin/tproxy.sh apply"
     )
@@ -1704,11 +1712,12 @@ def _fix_tproxy_iptables(
     exclude_ifaces: List[str],
     exclude_ips: List[str],
     exclude_ports: List[str],
+    protocol: str = "tcp+udp",
 ) -> None:
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports)
+        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -1736,6 +1745,9 @@ def tproxy_check_loop() -> None:
             node = load_prefix(f"/nodes/{NODE_ID}/")
             global_cfg = load_prefix("/global/")
 
+            # Get TPROXY protocol setting
+            tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
+
             # Reapply tproxy rules (using ipset, no individual IPs needed)
             _fix_tproxy_iptables(
                 _get_cached_tproxy_targets(),
@@ -1743,6 +1755,7 @@ def tproxy_check_loop() -> None:
                 _clash_exclude_ifaces(node),
                 [],  # No individual IPs, using ipset
                 _clash_exclude_ports(node, global_cfg),
+                tproxy_protocol,
             )
         except Exception as e:
             print(f"[tproxy-check] error: {e}", flush=True)
@@ -2271,6 +2284,7 @@ def handle_commit() -> None:
                     _clash_exclude_ifaces(node),
                     [],  # No individual IPs, using ipset instead
                     _clash_exclude_ports(node, global_cfg),
+                    out.get("tproxy_protocol", "tcp+udp"),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True

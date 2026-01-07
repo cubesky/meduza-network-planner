@@ -6,6 +6,10 @@ TPROXY_PORT="${TPROXY_PORT:-7893}"
 MARK="${MARK:-0x1}"
 TABLE="${TABLE:-100}"
 
+# PROTOCOL: which protocols to proxy (tcp, udp, or tcp+udp)
+# Default: tcp+udp (proxy both TCP and UDP)
+PROTOCOL="${PROTOCOL:-tcp+udp}"
+
 # PROXY_CIDRS: space-separated CIDRs of source addresses to proxy
 # Only traffic FROM these sources will be proxied, everything else bypasses
 if [[ -n "${PROXY_CIDRS:-}" ]]; then
@@ -79,9 +83,19 @@ apply_rules() {
   iptables -t mangle -A CLASH_TPROXY -p udp --dport "${TPROXY_PORT}" -j RETURN
 
   # Only proxy traffic FROM specified source CIDRs
+  # Protocol filtering based on PROTOCOL variable
   for cidr in "${PROXY_ARR[@]}"; do
-    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-    iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+    if [[ "${PROTOCOL}" == "tcp" ]]; then
+      # Proxy only TCP
+      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+    elif [[ "${PROTOCOL}" == "udp" ]]; then
+      # Proxy only UDP
+      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+    else
+      # Proxy both TCP and UDP (default)
+      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p tcp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      iptables -t mangle -A CLASH_TPROXY -s "${cidr}" -p udp -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+    fi
   done
 
   iptables -t mangle -A PREROUTING -j CLASH_TPROXY
