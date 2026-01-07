@@ -1921,7 +1921,7 @@ def _write_dnsmasq_base_config() -> None:
     """
     Generate base dnsmasq configuration with only fallback DNS servers.
 
-    dnsmasq will start with minimal upstream servers (223.5.5.5, 119.29.29.29).
+    dnsmasq will start with minimal upstream servers (119.29.29.29, 1.0.0.1).
     Additional upstreams (MosDNS, Clash DNS) will be added dynamically when those services become ready.
     """
     config = """# dnsmasq configuration - base startup
@@ -1929,8 +1929,8 @@ def _write_dnsmasq_base_config() -> None:
 port=53
 no-resolv
 # Initial fallback DNS servers (always available)
-server=223.5.5.5
 server=119.29.29.29
+server=1.0.0.1
 addn-hosts=/etc/etcd_hosts
 bogus-priv
 strict-order
@@ -1958,7 +1958,7 @@ def _update_dnsmasq_upstreams(add_mosdns: bool = False, add_clash: bool = False)
         add_clash: Whether to add Clash DNS (127.0.0.1#1053) as upstream
 
     Note:
-        Fallback DNS servers (223.5.5.5, 119.29.29.29) are only added when BOTH
+        Fallback DNS servers (119.29.29.29, 1.0.0.1) are only added when BOTH
         MosDNS and Clash DNS are NOT active. When both are available, they provide
         complete DNS coverage and fallback servers are unnecessary.
     """
@@ -1971,8 +1971,8 @@ def _update_dnsmasq_upstreams(add_mosdns: bool = False, add_clash: bool = False)
     # Only add fallback DNS servers when BOTH MosDNS and Clash DNS are inactive
     # If both are active, they provide complete DNS coverage without needing fallback
     if not (add_mosdns and add_clash):
-        servers_lines.append("server=223.5.5.5")
         servers_lines.append("server=119.29.29.29")
+        servers_lines.append("server=1.0.0.1")
 
     servers = "\n".join(servers_lines)
 
@@ -1999,7 +1999,7 @@ local-ttl=1
 
     # Reload dnsmasq to apply new upstreams
     try:
-        run("supervisorctl signal HUP dnsmasq")
+        _supervisor_restart("dnsmasq")
         upstreams = []
         if add_mosdns:
             upstreams.append("MosDNS")
@@ -2034,15 +2034,14 @@ def start_dnsmasq() -> None:
 
     # Check if dnsmasq is already running
     if _supervisor_is_running("dnsmasq"):
-        print("[dnsmasq] Already running, reloading config with HUP signal", flush=True)
-        # Already running, reload config with HUP signal
+        print("[dnsmasq] Already running, restarting to apply new config", flush=True)
+        # Already running, restart to apply new config
         try:
-            run("supervisorctl signal HUP dnsmasq")
-            print("[dnsmasq] Successfully reloaded with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
-        except Exception as e:
-            print(f"[dnsmasq] Failed to reload: {e}, restarting...", flush=True)
             _supervisor_restart("dnsmasq")
-            print("[dnsmasq] Successfully restarted with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+            print("[dnsmasq] Successfully restarted with base upstreams: Fallback DNS (119.29.29.29, 1.0.0.1)", flush=True)
+        except Exception as e:
+            print(f"[dnsmasq] Failed to restart: {e}", flush=True)
+            raise
     else:
         print("[dnsmasq] Not running, starting service via supervisorctl start...", flush=True)
         # Not running, start it
@@ -2051,7 +2050,7 @@ def start_dnsmasq() -> None:
             time.sleep(1)  # Give it a moment to start
             # Verify it started successfully
             if _supervisor_is_running("dnsmasq"):
-                print("[dnsmasq] ✓ Successfully started with base upstreams: Fallback DNS (223.5.5.5, 119.29.29.29)", flush=True)
+                print("[dnsmasq] ✓ Successfully started with base upstreams: Fallback DNS (119.29.29.29, 1.0.0.1)", flush=True)
             else:
                 status = _supervisor_status("dnsmasq")
                 print(f"[dnsmasq] ✗ Failed to start! Status: {status}", flush=True)

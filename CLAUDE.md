@@ -262,13 +262,14 @@ The `watcher.py` is the central orchestrator:
 - Forwards to sequential servers:
   - `127.0.0.1#1153` (MosDNS primary)
   - `127.0.0.1#1053` (Clash DNS - **only when Clash is enabled**)
-  - `223.5.5.5` (AliDNS)
   - `119.29.29.29` (DNSPod)
+  - `1.0.0.1` (Cloudflare DNS)
 - Uses `/etc/etcd_hosts` for hosts file
 - Doesn't block private network results
 - Starts BEFORE MosDNS rule downloads
 - Dynamically adjusts upstream servers based on Clash status
 - Uses `#` syntax for non-standard DNS ports (dnsmasq standard)
+- Uses `_supervisor_restart()` for config reload (HUP signal doesn't work with exec pattern)
 
 **Implementation**: [watcher.py:1125-1175](watcher.py#L1125-L1175)
 

@@ -197,8 +197,8 @@ The watcher generates `/etc/dnsmasq.conf` with these settings:
 - **Upstream servers** (tried in order):
   1. `127.0.0.1#1153` (MosDNS primary)
   2. `127.0.0.1#1053` (Clash DNS - **only if Clash is enabled**)
-  3. `223.5.5.5` (AliDNS public DNS)
-  4. `119.29.29.29` (DNSPod public DNS)
+  3. `119.29.29.29` (DNSPod public DNS)
+  4. `1.0.0.1` (Cloudflare public DNS)
 - **Hosts file**: `/etc/etcd_hosts` (dynamic DNS from etcd)
 - **mDNS support**: Enabled via Avahi D-Bus (`enable-dbus=org.freedesktop.Avahi`)
 - **Reverse DNS**: Supported for local networks (`local-ttl=1`)
@@ -239,12 +239,12 @@ def _write_dnsmasq_config(clash_enabled: bool = False) -> None:
     if clash_enabled:
         servers = """server=127.0.0.1#1153
 server=127.0.0.1#1053
-server=223.5.5.5
-server=119.29.29.29"""
+server=119.29.29.29
+server=1.0.0.1"""
     else:
         servers = """server=127.0.0.1#1153
-server=223.5.5.5
-server=119.29.29.29"""
+server=119.29.29.29
+server=1.0.0.1"""
 
     config = f"""# dnsmasq configuration for MosDNS frontend
 port=53
