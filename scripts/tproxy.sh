@@ -106,22 +106,30 @@ apply_rules() {
     if [[ "${USE_CONNTRACK}" == "true" ]]; then
       # Conntrack mode: only proxy connections initiated from this CIDR
       # This prevents proxying externally-initiated, locally-responded connections
-      ct_match="-m conntrack --ctstate NEW,ESTABLISHED,RELATED --ctorigsrc \"${cidr}\""
+      if [[ "${PROTOCOL}" == "tcp" ]]; then
+        # Proxy only TCP
+        iptables -t mangle -A CLASH_TPROXY -p tcp -m conntrack --ctstate NEW,ESTABLISHED,RELATED --ctorigsrc "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      elif [[ "${PROTOCOL}" == "udp" ]]; then
+        # Proxy only UDP
+        iptables -t mangle -A CLASH_TPROXY -p udp -m conntrack --ctstate NEW,ESTABLISHED,RELATED --ctorigsrc "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      else
+        # Proxy both TCP and UDP (default)
+        iptables -t mangle -A CLASH_TPROXY -p tcp -m conntrack --ctstate NEW,ESTABLISHED,RELATED --ctorigsrc "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+        iptables -t mangle -A CLASH_TPROXY -p udp -m conntrack --ctstate NEW,ESTABLISHED,RELATED --ctorigsrc "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      fi
     else
       # Legacy mode: simple source address matching
-      ct_match="-s \"${cidr}\""
-    fi
-
-    if [[ "${PROTOCOL}" == "tcp" ]]; then
-      # Proxy only TCP
-      iptables -t mangle -A CLASH_TPROXY -p tcp ${ct_match} -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-    elif [[ "${PROTOCOL}" == "udp" ]]; then
-      # Proxy only UDP
-      iptables -t mangle -A CLASH_TPROXY -p udp ${ct_match} -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-    else
-      # Proxy both TCP and UDP (default)
-      iptables -t mangle -A CLASH_TPROXY -p tcp ${ct_match} -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
-      iptables -t mangle -A CLASH_TPROXY -p udp ${ct_match} -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      if [[ "${PROTOCOL}" == "tcp" ]]; then
+        # Proxy only TCP
+        iptables -t mangle -A CLASH_TPROXY -p tcp -s "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      elif [[ "${PROTOCOL}" == "udp" ]]; then
+        # Proxy only UDP
+        iptables -t mangle -A CLASH_TPROXY -p udp -s "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      else
+        # Proxy both TCP and UDP (default)
+        iptables -t mangle -A CLASH_TPROXY -p tcp -s "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+        iptables -t mangle -A CLASH_TPROXY -p udp -s "${cidr}" -j TPROXY --on-port "${TPROXY_PORT}" --tproxy-mark "${MARK}/${MARK}"
+      fi
     fi
   done
 
