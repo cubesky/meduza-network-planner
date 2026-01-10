@@ -747,6 +747,7 @@ def clash_refresh_loop():
                     _clash_exclude_ifaces(node),
                     _clash_exclude_ports(node, global_cfg),
                     out.get("tproxy_protocol", "tcp+udp"),
+                    out.get("use_conntrack", False),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
@@ -805,8 +806,9 @@ def clash_crash_monitor_loop():
                         print("[clash-monitor] Re-initializing proxy IP ipset...", flush=True)
                         _ensure_proxy_ipset()
 
-                        # Get TPROXY protocol setting
+                        # Get TPROXY settings
                         tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
+                        use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
 
                         tproxy_apply(
                             proxy_dst,
@@ -815,6 +817,7 @@ def clash_crash_monitor_loop():
                             [],  # No individual IPs, using ipset
                             _clash_exclude_ports(node, global_cfg),
                             tproxy_protocol,
+                            use_conntrack,
                         )
                         print("[clash-monitor] TProxy reapplied successfully", flush=True)
 
@@ -1747,6 +1750,7 @@ def tproxy_apply(
     exclude_ips: List[str],
     exclude_ports: List[str],
     protocol: str = "tcp+udp",
+    use_conntrack: bool = False,
 ) -> None:
     """
     Apply TPROXY rules in include mode (only proxy specified destinations).
@@ -1758,6 +1762,7 @@ def tproxy_apply(
         exclude_ips: Proxy server IPs to bypass (to prevent proxy loops)
         exclude_ports: Ports to bypass proxy
         protocol: Protocol to proxy - "tcp", "udp", or "tcp+udp" (default)
+        use_conntrack: Use conntrack to match connection original source (default: False)
     """
     run(
         f"PROXY_CIDRS='{ ' '.join(proxy_dst) }' "
@@ -1767,6 +1772,7 @@ def tproxy_apply(
         f"EXCLUDE_PORTS='{ ' '.join(exclude_ports) }' "
         f"PROXY_IPSET_NAME='{PROXY_IPSET_NAME}' "
         f"PROTOCOL='{protocol}' "
+        f"USE_CONNTRACK='{ 'true' if use_conntrack else 'false' }' "
         f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
         f"/usr/local/bin/tproxy.sh apply"
     )
@@ -1833,11 +1839,12 @@ def _fix_tproxy_iptables(
     exclude_ips: List[str],
     exclude_ports: List[str],
     protocol: str = "tcp+udp",
+    use_conntrack: bool = False,
 ) -> None:
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol)
+        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -1865,8 +1872,9 @@ def tproxy_check_loop() -> None:
             node = load_prefix(f"/nodes/{NODE_ID}/")
             global_cfg = load_prefix("/global/")
 
-            # Get TPROXY protocol setting
+            # Get TPROXY settings
             tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
+            use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
 
             # Reapply tproxy rules (using ipset, no individual IPs needed)
             _fix_tproxy_iptables(
@@ -1876,6 +1884,7 @@ def tproxy_check_loop() -> None:
                 [],  # No individual IPs, using ipset
                 _clash_exclude_ports(node, global_cfg),
                 tproxy_protocol,
+                use_conntrack,
             )
         except Exception as e:
             print(f"[tproxy-check] error: {e}", flush=True)
@@ -2405,6 +2414,7 @@ def handle_commit() -> None:
                     [],  # No individual IPs, using ipset instead
                     _clash_exclude_ports(node, global_cfg),
                     out.get("tproxy_protocol", "tcp+udp"),
+                    out.get("use_conntrack", False),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True

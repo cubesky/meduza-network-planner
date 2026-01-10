@@ -103,11 +103,15 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     if tproxy_protocol not in ("tcp", "udp", "tcp+udp"):
         raise RuntimeError(f"invalid tproxy_protocol: {tproxy_protocol!r}, must be 'tcp', 'udp', or 'tcp+udp'")
 
+    # Get conntrack usage setting (default: false for backward compatibility)
+    use_conntrack = node.get(f"/nodes/{node_id}/clash/use_conntrack", "false") == "true"
+
     return {
         "config_yaml": yaml.safe_dump(merged, sort_keys=False, allow_unicode=True),
         "mode": mode,
         "tproxy_targets": _node_lans_for_proxy(node, node_id),
         "tproxy_protocol": tproxy_protocol,
+        "use_conntrack": use_conntrack,
         "refresh_enable": refresh_enable,
         "refresh_interval_minutes": interval,
         "api_controller": merged.get("external-controller", "0.0.0.0:9090"),
