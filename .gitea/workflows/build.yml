@@ -22,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Resolve registry host
         shell: bash
         run: |
@@ -59,29 +62,25 @@ jobs:
           set -euo pipefail
           echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
 
-      - name: Build image
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build \
-            -t "${IMAGE}:latest" \
-            -t "${IMAGE}:${{ gitea.sha }}" \
-            .
-
-      - name: Push image
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${{ gitea.sha }}"
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ gitea.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Push tag image
         if: startsWith(gitea.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${GITEA_REF#refs/tags/}"
-          docker tag "${IMAGE}:${{ gitea.sha }}" "${IMAGE}:${TAG}"
-          docker push "${IMAGE}:${TAG}"
-        env:
-          GITEA_REF: ${{ gitea.ref }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ gitea.ref_name }}
+          cache-from: type=gha

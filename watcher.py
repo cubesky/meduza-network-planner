@@ -921,6 +921,80 @@ def reload_frr_smooth(conf_text: str) -> None:
     run("vtysh -f /etc/frr/frr.conf")
 
 
+# ---------- Network Mapping (NAT) ----------
+
+# Global state to track current NAT rules for removal
+_current_network_mappings: List[Tuple[str, str]] = []
+_network_mapping_lock = threading.Lock()
+
+
+def _apply_network_mapping_nat(
+    mappings: List[Tuple[str, str, str, str]]
+) -> None:
+    """
+    Apply iptables NETMAP rules for network mapping.
+
+    Args:
+        mappings: List of (network_a, network_b, prefix_a, prefix_b) tuples
+                 network_a: Advertised network (e.g., "192.168.1.0/24")
+                 network_b: Actual local network (e.g., "10.100.1.0/24")
+    """
+    global _current_network_mappings
+
+    with _network_mapping_lock:
+        # Remove old rules
+        _remove_network_mapping_nat()
+
+        # Apply new rules
+        for network_a, network_b, _, _ in mappings:
+            # POSTROUTING: SNAT from network_b to network_a
+            # Traffic leaving with source in network_b gets translated to network_a
+            run(
+                f"iptables -t nat -A POSTROUTING -s {network_b} -d ! {network_b} "
+                f"-j NETMAP --to {network_a}"
+            )
+            # PREROUTING: DNAT from network_a to network_b
+            # Traffic arriving with destination in network_a gets translated to network_b
+            run(
+                f"iptables -t nat -A PREROUTING -d {network_a} "
+                f"-j NETMAP --to {network_b}"
+            )
+
+        # Update current state
+        _current_network_mappings = [(net_a, net_b) for net_a, net_b, _, _ in mappings]
+
+        print(
+            f"[network-mapping] Applied {len(mappings)} network mapping(s)",
+            flush=True
+        )
+
+
+def _remove_network_mapping_nat() -> None:
+    """Remove all network mapping NAT rules."""
+    global _current_network_mappings
+
+    with _network_mapping_lock:
+        for network_a, network_b in _current_network_mappings:
+            # Remove POSTROUTING rule
+            try:
+                run(
+                    f"iptables -t nat -D POSTROUTING -s {network_b} -d ! {network_b} "
+                    f"-j NETMAP --to {network_a}"
+                )
+            except Exception:
+                pass
+            # Remove PREROUTING rule
+            try:
+                run(
+                    f"iptables -t nat -D PREROUTING -d {network_a} "
+                    f"-j NETMAP --to {network_b}"
+                )
+            except Exception:
+                pass
+
+        _current_network_mappings = []
+
+
 # ---------- Clash ----------
 
 def _extract_ips_from_proxies(proxies: List[Dict]) -> Set[str]:
@@ -2346,15 +2420,21 @@ def handle_commit() -> None:
                 dev = _wg_devs.get(name) or _wg_dev_name(name)
             _write_wireguard_status(name, _compute_wireguard_status(name, dev))
 
-    # FRR depends on node routing config + global BGP filter policy
+    # FRR depends on node routing config + global BGP filter policy + network mapping
     frr_material = {k: v for k, v in node.items() if (
-        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k or "/wireguard/" in k
+        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k or "/wireguard/" in k or "/network_mapping/" in k
     )}
     global_bgp_filter = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/filter/")}
     if changed("frr", {"node": frr_material, "global_bgp_filter": global_bgp_filter}):
         payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": load_all_nodes()}
         out = _run_generator("gen_frr", payload)
         reload_frr_smooth(out["frr_conf"])
+        # Apply network mapping NAT rules if any
+        network_mappings = out.get("network_mappings", [])
+        if network_mappings:
+            _apply_network_mapping_nat(network_mappings)
+        else:
+            _remove_network_mapping_nat()
         did_apply = True
 
     clash_domain = {k: v for k, v in node.items() if "/clash/" in k}

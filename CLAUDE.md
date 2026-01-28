@@ -227,6 +227,52 @@ The `watcher.py` is the central orchestrator:
 /nodes/<NODE_ID>/ospf/router_id
 ```
 
+#### Network Mapping Configuration
+
+Network mapping provides 1:1 bidirectional address translation between two network segments of equal size.
+
+```python
+# Schema: /nodes/<NODE_ID>/network_mapping/<NETWORK_A_CIDR> = <NETWORK_B_CIDR>
+# Key: Advertised network (network A)
+# Value: Actual local network (network B)
+
+# Example: Map 192.168.1.0/24 (local) to 10.100.1.0/24 (advertised)
+/nodes/gateway1/network_mapping/10.100.1.0/24 = 192.168.1.0/24
+
+# Multiple mappings supported
+/nodes/gateway1/network_mapping/10.100.2.0/24 = 192.168.2.0/24
+```
+
+**Behavior**:
+- **Key** (network A): Advertised network via BGP (e.g., `10.100.1.0/24`)
+- **Value** (network B): Actual local network (e.g., `192.168.1.0/24`)
+- **Requirement**: Both networks MUST have the same prefix length
+
+**Bidirectional 1:1 NAT**:
+- **Outbound**: Traffic from network B is translated to network A
+  - Source: `192.168.1.100` → `10.100.1.100`
+- **Inbound**: Traffic destined for network A is translated to network B
+  - Destination: `10.100.1.100` → `192.168.1.100`
+
+**BGP Advertisement**:
+- Network A (advertised network) is advertised via BGP
+- External networks learn routes to network A
+- Traffic to network A arrives and is NAT-translated to network B
+
+**Implementation**:
+- Uses iptables `NETMAP` target for efficient 1:1 prefix translation
+- Applied in both PREROUTING (DNAT) and POSTROUTING (SNAT) chains
+- Automatically applied/removed when configuration changes
+- State tracked in `watcher.py` with `_current_network_mappings`
+
+**Use Cases**:
+- Migrate from one IP range to another without reconfiguring clients
+- Connect overlapping network segments
+- Provide external-facing IP ranges that differ from internal ranges
+- Enable gradual network migration with minimal disruption
+
+**Implementation**: [generators/gen_frr.py:10-88](generators/gen_frr.py#L10-L88), [watcher.py:924-996](watcher.py#L924-L996)
+
 #### Clash Configuration
 ```python
 # Global subscriptions
@@ -324,7 +370,7 @@ All generators are in `generators/` directory:
 - `gen_tinc.py` - Tinc overlay config
 - `gen_openvpn.py` - OpenVPN instances
 - `gen_wireguard.py` - WireGuard instances
-- `gen_frr.py` - FRR routing (OSPF/BGP)
+- `gen_frr.py` - FRR routing (OSPF/BGP) + Network mapping NAT rules
 - `gen_clash.py` - Clash proxy config
 - `gen_mosdns.py` - MosDNS config
 - `common.py` - Shared utilities
@@ -354,7 +400,9 @@ All generators are in `generators/` directory:
   "tproxy_exclude": [...],     // For Clash: CIDRs to exclude from TPROXY
   "mode": "tproxy",            // For Clash
   "refresh_enable": true,      // For Clash
-  "refresh_interval_minutes": 60
+  "refresh_interval_minutes": 60,
+  "network_mappings": [...],   // For FRR: Network mapping configurations
+  "nat_rules": [...]           // For FRR: Generated iptables NETMAP rules
 }
 ```
 
