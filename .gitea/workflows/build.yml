@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-amd64:
     runs-on: ubuntu-latest
     env:
       REGISTRY: ${{ secrets.REGISTRY }}
@@ -62,25 +62,181 @@ jobs:
           set -euo pipefail
           echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
 
-      - name: Build and push multi-arch image
+      - name: Build and push amd64 image
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ gitea.sha }}
+            ${{ env.IMAGE }}:latest-amd64
+            ${{ env.IMAGE }}:${{ gitea.sha }}-amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            TARGETARCH=amd64
 
-      - name: Push tag image
+      - name: Push tag image (amd64)
         if: startsWith(gitea.ref, 'refs/tags/')
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE }}:${{ gitea.ref_name }}
+            ${{ env.IMAGE }}:${{ gitea.ref_name }}-amd64
           cache-from: type=gha
+          build-args: |
+            TARGETARCH=amd64
+
+  build-arm64:
+    # Note: Update this to use self-hosted arm64 runner, e.g.:
+    # runs-on: [self-hosted, linux, arm64]
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ secrets.REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      GITEA_SERVER_URL: ${{ gitea.server_url }}
+      GITEA_ACTOR: ${{ gitea.actor }}
+      GITEA_PAT: ${{ secrets.PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve registry host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${REGISTRY}" ]]; then
+            REGISTRY_HOST="${REGISTRY}"
+          else
+            REGISTRY_HOST="${GITEA_SERVER_URL#http://}"
+            REGISTRY_HOST="${REGISTRY_HOST#https://}"
+            REGISTRY_HOST="${REGISTRY_HOST%/}"
+          fi
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "${GITHUB_ENV}"
+          echo "IMAGE=${REGISTRY_HOST}/${{ gitea.repository }}" >> "${GITHUB_ENV}"
+
+      - name: Validate registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USER}" ]]; then
+            REGISTRY_USER="${GITEA_ACTOR}"
+          fi
+          if [[ -z "${REGISTRY_PASSWORD}" ]]; then
+            REGISTRY_PASSWORD="${GITEA_PAT}"
+          fi
+          if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
+            echo "Missing registry credentials. Set REGISTRY_USER/REGISTRY_PASSWORD or secrets.PAT."
+            exit 1
+          fi
+          echo "REGISTRY_USER=${REGISTRY_USER}" >> "${GITHUB_ENV}"
+          echo "REGISTRY_PASSWORD=${REGISTRY_PASSWORD}" >> "${GITHUB_ENV}"
+
+      - name: Login to registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
+
+      - name: Build and push arm64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest-arm64
+            ${{ env.IMAGE }}:${{ gitea.sha }}-arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            TARGETARCH=arm64
+
+      - name: Push tag image (arm64)
+        if: startsWith(gitea.ref, 'refs/tags/')
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ gitea.ref_name }}-arm64
+          cache-from: type=gha
+          build-args: |
+            TARGETARCH=arm64
+
+  manifest:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ secrets.REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      GITEA_SERVER_URL: ${{ gitea.server_url }}
+      GITEA_ACTOR: ${{ gitea.actor }}
+      GITEA_PAT: ${{ secrets.PAT }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve registry host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${REGISTRY}" ]]; then
+            REGISTRY_HOST="${REGISTRY}"
+          else
+            REGISTRY_HOST="${GITEA_SERVER_URL#http://}"
+            REGISTRY_HOST="${REGISTRY_HOST#https://}"
+            REGISTRY_HOST="${REGISTRY_HOST%/}"
+          fi
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "${GITHUB_ENV}"
+          echo "IMAGE=${REGISTRY_HOST}/${{ gitea.repository }}" >> "${GITHUB_ENV}"
+
+      - name: Validate registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USER}" ]]; then
+            REGISTRY_USER="${GITEA_ACTOR}"
+          fi
+          if [[ -z "${REGISTRY_PASSWORD}" ]]; then
+            REGISTRY_PASSWORD="${GITEA_PAT}"
+          fi
+          if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
+            echo "Missing registry credentials. Set REGISTRY_USER/REGISTRY_PASSWORD or secrets.PAT."
+            exit 1
+          fi
+          echo "REGISTRY_USER=${REGISTRY_USER}" >> "${GITHUB_ENV}"
+          echo "REGISTRY_PASSWORD=${REGISTRY_PASSWORD}" >> "${GITHUB_ENV}"
+
+      - name: Login to registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
+
+      - name: Create and push multi-arch manifest (latest and sha)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ gitea.sha }}" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64"
+
+      - name: Create and push multi-arch manifest (tag)
+        if: startsWith(gitea.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ gitea.ref_name }}" \
+            "${IMAGE}:${{ gitea.ref_name }}-amd64" \
+            "${IMAGE}:${{ gitea.ref_name }}-arm64"
