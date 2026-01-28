@@ -69,10 +69,10 @@ RUN set -eux; \
     rm -rf /tmp/easytier /tmp/easytier.zip
 
 # --- Clash Meta (mihomo) ---
-# Release asset naming:
-#   amd64: mihomo-linux-amd64-v2-v<VER>.gz
-#   arm64: mihomo-linux-arm64-v2-v<VER>.gz
-# Gzip contains binary: mihomo-linux-{arch}-v2
+# Release asset naming varies by version and architecture:
+#   amd64 (all versions): mihomo-linux-amd64-v2-v<VER>.gz (contains: mihomo-linux-amd64-v2)
+#   arm64 (older versions): mihomo-linux-arm64-v2-v<VER>.gz (contains: mihomo-linux-arm64-v2)
+#   arm64 (newer versions >= 1.19.19): mihomo-linux-arm64-v<VER>.gz (contains: mihomo)
 RUN set -eux; \
     PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
@@ -80,17 +80,32 @@ RUN set -eux; \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
     case "${TARGETARCH}" in \
-        amd64) MIHOMO_ARCH="amd64" ;; \
-        arm64) MIHOMO_ARCH="arm64" ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+        amd64) \
+            MIHOMO_ARCH="amd64"; \
+            ASSET="mihomo-linux-amd64-v2-v${MIHOMO_VERSION}.gz"; \
+            ;; \
+        arm64) \
+            MIHOMO_ARCH="arm64"; \
+            ASSET="mihomo-linux-arm64-v${MIHOMO_VERSION}.gz"; \
+            ;; \
+        *) \
+            echo "Unsupported architecture: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
     esac; \
-    ASSET="mihomo-linux-${MIHOMO_ARCH}-v2-v${MIHOMO_VERSION}.gz"; \
     URL="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/${ASSET}"; \
     echo "Downloading Mihomo for ${MIHOMO_ARCH}: ${URL}"; \
     curl -fL ${CURL_PROXY} "$URL" -o /tmp/mihomo.gz; \
-    gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
+    # Extract binary (handle different archive structures)
+    ARCHIVE_FILE="$(gunzip -l /tmp/mihomo.gz 2>/dev/null | awk '{print $NF}' | tail -1)"; \
+    if [ "${ARCHIVE_FILE}" = "mihomo" ] || [ "${ARCHIVE_FILE}" = "mihomo-linux-${MIHOMO_ARCH}" ]; then \
+        gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
+    else \
+        gunzip -c /tmp/mihomo.gz > /tmp/mihomo-extracted; \
+        mv /tmp/mihomo-extracted /usr/local/bin/mihomo; \
+    fi; \
     chmod +x /usr/local/bin/mihomo; \
-    rm -f /tmp/mihomo.gz
+    rm -f /tmp/mihomo.gz /tmp/mihomo-extracted 2>/dev/null || true
 
 # --- MetaCubeXD (UI) ---
 RUN set -eux; \
