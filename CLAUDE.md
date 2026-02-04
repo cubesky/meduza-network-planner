@@ -221,6 +221,50 @@ The `watcher.py` is the central orchestrator:
 # - "deny <prefix> [ge N] [le N]"
 ```
 
+#### Node Behavior Configuration
+
+Controls route priority for nodes in iBGP routing using local-preference.
+
+```python
+# Node behavior: determines routing policy for iBGP
+/nodes/<NODE_ID>/behavior = "static" | "roaming"  # Default: "static"
+```
+
+**Behavior modes**:
+- **static** (default): Node is stable and can be used for transit traffic
+  - Routes learned from this node have default local-preference (100)
+  - Normal mesh routing applies
+  - Preferred for transit traffic
+- **roaming**: Node is mobile/unstable (e.g., 4G/5G connection)
+  - Routes learned from this node have lower local-preference (50)
+  - Routes are still advertised to all iBGP peers
+  - **NOT preferred for transit traffic** (lower priority)
+  - **Still reachable as backup** when all static paths fail
+  - The node can still reach other nodes and external BGP neighbors
+  - Other iBGP nodes can reach networks via this node (as last resort)
+
+**How local-preference works**:
+- BGP prefers routes with **higher** local-preference
+- Default local-preference is 100
+- Roaming node routes are set to 50
+- Static nodes will always be preferred over roaming nodes for transit
+- But roaming routes remain in the routing table as backup
+
+**Use cases**:
+- **Static nodes**: Data center gateways, office routers, home servers
+- **Roaming nodes**: Mobile devices, laptops, vehicles, temporary pop-up sites
+
+**Example**:
+```
+# Gateway in data center (static)
+/nodes/dc-gateway/behavior = "static"
+
+# Traveling laptop with 4G backup (roaming)
+/nodes/laptop-01/behavior = "roaming"
+```
+
+**Implementation**: [generators/gen_frr.py:172-210, 494-505, 638-663](generators/gen_frr.py)
+
 #### OSPF Configuration
 ```python
 /nodes/<NODE_ID>/ospf/enable

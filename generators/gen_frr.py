@@ -194,10 +194,14 @@ def _internal_bgp_neighbors(
             continue
         ovpn = _parse_openvpn(nid, data)
         wg = _parse_wireguard(nid, data)
+        # Get node behavior: "static" (default) or "roaming"
+        # Roaming nodes should not be used for transit traffic
+        behavior = data.get(f"/nodes/{nid}/behavior", "static") or "static"
         out[nid] = {
             "router_id": router_id,
             "is_exit": "true" if _node_is_exit(ovpn, wg) else "false",
             "name": nid,
+            "is_roaming": "true" if behavior == "roaming" else "false",
         }
     return out
 
@@ -487,6 +491,26 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append("!")
                 lines.append("")
 
+    # Generate route-maps for roaming iBGP neighbors
+    # Roaming nodes should be deprioritized for transit traffic
+    # Routes learned from them will have lower local-preference
+    # This allows them to be used as backup paths but not preferred for transit
+    has_roaming_ibgp = False
+    if internal_routing == "bgp" and bgp_enable:
+        neighbors = _internal_bgp_neighbors(node_id, all_nodes)
+        has_roaming_ibgp = any(info.get("is_roaming") == "true" for info in neighbors.values())
+
+    if has_roaming_ibgp:
+        # Inbound route-map for roaming iBGP neighbors: lower local-preference
+        # Default local-preference is 100, we set roaming routes to 50
+        # This makes them less preferred but still available as backup
+        lines.append("route-map RM-BGP-IN-ROAMING permit 10")
+        lines.append(" match ip address prefix-list PL-BGP-IN")
+        lines.append(" set local-preference 50")
+        lines.append("route-map RM-BGP-IN-ROAMING permit 20")
+        lines.append("!")
+        lines.append("")
+
     if ospf_enable:
         ospf_area = node.get(f"/nodes/{node_id}/ospf/area", "0")
         for iface in active_ifaces:
@@ -613,14 +637,26 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
         for info in ibgp_neighbors:
             peer_ip = info["router_id"]
+            is_roaming = info.get("is_roaming") == "true"
             lines.append(f"  neighbor {peer_ip} activate")
-            lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+
+            # Use different inbound route-map for roaming vs static neighbors
+            # Roaming neighbors get lower local-preference (50 vs default 100)
+            # This deprioritizes transit through roaming nodes while keeping them reachable
+            if is_roaming:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN-ROAMING in")
+            else:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+
+            # Outbound: same route-map for both roaming and static
+            # Routes will be advertised, but roaming routes have lower preference
+            # Other nodes will prefer static paths while roaming paths remain as backup
             if private_lans:
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-INTERNAL out")
             else:
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+
             # Always use next-hop-self for iBGP to ensure proper route propagation
-            # This ensures all routes learned from eBGP are properly redistributed within the mesh
             lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]

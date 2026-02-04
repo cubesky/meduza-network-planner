@@ -20,6 +20,34 @@ Private LANs (internal-only, newline-separated):
 
 - `private_lan` is distributed only via OSPF or iBGP (not exported to external BGP neighbors).
 
+## Node behavior
+
+Controls route priority for nodes in iBGP routing using local-preference:
+
+```
+/nodes/<NODE_ID>/behavior = "static" | "roaming"  # Default: "static"
+```
+
+**Behavior modes**:
+- **static** (default): Node is stable and preferred for transit traffic
+  - Routes learned from this node have default local-preference (100)
+  - Normal mesh routing applies
+- **roaming**: Node is mobile/unstable (e.g., 4G/5G connection)
+  - Routes learned from this node have lower local-preference (50)
+  - Routes are still advertised to all iBGP peers (not blocked)
+  - **NOT preferred for transit traffic** (lower priority)
+  - **Still reachable as backup** when all static paths fail
+
+**How local-preference works**:
+- BGP prefers routes with **higher** local-preference
+- Roaming routes (local-pref 50) are deprioritized vs static routes (local-pref 100)
+- Static nodes are always preferred for transit
+- Roaming routes remain available as backup paths
+
+**Use cases**:
+- **Static**: Data center gateways, office routers, home servers
+- **Roaming**: Mobile devices, laptops with 4G backup, vehicles
+
 These prefixes are treated as **Local segments**:
 - advertised by routing (OSPF via redistribute connected; BGP via network statements)
 - excluded from Clash TPROXY interception
