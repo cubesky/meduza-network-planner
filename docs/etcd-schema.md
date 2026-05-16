@@ -111,6 +111,79 @@ Notes:
 - IPv6 literal addresses must be wrapped in `[]`, for example `51820:[2001:db8::10]:51820`.
 
 
+## Access VPN
+
+Provide a node-level OpenVPN access server authenticated against LDAP group `access`.
+
+Global LDAP settings:
+
+```text
+/global/access/ldap/uri
+/global/access/ldap/base_dn
+/global/access/ldap/bind_dn
+/global/access/ldap/bind_password
+/global/access/ldap/user_filter
+/global/access/ldap/group_base_dn
+/global/access/ldap/group_filter
+/global/access/ldap/ca_cert
+/global/access/ldap/insecure
+/global/access/ldap/start_tls
+```
+
+Recommended defaults:
+- `user_filter`: `(&(objectClass=person)(uid={username}))`
+- `group_filter`: `(&(objectClass=groupOfNames)(cn=access)(member={user_dn}))`
+
+Global OpenVPN server base settings:
+
+```text
+/global/access/openvpn/proto
+/global/access/openvpn/dev
+/global/access/openvpn/dev_type
+/global/access/openvpn/local
+/global/access/openvpn/keepalive
+/global/access/openvpn/verb
+/global/access/openvpn/auth
+/global/access/openvpn/cipher
+/global/access/openvpn/data_ciphers
+/global/access/openvpn/topology
+/global/access/openvpn/reneg_sec
+/global/access/openvpn/max_clients
+/global/access/openvpn/sndbuf
+/global/access/openvpn/rcvbuf
+/global/access/openvpn/status
+/global/access/openvpn/status_version
+/global/access/openvpn/explicit_exit_notify
+/global/access/openvpn/tun_mtu
+/global/access/openvpn/mssfix
+/global/access/openvpn/push_dns
+/global/access/openvpn/extra_config
+/global/access/openvpn/ca
+/global/access/openvpn/cert
+/global/access/openvpn/key
+/global/access/openvpn/dh
+/global/access/openvpn/tls_auth
+/global/access/openvpn/tls_crypt
+/global/access/openvpn/crl_verify
+/global/access/openvpn/key_direction
+```
+
+Node-level enablement:
+
+```text
+/nodes/<NODE_ID>/access/enable   # "true" | "false"
+/nodes/<NODE_ID>/access/port
+/nodes/<NODE_ID>/access/network  # IPv4 CIDR assigned to access clients
+```
+
+Behavior:
+- A dedicated access OpenVPN server is generated independently from normal `/nodes/<NODE_ID>/openvpn/<NAME>` instances.
+- Users must successfully authenticate with LDAP and be a member of group `access`.
+- The access client pool network is advertised through BGP automatically.
+- The server pushes known routed prefixes to clients so they can reach resources behind the BGP fabric.
+- Multiple simultaneous connections for the same user are allowed.
+
+
 ## OpenVPN
 
 Schema (per instance):

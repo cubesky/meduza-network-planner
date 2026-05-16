@@ -483,10 +483,15 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
     instances = out.get("instances", [])
     enabled: List[str] = []
     changed = False
+    access_dev: Optional[str] = None
 
     with _ovpn_lock:
+        access_dev = _ovpn_devs.get("access")
         _ovpn_cfg_names.clear()
         _ovpn_devs.clear()
+        if access_dev:
+            _ovpn_cfg_names.append("access")
+            _ovpn_devs["access"] = access_dev
 
     active = set()
     for inst in instances:
@@ -509,6 +514,8 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
 
     for path in glob.glob("/etc/supervisor/conf.d/openvpn-*.conf"):
         name = os.path.basename(path).split("openvpn-")[-1].split(".conf")[0]
+        if name == "access":
+            continue
         if name not in active:
             try:
                 os.remove(path)
@@ -524,6 +531,68 @@ def reload_openvpn(node: Dict[str, str]) -> Tuple[bool, List[str]]:
         _write_openvpn_status(name, "connecting")
 
     return changed, sorted(enabled)
+
+
+def _remove_file_if_exists(path: str) -> bool:
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def reload_access_openvpn(node: Dict[str, str], global_cfg: Dict[str, str], all_nodes: Dict[str, str]) -> bool:
+    payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": all_nodes}
+    out = _run_generator("gen_access", payload)
+    changed = False
+
+    with _ovpn_lock:
+        if "access" in _ovpn_cfg_names:
+            _ovpn_cfg_names.remove("access")
+        _ovpn_devs.pop("access", None)
+
+    if not out.get("enabled"):
+        changed = _remove_file_if_exists("/etc/supervisor/conf.d/openvpn-access.conf") or changed
+        changed = _remove_file_if_exists("/etc/openvpn/generated/access.conf") or changed
+        changed = _remove_file_if_exists("/etc/openvpn/generated/access-ldap.json") or changed
+        for extra in [
+            "/etc/openvpn/generated/access.ca",
+            "/etc/openvpn/generated/access.cert",
+            "/etc/openvpn/generated/access.key",
+            "/etc/openvpn/generated/access.dh",
+            "/etc/openvpn/generated/access.tlsauth",
+            "/etc/openvpn/generated/access.tlscrypt",
+            "/etc/openvpn/generated/access.crlverify",
+            "/etc/openvpn/generated/access.ldapca",
+        ]:
+            changed = _remove_file_if_exists(extra) or changed
+        _supervisorctl(["reread"])
+        _supervisorctl(["update"])
+        return changed
+
+    inst = out["instance"]
+    dev = inst["dev"]
+    for f in inst.get("files", []):
+        if _write_if_changed(f["path"], f["content"], mode=f.get("mode")):
+            changed = True
+    if _write_if_changed("/etc/openvpn/generated/access.conf", inst["config"]):
+        changed = True
+    if _write_if_changed("/etc/supervisor/conf.d/openvpn-access.conf", _openvpn_program_conf("access", dev)):
+        changed = True
+
+    with _ovpn_lock:
+        _ovpn_devs["access"] = dev
+        if "access" not in _ovpn_cfg_names:
+            _ovpn_cfg_names.append("access")
+            _ovpn_cfg_names.sort()
+
+    _supervisorctl(["reread"])
+    _supervisorctl(["update"])
+    _supervisor_restart("openvpn-access")
+    _write_openvpn_status("access", "connecting")
+    return changed
 
 
 def openvpn_status_loop():
@@ -2612,6 +2681,13 @@ def handle_commit() -> None:
 
     node = load_prefix(f"/nodes/{NODE_ID}/")
     global_cfg = load_prefix("/global/")
+    all_nodes_cache: Optional[Dict[str, str]] = None
+
+    def get_all_nodes() -> Dict[str, str]:
+        nonlocal all_nodes_cache
+        if all_nodes_cache is None:
+            all_nodes_cache = load_all_nodes()
+        return all_nodes_cache
 
     def changed(key: str, val: Any) -> bool:
         if reconcile_force:
@@ -2693,6 +2769,15 @@ def handle_commit() -> None:
                 dev = _ovpn_devs.get(name) or (f"tun{name[-1]}" if name and name[-1].isdigit() else f"tun-{name}")
             _write_openvpn_status(name, _compute_openvpn_status(name, dev))
 
+    access_domain = {k: v for k, v in node.items() if "/access/" in k}
+    global_access = {k: v for k, v in global_cfg.items() if k.startswith("/global/access/")}
+    if changed("access", {"node": access_domain, "global": global_access}):
+        did_apply = reload_access_openvpn(node, global_cfg, get_all_nodes()) or did_apply
+        with _ovpn_lock:
+            dev = _ovpn_devs.get("access")
+        if dev:
+            _write_openvpn_status("access", _compute_openvpn_status("access", dev))
+
     wireguard_domain = {k: v for k, v in node.items() if "/wireguard/" in k}
     if changed("wireguard", wireguard_domain):
         changed_wg, enabled = reload_wireguard(node)
@@ -2704,11 +2789,11 @@ def handle_commit() -> None:
 
     # FRR depends on node routing config + global BGP filter policy + network mapping
     frr_material = {k: v for k, v in node.items() if (
-        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k or "/wireguard/" in k or "/network_mapping/" in k
+        "/ospf/" in k or "/bgp/" in k or "/lan/" in k or "/openvpn/" in k or "/wireguard/" in k or "/network_mapping/" in k or "/access/" in k
     )}
-    global_bgp_filter = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/filter/")}
-    if changed("frr", {"node": frr_material, "global_bgp_filter": global_bgp_filter}):
-        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": load_all_nodes()}
+    global_bgp_related = {k: v for k, v in global_cfg.items() if k.startswith("/global/bgp/") or k.startswith("/global/access/")}
+    if changed("frr", {"node": frr_material, "global": global_bgp_related}):
+        payload = {"node_id": NODE_ID, "node": node, "global": global_cfg, "all_nodes": get_all_nodes()}
         out = _run_generator("gen_frr", payload)
         reload_frr_smooth(out["frr_conf"])
         # Apply network mapping NAT rules if any

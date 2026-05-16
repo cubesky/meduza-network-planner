@@ -147,6 +147,18 @@ def _parse_wireguard(node_id: str, node: Dict[str, str]) -> Dict[str, Dict[str, 
     return out
 
 
+def _parse_access_network(node_id: str, node: Dict[str, str]) -> List[str]:
+    if node.get(f"/nodes/{node_id}/access/enable") != "true":
+        return []
+    raw = node.get(f"/nodes/{node_id}/access/network", "").strip()
+    if not raw:
+        return []
+    net = ipaddress.ip_network(raw, strict=False)
+    if net.version != 4:
+        raise ValueError("access network must be an IPv4 CIDR")
+    return [str(net)]
+
+
 def _bgp_enabled(cfg: Dict[str, str]) -> bool:
     return cfg.get("bgp/enable", "true") == "true"
 
@@ -330,6 +342,7 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
     lans = node_lans(node, node_id) if inject_site_lan else []
     private_lans = sorted(set(split_ml(node.get(f"/nodes/{node_id}/private_lan", "")))) if inject_private_lan else []
+    access_networks = _parse_access_network(node_id, node)
 
     lines: List[str] = [
         "frr defaults traditional",
@@ -570,6 +583,8 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         lines.append(" address-family ipv4 unicast")
         lines.append(f"  maximum-paths {max_paths}")
         for pfx in lans:
+            lines.append(f"  network {pfx}")
+        for pfx in access_networks:
             lines.append(f"  network {pfx}")
         if internal_routing == "bgp":
             for pfx in private_lans:
