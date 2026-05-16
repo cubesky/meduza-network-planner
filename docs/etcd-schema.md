@@ -20,6 +20,34 @@ Private LANs (internal-only, newline-separated):
 
 - `private_lan` is distributed only via OSPF or iBGP (not exported to external BGP neighbors).
 
+## Node behavior
+
+Controls route priority for nodes in iBGP routing using local-preference:
+
+```
+/nodes/<NODE_ID>/behavior = "static" | "roaming"  # Default: "static"
+```
+
+**Behavior modes**:
+- **static** (default): Node is stable and preferred for transit traffic
+  - Routes learned from this node have default local-preference (100)
+  - Normal mesh routing applies
+- **roaming**: Node is mobile/unstable (e.g., 4G/5G connection)
+  - Routes learned from this node have lower local-preference (50)
+  - Routes are still advertised to all iBGP peers (not blocked)
+  - **NOT preferred for transit traffic** (lower priority)
+  - **Still reachable as backup** when all static paths fail
+
+**How local-preference works**:
+- BGP prefers routes with **higher** local-preference
+- Roaming routes (local-pref 50) are deprioritized vs static routes (local-pref 100)
+- Static nodes are always preferred for transit
+- Roaming routes remain available as backup paths
+
+**Use cases**:
+- **Static**: Data center gateways, office routers, home servers
+- **Roaming**: Mobile devices, laptops with 4G backup, vehicles
+
 These prefixes are treated as **Local segments**:
 - advertised by routing (OSPF via redistribute connected; BGP via network statements)
 - excluded from Clash TPROXY interception
@@ -293,3 +321,50 @@ Mapped listeners usage:
 - Public mapped listener:   `tcp://203.0.113.10:443`
 
 When set, the gateway starts EasyTier with one or more `--mapped-listeners <addr>` arguments.
+
+
+## Network Mapping (NAT 1:1 Bidirectional)
+
+Network mapping provides 1:1 bidirectional address translation between two network segments of equal size.
+
+Schema (per node):
+
+```
+/nodes/<NODE_ID>/network_mapping/<NETWORK_A_CIDR> = <NETWORK_B_CIDR>
+```
+
+- **Key**: `<NETWORK_A_CIDR>` - Local network segment (e.g., `192.168.1.0/24`)
+- **Value**: `<NETWORK_B_CIDR>` - Target network segment (e.g., `10.100.1.0/24`)
+- **Requirement**: Both networks MUST have the same prefix length (same size)
+- **Multiple mappings**: Can specify multiple network pairs by using different keys
+
+Example:
+
+```
+/nodes/gateway1/network_mapping/192.168.1.0/24 = 10.100.1.0/24
+/nodes/gateway1/network_mapping/192.168.2.0/24 = 10.100.2.0/24
+```
+
+**Behavior**:
+
+1. **Bidirectional 1:1 NAT**:
+   - **Outbound (A→B)**: Traffic from network A is translated to network B
+     - Source: 192.168.1.100 → 10.100.1.100
+   - **Inbound (B→A)**: Traffic destined for network B is translated to network A
+     - Destination: 10.100.1.100 → 192.168.1.100
+
+2. **BGP Advertisement**:
+   - Network A (local) is advertised via BGP, NOT network B
+   - External networks learn routes to network A
+   - Traffic to network A arrives and is translated to network B
+
+3. **Implementation**:
+   - Uses iptables `NETMAP` target for efficient 1:1 prefix translation
+   - Applied in both PREROUTING (DNAT) and POSTROUTING (SNAT) chains
+   - Automatically excludes traffic within the same network segment
+
+**Use Cases**:
+- Migrate from one IP range to another without reconfiguring clients
+- Connect overlapping network segments
+- Provide external-facing IP ranges that differ from internal ranges
+- Enable gradual network migration with minimal disruption

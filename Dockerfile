@@ -1,5 +1,10 @@
 FROM library/debian:12-slim
 
+# Build arguments for multi-architecture support
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG TARGETARCH
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Versions can be overridden at build time:
@@ -39,37 +44,68 @@ RUN apt-get update && apt-get install -y \
  && rm -rf /var/lib/apt/lists/*
 
 # --- EasyTier ---
-# Release asset name: easytier-linux-x86_64-v<VER>.zip
-# Zip structure: easytier-linux-x86_64/{easytier-core,easytier-cli,easytier-web,easytier-web-embed}
+# Release asset naming:
+#   amd64: easytier-linux-x86_64-v<VER>.zip
+#   arm64: easytier-linux-aarch64-v<VER>.zip
+# Zip structure: easytier-linux-{arch}/{easytier-core,easytier-cli,easytier-web,easytier-web-embed}
 RUN set -eux; \
     PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
-    ASSET="easytier-linux-x86_64-v${EASYTIER_VERSION}.zip"; \
+    case "${TARGETARCH}" in \
+        amd64) EASYTIER_ARCH="x86_64" ;; \
+        arm64) EASYTIER_ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ASSET="easytier-linux-${EASYTIER_ARCH}-v${EASYTIER_VERSION}.zip"; \
     URL="https://github.com/EasyTier/EasyTier/releases/download/v${EASYTIER_VERSION}/${ASSET}"; \
+    echo "Downloading EasyTier for ${EASYTIER_ARCH}: ${URL}"; \
     curl -fL ${CURL_PROXY} "$URL" -o /tmp/easytier.zip; \
     unzip -q /tmp/easytier.zip -d /tmp/easytier; \
-    install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-core /usr/local/bin/easytier-core; \
-    install -m 0755 /tmp/easytier/easytier-linux-x86_64/easytier-cli /usr/local/bin/easytier-cli || true; \
+    install -m 0755 /tmp/easytier/easytier-linux-${EASYTIER_ARCH}/easytier-core /usr/local/bin/easytier-core; \
+    install -m 0755 /tmp/easytier/easytier-linux-${EASYTIER_ARCH}/easytier-cli /usr/local/bin/easytier-cli || true; \
     rm -rf /tmp/easytier /tmp/easytier.zip
 
 # --- Clash Meta (mihomo) ---
-# Release asset name: mihomo-linux-amd64-v2-v<VER>.gz
-# Gzip contains binary: mihomo-linux-amd64-v2
+# Release asset naming varies by version and architecture:
+#   amd64 (all versions): mihomo-linux-amd64-v2-v<VER>.gz (contains: mihomo-linux-amd64-v2)
+#   arm64 (older versions): mihomo-linux-arm64-v2-v<VER>.gz (contains: mihomo-linux-arm64-v2)
+#   arm64 (newer versions >= 1.19.19): mihomo-linux-arm64-v<VER>.gz (contains: mihomo)
 RUN set -eux; \
     PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
-    ASSET="mihomo-linux-amd64-v2-v${MIHOMO_VERSION}.gz"; \
+    case "${TARGETARCH}" in \
+        amd64) \
+            MIHOMO_ARCH="amd64"; \
+            ASSET="mihomo-linux-amd64-v2-v${MIHOMO_VERSION}.gz"; \
+            ;; \
+        arm64) \
+            MIHOMO_ARCH="arm64"; \
+            ASSET="mihomo-linux-arm64-v${MIHOMO_VERSION}.gz"; \
+            ;; \
+        *) \
+            echo "Unsupported architecture: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac; \
     URL="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/${ASSET}"; \
+    echo "Downloading Mihomo for ${MIHOMO_ARCH}: ${URL}"; \
     curl -fL ${CURL_PROXY} "$URL" -o /tmp/mihomo.gz; \
-    gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
+    # Extract binary (handle different archive structures)
+    ARCHIVE_FILE="$(gunzip -l /tmp/mihomo.gz 2>/dev/null | awk '{print $NF}' | tail -1)"; \
+    if [ "${ARCHIVE_FILE}" = "mihomo" ] || [ "${ARCHIVE_FILE}" = "mihomo-linux-${MIHOMO_ARCH}" ]; then \
+        gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo; \
+    else \
+        gunzip -c /tmp/mihomo.gz > /tmp/mihomo-extracted; \
+        mv /tmp/mihomo-extracted /usr/local/bin/mihomo; \
+    fi; \
     chmod +x /usr/local/bin/mihomo; \
-    rm -f /tmp/mihomo.gz
+    rm -f /tmp/mihomo.gz /tmp/mihomo-extracted 2>/dev/null || true
 
 # --- MetaCubeXD (UI) ---
 RUN set -eux; \
@@ -107,15 +143,23 @@ RUN set -eux; \
     rm -rf /tmp/tinc
 
 # --- MosDNS ---
-# Release asset name: mosdns-linux-amd64.zip (no nested folder)
+# Release asset naming:
+#   amd64: mosdns-linux-amd64.zip (no nested folder)
+#   arm64: mosdns-linux-arm64.zip (no nested folder)
 RUN set -eux; \
     PROXY="http://10.42.7.5:7890"; \
     CURL_PROXY=""; \
     if curl -fsSL --connect-timeout 2 --proxy "${PROXY}" https://github.com/ >/dev/null; then \
       CURL_PROXY="--proxy ${PROXY}"; \
     fi; \
-    ASSET="mosdns-linux-amd64.zip"; \
+    case "${TARGETARCH}" in \
+        amd64) MOSDNS_ARCH="amd64" ;; \
+        arm64) MOSDNS_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ASSET="mosdns-linux-${MOSDNS_ARCH}.zip"; \
     URL="https://github.com/IrineSistiana/mosdns/releases/download/v${MOSDNS_VERSION}/${ASSET}"; \
+    echo "Downloading MosDNS for ${MOSDNS_ARCH}: ${URL}"; \
     curl -fL ${CURL_PROXY} "$URL" -o /tmp/mosdns.zip; \
     unzip -q /tmp/mosdns.zip -d /tmp/mosdns; \
     install -m 0755 /tmp/mosdns/mosdns /usr/local/bin/mosdns; \

@@ -1,9 +1,91 @@
 import json
+import ipaddress
 from typing import Any, Dict, List, Tuple, Set
 
 from common import read_input, write_output, split_ml, node_lans
 
 TAG_NO_REINJECT = 65000
+
+
+def _parse_network_mapping(
+    node_id: str, node: Dict[str, str]
+) -> List[Tuple[str, str, str, str]]:
+    """
+    Parse network mapping configuration from etcd.
+
+    Returns list of (network_a, network_b, prefix_a, prefix_b) tuples.
+    - network_a: Advertised network (key)
+    - network_b: Actual local network (value)
+    - prefix_a: Prefix length of network_a (e.g., 24)
+    - prefix_b: Prefix length of network_b (e.g., 24)
+
+    Schema: /nodes/<NODE_ID>/network_mapping/<NETWORK_A> = <NETWORK_B>
+    Example: /nodes/gw1/network_mapping/192.168.1.0/24 = 10.100.1.0/24
+
+    Raises ValueError if networks have different prefix lengths.
+    """
+    base = f"/nodes/{node_id}/network_mapping/"
+    mappings: List[Tuple[str, str, str, str]] = []
+
+    for k, v in node.items():
+        if not k.startswith(base):
+            continue
+        network_a = k[len(base):]  # Extract key (e.g., "192.168.1.0/24")
+        network_b = v.strip()  # Value (e.g., "10.100.1.0/24")
+
+        if not network_a or not network_b:
+            continue
+
+        try:
+            # Validate CIDR format and extract prefix lengths
+            net_a = ipaddress.ip_network(network_a, strict=False)
+            net_b = ipaddress.ip_network(network_b, strict=False)
+
+            prefix_a = str(net_a.prefixlen)
+            prefix_b = str(net_b.prefixlen)
+
+            # Validate that networks have same size
+            if net_a.prefixlen != net_b.prefixlen:
+                raise ValueError(
+                    f"Network mapping {network_a} -> {network_b} has different prefix lengths "
+                    f"({prefix_a} vs {prefix_b}). Both networks must have the same size."
+                )
+
+            mappings.append((network_a, network_b, prefix_a, prefix_b))
+        except ValueError as e:
+            raise ValueError(f"Invalid network mapping {network_a} -> {network_b}: {e}")
+
+    return mappings
+
+
+def _generate_nat_rules(
+    mappings: List[Tuple[str, str, str, str]]
+) -> List[str]:
+    """
+    Generate iptables NETMAP rules for network mapping.
+
+    Returns list of iptables commands to apply.
+    Each mapping generates two rules:
+    1. POSTROUTING (SNAT): Translate source from network_b to network_a
+    2. PREROUTING (DNAT): Translate destination from network_a to network_b
+    """
+    rules: List[str] = []
+
+    for network_a, network_b, _, _ in sorted(mappings):
+        # POSTROUTING: SNAT from network_b to network_a
+        # Traffic leaving the gateway with source in network_b gets translated to network_a
+        rules.append(
+            f"iptables -t nat -A POSTROUTING -s {network_b} -d ! {network_b} "
+            f"-j NETMAP --to {network_a}"
+        )
+        # PREROUTING: DNAT from network_a to network_b
+        # Traffic arriving with destination in network_a gets translated to network_b
+        rules.append(
+            f"iptables -t nat -A PREROUTING -d {network_a} "
+            f"-j NETMAP --to {network_b}"
+        )
+
+    return rules
 
 
 def _ovpn_dev_name(name: str) -> str:
@@ -112,10 +194,14 @@ def _internal_bgp_neighbors(
             continue
         ovpn = _parse_openvpn(nid, data)
         wg = _parse_wireguard(nid, data)
+        # Get node behavior: "static" (default) or "roaming"
+        # Roaming nodes should not be used for transit traffic
+        behavior = data.get(f"/nodes/{nid}/behavior", "static") or "static"
         out[nid] = {
             "router_id": router_id,
             "is_exit": "true" if _node_is_exit(ovpn, wg) else "false",
             "name": nid,
+            "is_roaming": "true" if behavior == "roaming" else "false",
         }
     return out
 
@@ -161,7 +247,7 @@ def _get_bgp_control_flags(cfg: Dict[str, str]) -> Tuple[bool, bool]:
     return no_transit, no_forward
 
 
-def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str], all_nodes: Dict[str, str]) -> str:
+def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str], all_nodes: Dict[str, str]) -> Dict[str, Any]:
     router_id = node.get(f"/nodes/{node_id}/router_id", "")
     internal_routing = global_cfg.get("/global/internal_routing_system", "ospf")
     ospf_enable = node.get(f"/nodes/{node_id}/ospf/enable") == "true"
@@ -173,6 +259,16 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
     ospf_redistribute_bgp = node.get(f"/nodes/{node_id}/ospf/redistribute_bgp", "true") == "true"
     inject_site_lan = node.get(f"/nodes/{node_id}/ospf/inject_site_lan", "true") == "true"
     inject_private_lan = node.get(f"/nodes/{node_id}/ospf/inject_private_lan", "true") == "true"
+
+    # Parse network mappings: /nodes/<NODE_ID>/network_mapping/<NETWORK_A> = <NETWORK_B>
+    # Returns list of (network_a, network_b, prefix_a, prefix_b)
+    # network_a: Advertised network (key)
+    # network_b: Actual local network (value)
+    network_mappings = _parse_network_mapping(node_id, node)
+    # Extract advertised networks (network_a) for BGP advertisement
+    advertised_networks = sorted({net_a for net_a, _, _, _ in network_mappings})
+    # Extract actual local networks (network_b) for informational purposes
+    actual_networks = sorted({net_b for _, net_b, _, _ in network_mappings})
 
     # Parse BGP transit AS list (newline-separated, '*' means allow all)
     bgp_transit_raw = global_cfg.get("/global/bgp/transit", "")
@@ -395,6 +491,26 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
                 lines.append("!")
                 lines.append("")
 
+    # Generate route-maps for roaming iBGP neighbors
+    # Roaming nodes should be deprioritized for transit traffic
+    # Routes learned from them will have lower local-preference
+    # This allows them to be used as backup paths but not preferred for transit
+    has_roaming_ibgp = False
+    if internal_routing == "bgp" and bgp_enable:
+        neighbors = _internal_bgp_neighbors(node_id, all_nodes)
+        has_roaming_ibgp = any(info.get("is_roaming") == "true" for info in neighbors.values())
+
+    if has_roaming_ibgp:
+        # Inbound route-map for roaming iBGP neighbors: lower local-preference
+        # Default local-preference is 100, we set roaming routes to 50
+        # This makes them less preferred but still available as backup
+        lines.append("route-map RM-BGP-IN-ROAMING permit 10")
+        lines.append(" match ip address prefix-list PL-BGP-IN")
+        lines.append(" set local-preference 50")
+        lines.append("route-map RM-BGP-IN-ROAMING permit 20")
+        lines.append("!")
+        lines.append("")
+
     if ospf_enable:
         ospf_area = node.get(f"/nodes/{node_id}/ospf/area", "0")
         for iface in active_ifaces:
@@ -458,6 +574,9 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
         if internal_routing == "bgp":
             for pfx in private_lans:
                 lines.append(f"  network {pfx}")
+        # Advertise network mappings (network_a)
+        for pfx in advertised_networks:
+            lines.append(f"  network {pfx}")
         # Broadcast edge prefixes if this node is an exit node
         if self_is_exit and bgp_edge_broadcast:
             for pfx in bgp_edge_broadcast:
@@ -518,19 +637,38 @@ def generate_frr(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str],
 
         for info in ibgp_neighbors:
             peer_ip = info["router_id"]
+            is_roaming = info.get("is_roaming") == "true"
             lines.append(f"  neighbor {peer_ip} activate")
-            lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+
+            # Use different inbound route-map for roaming vs static neighbors
+            # Roaming neighbors get lower local-preference (50 vs default 100)
+            # This deprioritizes transit through roaming nodes while keeping them reachable
+            if is_roaming:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN-ROAMING in")
+            else:
+                lines.append(f"  neighbor {peer_ip} route-map RM-BGP-IN in")
+
+            # Outbound: same route-map for both roaming and static
+            # Routes will be advertised, but roaming routes have lower preference
+            # Other nodes will prefer static paths while roaming paths remain as backup
             if private_lans:
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT-INTERNAL out")
             else:
                 lines.append(f"  neighbor {peer_ip} route-map RM-BGP-OUT out")
+
             # Always use next-hop-self for iBGP to ensure proper route propagation
-            # This ensures all routes learned from eBGP are properly redistributed within the mesh
             lines.append(f"  neighbor {peer_ip} next-hop-self")
         lines.append(" exit-address-family")
         lines += ["!", ""]
 
-    return "\n".join(lines).strip() + "\n"
+    frr_conf = "\n".join(lines).strip() + "\n"
+    nat_rules = _generate_nat_rules(network_mappings)
+
+    return {
+        "frr_conf": frr_conf,
+        "network_mappings": network_mappings,
+        "nat_rules": nat_rules,
+    }
 
 
 def main() -> None:
@@ -538,8 +676,8 @@ def main() -> None:
     node_id = payload["node_id"]
     node = payload["node"]
     global_cfg = payload["global"]
-    conf_text = generate_frr(node_id, node, global_cfg, payload.get("all_nodes", {}))
-    write_output({"frr_conf": conf_text})
+    result = generate_frr(node_id, node, global_cfg, payload.get("all_nodes", {}))
+    write_output(result)
 
 
 if __name__ == "__main__":
