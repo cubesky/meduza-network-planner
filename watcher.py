@@ -9,6 +9,7 @@ import threading
 import random
 import signal
 import re
+import socket
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -165,6 +166,11 @@ _cached_tproxy_targets: List[str] = []
 _clash_monitoring_lock = threading.Lock()
 _clash_last_healthy = 0.0
 _clash_monitoring_enabled = False
+
+# Plain TCP healthy port listener
+_healthy_lock = threading.Lock()
+_healthy_enabled = False
+_healthy_port: Optional[int] = None
 
 # Proxy IP extraction and ipset management
 _proxy_ips_lock = threading.Lock()
@@ -927,6 +933,11 @@ def reload_frr_smooth(conf_text: str) -> None:
 # Global state to track current NAT rules for removal
 _current_network_mappings: List[Tuple[str, str]] = []
 _network_mapping_lock = threading.Lock()
+_portforward_lock = threading.Lock()
+
+PORTFORWARD_PREROUTING_CHAIN = "CLASH_PORTFW_PREROUTING"
+PORTFORWARD_POSTROUTING_CHAIN = "CLASH_PORTFW_POSTROUTING"
+PORTFORWARD_FORWARD_CHAIN = "CLASH_PORTFW_FORWARD"
 
 
 def _apply_network_mapping_nat(
@@ -994,6 +1005,173 @@ def _remove_network_mapping_nat() -> None:
                 pass
 
         _current_network_mappings = []
+
+
+def _parse_portforward_specs(raw: str) -> List[Tuple[int, str, int]]:
+    out: List[Tuple[int, str, int]] = []
+    seen: Set[Tuple[int, str, int]] = set()
+    pattern = re.compile(r"^(?P<listen>\d+):(?P<target>\[[^\]]+\]|[^:]+):(?P<target_port>\d+)$")
+
+    for line in _split_ml(raw):
+        m = pattern.fullmatch(line.strip())
+        if not m:
+            print(f"[portforward] skipping invalid entry: {line!r}", flush=True)
+            continue
+
+        listen_raw = m.group("listen")
+        target_host = m.group("target").strip()
+        target_raw = m.group("target_port")
+        listen_port = _parse_tcp_port(listen_raw)
+        target_port = _parse_tcp_port(target_raw)
+
+        if listen_port is None or target_port is None:
+            print(f"[portforward] skipping invalid entry: {line!r}", flush=True)
+            continue
+
+        if target_host.startswith("[") and target_host.endswith("]"):
+            target_host = target_host[1:-1].strip()
+
+        if not target_host:
+            print(f"[portforward] skipping invalid target host: {line!r}", flush=True)
+            continue
+
+        if ":" not in target_host and not re.fullmatch(r"[A-Za-z0-9.-]+", target_host):
+            print(f"[portforward] skipping invalid target host: {line!r}", flush=True)
+            continue
+
+        spec = (listen_port, target_host, target_port)
+        if spec not in seen:
+            seen.add(spec)
+            out.append(spec)
+
+    return sorted(out)
+
+
+def _iptables(args: List[str]) -> None:
+    subprocess.run(["iptables", *args], check=True)
+
+
+def _sysctl_enable_ip_forward() -> None:
+    subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, stdout=subprocess.DEVNULL)
+
+
+def _ensure_iptables_chain(table: str, chain: str) -> None:
+    cp = subprocess.run(
+        ["iptables", "-t", table, "-L", chain],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if cp.returncode != 0:
+        _iptables(["-t", table, "-N", chain])
+
+
+def _ensure_iptables_jump(table: str, parent: str, rule: List[str]) -> None:
+    cp = subprocess.run(
+        ["iptables", "-t", table, "-C", parent, *rule],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if cp.returncode != 0:
+        _iptables(["-t", table, "-A", parent, *rule])
+
+
+def _safe_delete_iptables_jump(table: str, parent: str, rule: List[str]) -> None:
+    try:
+        _iptables(["-t", table, "-D", parent, *rule])
+    except Exception:
+        pass
+
+
+def _flush_delete_iptables_chain(table: str, chain: str) -> None:
+    try:
+        _iptables(["-t", table, "-F", chain])
+    except Exception:
+        pass
+    try:
+        _iptables(["-t", table, "-X", chain])
+    except Exception:
+        pass
+
+
+def _remove_portforward_rules_unlocked() -> None:
+    _safe_delete_iptables_jump(
+        "nat",
+        "PREROUTING",
+        ["-m", "addrtype", "--dst-type", "LOCAL", "-j", PORTFORWARD_PREROUTING_CHAIN],
+    )
+    _safe_delete_iptables_jump("nat", "POSTROUTING", ["-j", PORTFORWARD_POSTROUTING_CHAIN])
+    _safe_delete_iptables_jump("filter", "FORWARD", ["-j", PORTFORWARD_FORWARD_CHAIN])
+
+    _flush_delete_iptables_chain("nat", PORTFORWARD_PREROUTING_CHAIN)
+    _flush_delete_iptables_chain("nat", PORTFORWARD_POSTROUTING_CHAIN)
+    _flush_delete_iptables_chain("filter", PORTFORWARD_FORWARD_CHAIN)
+
+
+def _remove_portforward_rules() -> None:
+    with _portforward_lock:
+        _remove_portforward_rules_unlocked()
+
+
+def _apply_portforward_rules(specs: List[Tuple[int, str, int]]) -> None:
+    with _portforward_lock:
+        _remove_portforward_rules_unlocked()
+
+        if not specs:
+            print("[portforward] Removed all port forward rules", flush=True)
+            return
+
+        _sysctl_enable_ip_forward()
+        _ensure_iptables_chain("nat", PORTFORWARD_PREROUTING_CHAIN)
+        _ensure_iptables_chain("nat", PORTFORWARD_POSTROUTING_CHAIN)
+        _ensure_iptables_chain("filter", PORTFORWARD_FORWARD_CHAIN)
+
+        _ensure_iptables_jump(
+            "nat",
+            "PREROUTING",
+            ["-m", "addrtype", "--dst-type", "LOCAL", "-j", PORTFORWARD_PREROUTING_CHAIN],
+        )
+        _ensure_iptables_jump("nat", "POSTROUTING", ["-j", PORTFORWARD_POSTROUTING_CHAIN])
+        _ensure_iptables_jump("filter", "FORWARD", ["-j", PORTFORWARD_FORWARD_CHAIN])
+
+        for listen_port, target_host, target_port in specs:
+            for protocol in ("tcp", "udp"):
+                _iptables([
+                    "-t", "nat", "-A", PORTFORWARD_PREROUTING_CHAIN,
+                    "-p", protocol,
+                    "--dport", str(listen_port),
+                    "-j", "DNAT",
+                    "--to-destination", f"{target_host}:{target_port}",
+                ])
+                _iptables([
+                    "-t", "nat", "-A", PORTFORWARD_POSTROUTING_CHAIN,
+                    "-p", protocol,
+                    "-d", target_host,
+                    "--dport", str(target_port),
+                    "-m", "conntrack",
+                    "--ctstate", "DNAT",
+                    "--ctorigdstport", str(listen_port),
+                    "-j", "MASQUERADE",
+                ])
+                _iptables([
+                    "-A", PORTFORWARD_FORWARD_CHAIN,
+                    "-p", protocol,
+                    "-d", target_host,
+                    "--dport", str(target_port),
+                    "-m", "conntrack",
+                    "--ctstate", "NEW,ESTABLISHED,RELATED",
+                    "-j", "ACCEPT",
+                ])
+                _iptables([
+                    "-A", PORTFORWARD_FORWARD_CHAIN,
+                    "-p", protocol,
+                    "-s", target_host,
+                    "--sport", str(target_port),
+                    "-m", "conntrack",
+                    "--ctstate", "ESTABLISHED,RELATED",
+                    "-j", "ACCEPT",
+                ])
+
+        print(f"[portforward] Applied {len(specs)} port forward rule(s)", flush=True)
 
 
 # ---------- Clash ----------
@@ -1781,6 +1959,81 @@ def _parse_port(val: str) -> Optional[str]:
     return None
 
 
+def _parse_tcp_port(val: str) -> Optional[int]:
+    p = _parse_port(val)
+    if not p:
+        return None
+    try:
+        port = int(p)
+    except ValueError:
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def configure_healthy_listener(enabled: bool, port: Optional[int]) -> None:
+    global _healthy_enabled, _healthy_port
+    with _healthy_lock:
+        _healthy_enabled = enabled and port is not None
+        _healthy_port = port if enabled else None
+
+    if enabled and port is None:
+        print("[healthy] enabled but port is invalid or missing; listener disabled", flush=True)
+
+
+def healthy_port_loop() -> None:
+    listener: Optional[socket.socket] = None
+    active_port: Optional[int] = None
+
+    def close_listener() -> None:
+        nonlocal listener, active_port
+        if listener is not None:
+            try:
+                listener.close()
+            except Exception:
+                pass
+            if active_port is not None:
+                print(f"[healthy] TCP listener stopped on 0.0.0.0:{active_port}", flush=True)
+        listener = None
+        active_port = None
+
+    while True:
+        try:
+            with _healthy_lock:
+                enabled = _healthy_enabled
+                port = _healthy_port
+
+            if not enabled or port is None:
+                close_listener()
+                time.sleep(1)
+                continue
+
+            if listener is None or active_port != port:
+                close_listener()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("0.0.0.0", port))
+                sock.listen(128)
+                sock.settimeout(1.0)
+                listener = sock
+                active_port = port
+                print(f"[healthy] TCP listener started on 0.0.0.0:{port}", flush=True)
+
+            try:
+                conn, _addr = listener.accept()
+                conn.close()
+            except socket.timeout:
+                continue
+            except OSError:
+                close_listener()
+                time.sleep(1)
+        except Exception as e:
+            print(f"[healthy] listener error: {e}", flush=True)
+            close_listener()
+            time.sleep(5)
+
+
 _PORT_SPEC_RE = re.compile(r"^(?:(?:in|out):)?(?:(?:tcp|udp):)?\d+$")
 
 
@@ -2393,6 +2646,21 @@ def handle_commit() -> None:
         did_apply = True
     # ========== dnsmasq: START FIRST (priority) ==========
 
+    healthy_enabled = node.get(f"/nodes/{NODE_ID}/healthy/enable", "false") == "true"
+    healthy_port = _parse_tcp_port(node.get(f"/nodes/{NODE_ID}/healthy/port", ""))
+    healthy_material = {
+        "enabled": healthy_enabled,
+        "port": healthy_port,
+    }
+    if changed("healthy", healthy_material):
+        configure_healthy_listener(healthy_enabled, healthy_port)
+        did_apply = True
+
+    portforward_specs = _parse_portforward_specs(node.get(f"/nodes/{NODE_ID}/portforward", ""))
+    if changed("portforward", portforward_specs):
+        _apply_portforward_rules(portforward_specs)
+        did_apply = True
+
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
     if mesh_type == "tinc":
         _supervisor_stop("easytier")
@@ -2705,6 +2973,7 @@ def main() -> None:
     threading.Thread(target=supervisor_retry_loop, daemon=True).start()
     threading.Thread(target=clash_refresh_loop, daemon=True).start()
     threading.Thread(target=clash_crash_monitor_loop, daemon=True).start()
+    threading.Thread(target=healthy_port_loop, daemon=True).start()
     threading.Thread(target=clash_proxy_ips_monitor_loop, daemon=True).start()
     threading.Thread(target=tproxy_check_loop, daemon=True).start()
     threading.Thread(target=periodic_reconcile_loop, daemon=True).start()

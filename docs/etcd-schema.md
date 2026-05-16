@@ -69,6 +69,48 @@ ENV:
 - `UPDATE_TTL_SECONDS` (optional, default `60`)
 
 
+## Healthy TCP Port
+
+Expose a plain TCP port for health probes such as `tcping`. This listener is not HTTP-based:
+it only accepts TCP connections and closes them immediately.
+
+```
+/nodes/<NODE_ID>/healthy/enable = "true" | "false"
+/nodes/<NODE_ID>/healthy/port   = "<tcp port>"
+```
+
+Notes:
+- The listener binds to `0.0.0.0:<port>`.
+- When `enable=true` but `port` is missing or invalid, the listener stays disabled.
+- This is independent of Mihomo API health checks.
+
+
+## Port Forward
+
+Expose node-level TCP and UDP port forwarding with source NAT.
+
+```
+/nodes/<NODE_ID>/portforward = "<listenport>:<targethost>:<targetport>"
+```
+
+Multiple rules are supported as newline-separated entries:
+
+```text
+/nodes/gateway1/portforward = "80:192.168.1.10:80\n443:host.example.com:443\n51820:[2001:db8::10]:51820"
+```
+
+Behavior:
+- Each rule forwards both TCP and UDP on `<listenport>`.
+- DNAT is applied in `PREROUTING` for traffic addressed to the local node.
+- MASQUERADE is applied in `POSTROUTING` so return traffic comes back through this node.
+- `FORWARD` accept rules are installed for both directions.
+
+Notes:
+- `targethost` may be a local LAN host or any other reachable address/hostname reachable through normal routing, including BGP-learned routes.
+- Format is strictly `<listenport>:<targethost>:<targetport>`.
+- IPv6 literal addresses must be wrapped in `[]`, for example `51820:[2001:db8::10]:51820`.
+
+
 ## OpenVPN
 
 Schema (per instance):
