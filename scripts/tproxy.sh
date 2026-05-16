@@ -66,6 +66,16 @@ remove_rules() {
   ip route flush table ${TABLE} 2>/dev/null || true
 }
 
+is_valid_port_number() {
+  local port="${1:-}"
+  [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+is_valid_port_spec() {
+  local spec="${1:-}"
+  [[ "${spec}" =~ ^((in|out):)?((tcp|udp):)?[0-9]+$ ]]
+}
+
 apply_rules() {
   ensure_sysctl
   remove_rules
@@ -108,6 +118,11 @@ apply_rules() {
   #   - If PROTOCOL=udp, TCP-specific exclusions (tcp:22) are ignored
   #   - Unspecified protocol exclusions (22, in:80) apply to enabled protocols only
   for port_spec in "${EXCLUDE_PORTS_ARR[@]}"; do
+    if ! is_valid_port_spec "${port_spec}"; then
+      echo "[tproxy] skipping invalid EXCLUDE_PORTS entry: ${port_spec}" >&2
+      continue
+    fi
+
     # Parse direction and protocol
     local direction=""
     local protocol=""
@@ -137,6 +152,11 @@ apply_rules() {
         protocol="${prefix}"
         port="${rest}"
       fi
+    fi
+
+    if ! is_valid_port_number "${port}"; then
+      echo "[tproxy] skipping invalid EXCLUDE_PORTS port: ${port_spec}" >&2
+      continue
     fi
 
     # Skip if protocol is specified but doesn't match PROTOCOL setting

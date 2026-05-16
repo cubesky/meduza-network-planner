@@ -8,6 +8,7 @@ import shutil
 import threading
 import random
 import signal
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -1706,9 +1707,22 @@ def _parse_port(val: str) -> Optional[str]:
     return None
 
 
+_PORT_SPEC_RE = re.compile(r"^(?:(?:in|out):)?(?:(?:tcp|udp):)?\d+$")
+
+
+def _is_valid_port_spec(val: str) -> bool:
+    v = val.strip()
+    return bool(v) and _PORT_SPEC_RE.fullmatch(v) is not None
+
+
 def _clash_exclude_ports(node: Dict[str, str], global_cfg: Dict[str, str]) -> List[str]:
     raw = load_key(f"/nodes/{NODE_ID}/clash/exclude_tproxy_port")
-    ports = set(_split_ml(raw))
+    ports: Set[str] = set()
+    for item in _split_ml(raw):
+        if _is_valid_port_spec(item):
+            ports.add(item)
+        else:
+            print(f"[tproxy] skipping invalid exclude port spec: {item!r}", flush=True)
 
     mesh_type = global_cfg.get("/global/mesh_type", "easytier")
     if mesh_type == "tinc":
