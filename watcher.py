@@ -817,10 +817,11 @@ def clash_refresh_loop():
                     except Exception:
                         pass
                 # Apply new tproxy rules
-                tproxy_apply(
+                _apply_tproxy_with_verify(
                     out["tproxy_targets"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),
+                    [],
                     _clash_exclude_ports(node, global_cfg),
                     out.get("tproxy_protocol", "tcp+udp"),
                     out.get("use_conntrack", False),
@@ -886,7 +887,7 @@ def clash_crash_monitor_loop():
                         tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
                         use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
 
-                        tproxy_apply(
+                        _apply_tproxy_with_verify(
                             proxy_dst,
                             _clash_exclude_src(node),
                             _clash_exclude_ifaces(node),
@@ -2179,6 +2180,9 @@ def tproxy_apply(
         protocol: Protocol to proxy - "tcp", "udp", or "tcp+udp" (default)
         use_conntrack: Use conntrack to match connection original source (default: False)
     """
+    if isinstance(exclude_ports, str):
+        raise TypeError(f"exclude_ports must be a list of strings, got str: {exclude_ports!r}")
+
     run(
         f"PROXY_CIDRS='{ ' '.join(proxy_dst) }' "
         f"EXCLUDE_SRC_CIDRS='{ ' '.join(exclude_src) }' "
@@ -2197,6 +2201,36 @@ def tproxy_remove() -> None:
     run(f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 /usr/local/bin/tproxy.sh remove")
 
 
+def _apply_tproxy_with_verify(
+    proxy_dst: List[str],
+    exclude_src: List[str],
+    exclude_ifaces: List[str],
+    exclude_ips: List[str],
+    exclude_ports: List[str],
+    protocol: str = "tcp+udp",
+    use_conntrack: bool = False,
+    retries: int = 3,
+    delay_seconds: float = 1.0,
+) -> None:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
+            if _check_tproxy_iptables(protocol):
+                if attempt > 1:
+                    print(f"[tproxy] iptables verified after retry {attempt}/{retries}", flush=True)
+                return
+            last_error = RuntimeError("tproxy verification failed after apply")
+            print(f"[tproxy] apply attempt {attempt}/{retries} incomplete, retrying...", flush=True)
+        except Exception as e:
+            last_error = e
+            print(f"[tproxy] apply attempt {attempt}/{retries} failed: {e}", flush=True)
+        if attempt < retries:
+            time.sleep(delay_seconds)
+    if last_error:
+        raise last_error
+
+
 def _get_cached_tproxy_targets() -> List[str]:
     """Get the cached tproxy target list."""
     return list(_cached_tproxy_targets)
@@ -2208,37 +2242,56 @@ def _set_cached_tproxy_targets(targets: List[str]) -> None:
     _cached_tproxy_targets = list(targets)
 
 
-def _check_tproxy_iptables() -> bool:
+def _check_tproxy_iptables(protocol: str = "tcp+udp") -> bool:
     """Check if tproxy iptables rules are correctly applied."""
     try:
-        # Check if CLASH_TPROXY chain exists in mangle table
         cp = subprocess.run(
-            ["iptables", "-t", "mangle", "-L", "CLASH_TPROXY"],
+            ["iptables", "-t", "mangle", "-S", "CLASH_TPROXY"],
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode != 0:
+            return False
+        chain_rules = cp.stdout
+
+        cp = subprocess.run(
+            ["iptables", "-t", "mangle", "-S", "PREROUTING"],
             capture_output=True,
             text=True,
         )
         if cp.returncode != 0:
             return False
 
-        # Check if PREROUTING chain jumps to CLASH_TPROXY
-        cp = subprocess.run(
-            ["iptables", "-t", "mangle", "-L", "PREROUTING"],
-            capture_output=True,
-            text=True,
-        )
-        if cp.returncode != 0:
+        if "-j CLASH_TPROXY" not in cp.stdout:
             return False
 
-        if "CLASH_TPROXY" not in cp.stdout:
+        if "-j TPROXY" not in chain_rules:
+            return False
+        if f"--on-port {TPROXY_PORT}" not in chain_rules:
+            return False
+        if protocol in ("tcp", "tcp+udp") and "-p tcp" not in chain_rules:
+            return False
+        if protocol in ("udp", "tcp+udp") and "-p udp" not in chain_rules:
             return False
 
-        # Check ip rule
         cp = subprocess.run(
             ["ip", "rule", "list"],
             capture_output=True,
             text=True,
         )
-        if "fwmark 0x1" not in cp.stdout:
+        if cp.returncode != 0:
+            return False
+        if "fwmark 0x1" not in cp.stdout or "lookup 100" not in cp.stdout:
+            return False
+
+        cp = subprocess.run(
+            ["ip", "route", "show", "table", "100"],
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode != 0:
+            return False
+        if "local 0.0.0.0/0 dev lo" not in cp.stdout:
             return False
 
         return True
@@ -2259,7 +2312,7 @@ def _fix_tproxy_iptables(
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
+        _apply_tproxy_with_verify(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -2277,9 +2330,6 @@ def tproxy_check_loop() -> None:
             if not enabled or not tproxy_enabled:
                 continue
 
-            if _check_tproxy_iptables():
-                continue
-
             # Rules are missing or incorrect, reapply them
             print(f"[tproxy-check] tproxy iptables rules missing or incorrect, fixing...", flush=True)
 
@@ -2287,9 +2337,10 @@ def tproxy_check_loop() -> None:
             node = load_prefix(f"/nodes/{NODE_ID}/")
             global_cfg = load_prefix("/global/")
 
-            # Get TPROXY settings
             tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
             use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
+            if _check_tproxy_iptables(tproxy_protocol):
+                continue
 
             # Reapply tproxy rules (using ipset, no individual IPs needed)
             _fix_tproxy_iptables(
@@ -2859,7 +2910,7 @@ def handle_commit() -> None:
                 print("[clash] Initializing proxy IP ipset...", flush=True)
                 _ensure_proxy_ipset()
 
-                tproxy_apply(
+                _apply_tproxy_with_verify(
                     out["tproxy_targets"],
                     _clash_exclude_src(node),
                     _clash_exclude_ifaces(node),

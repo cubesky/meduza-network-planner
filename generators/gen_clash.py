@@ -1,4 +1,6 @@
 import json
+import re
+import subprocess
 from typing import Any, Dict, List
 
 import requests
@@ -9,6 +11,7 @@ from common import read_input, write_output, node_lans
 TPROXY_PORT = 7893
 SOCKS_PORT = 7891
 HTTP_PORT = 7890
+_DNS_ENDPOINT_RE = re.compile(r"^(?:(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://)?(?P<host>\[[^\]]+\]|[^:]+?)(?::(?P<port>\d+))?$")
 
 
 def _node_lans_for_proxy(node: Dict[str, str], node_id: str) -> List[str]:
@@ -39,6 +42,79 @@ def _subscriptions(global_cfg: Dict[str, str]) -> Dict[str, str]:
     return subs
 
 
+def _local_ipv4_addrs() -> List[str]:
+    try:
+        cp = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return []
+
+    out: List[str] = []
+    for line in cp.stdout.splitlines():
+        parts = line.split()
+        if "inet" not in parts:
+            continue
+        idx = parts.index("inet")
+        if idx + 1 >= len(parts):
+            continue
+        cidr = parts[idx + 1]
+        ip = cidr.split("/", 1)[0].strip()
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _normalize_dns_server_entry(entry: Any, local_ips: List[str]) -> Any:
+    if not isinstance(entry, str):
+        return entry
+    m = _DNS_ENDPOINT_RE.fullmatch(entry.strip())
+    if not m:
+        return entry
+
+    scheme = m.group("scheme") or ""
+    host = m.group("host") or ""
+    port = m.group("port")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
+    if host not in local_ips:
+        return entry
+    if port not in (None, "", "53"):
+        return entry
+
+    prefix = f"{scheme}://" if scheme else ""
+    if port:
+        return f"{prefix}127.0.0.1:{port}"
+    return f"{prefix}127.0.0.1"
+
+
+def _normalize_dns_cfg(dns_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    local_ips = _local_ipv4_addrs()
+    if not local_ips:
+        return dns_cfg
+
+    for key in ("default-nameserver", "nameserver", "fallback", "proxy-server-nameserver"):
+        value = dns_cfg.get(key)
+        if isinstance(value, list):
+            dns_cfg[key] = [_normalize_dns_server_entry(v, local_ips) for v in value]
+
+    policy = dns_cfg.get("nameserver-policy")
+    if isinstance(policy, dict):
+        new_policy: Dict[str, Any] = {}
+        for key, value in policy.items():
+            if isinstance(value, list):
+                new_policy[key] = [_normalize_dns_server_entry(v, local_ips) for v in value]
+            else:
+                new_policy[key] = _normalize_dns_server_entry(value, local_ips)
+        dns_cfg["nameserver-policy"] = new_policy
+
+    return dns_cfg
+
+
 def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str]) -> Dict[str, Any]:
     base = yaml.safe_load(open("/clash/base.yaml", encoding="utf-8")) or {}
     mode = node.get(f"/nodes/{node_id}/clash/mode", "mixed")
@@ -67,6 +143,7 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
     if not isinstance(dns_cfg, dict):
         dns_cfg = {}
     dns_cfg["enhanced-mode"] = "redir-host"
+    dns_cfg = _normalize_dns_cfg(dns_cfg)
     merged["dns"] = dns_cfg
 
     merged["external-ui"] = "/etc/clash/ui"
