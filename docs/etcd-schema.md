@@ -426,6 +426,7 @@ Node-level behavior:
 /nodes/<NODE_ID>/clash/enable
 /nodes/<NODE_ID>/clash/mode                 # mixed | tproxy
 /nodes/<NODE_ID>/clash/active_subscription  # selects a name under /global/clash/subscriptions/
+/nodes/<NODE_ID>/clash/exclude_rfc1918      # "true" to bypass destination RFC1918 ranges in TPROXY
 /nodes/<NODE_ID>/clash/refresh/enable
 /nodes/<NODE_ID>/clash/refresh/interval_minutes
 ```

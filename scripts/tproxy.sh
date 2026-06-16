@@ -18,6 +18,7 @@ PROTOCOL="${PROTOCOL:-tcp+udp}"
 # Note: Proxy rules always use simple -s matching for reliability
 # Default: false
 USE_CONNTRACK="${USE_CONNTRACK:-false}"
+EXCLUDE_RFC1918="${EXCLUDE_RFC1918:-false}"
 
 # PROXY_CIDRS: space-separated CIDRs of source addresses to proxy
 # Only traffic FROM these sources will be proxied, everything else bypasses
@@ -47,6 +48,14 @@ if [[ -n "${EXCLUDE_PORTS:-}" ]]; then
 else
   EXCLUDE_PORTS_ARR=()
 fi
+
+# Always bypass RFC1918 destinations to avoid intercepting internal routing traffic
+# such as FRR-learned prefixes exchanged over OpenVPN/WireGuard.
+RFC1918_DST_ARR=(
+  "10.0.0.0/8"
+  "172.16.0.0/12"
+  "192.168.0.0/16"
+)
 
 ensure_sysctl() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -89,6 +98,13 @@ apply_rules() {
   for iface in "${EXCLUDE_IFACES_ARR[@]}"; do
     iptables -t mangle -A CLASH_TPROXY -i "${iface}" -j RETURN
   done
+
+  if [[ "${EXCLUDE_RFC1918}" == "true" ]]; then
+    # Exclude traffic destined to RFC1918 private ranges.
+    for cidr in "${RFC1918_DST_ARR[@]}"; do
+      iptables -t mangle -A CLASH_TPROXY -d "${cidr}" -j RETURN
+    done
+  fi
 
   # Exclude connections from specified source CIDRs (e.g., main gateway)
   # Method depends on USE_CONNTRACK setting

@@ -182,6 +182,7 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
 
     # Get conntrack usage setting (default: false for backward compatibility)
     use_conntrack = node.get(f"/nodes/{node_id}/clash/use_conntrack", "false") == "true"
+    exclude_rfc1918 = node.get(f"/nodes/{node_id}/clash/exclude_rfc1918", "false") == "true"
 
     return {
         "config_yaml": yaml.safe_dump(merged, sort_keys=False, allow_unicode=True),
@@ -189,6 +190,7 @@ def generate_clash(node_id: str, node: Dict[str, str], global_cfg: Dict[str, str
         "tproxy_targets": _node_lans_for_proxy(node, node_id),
         "tproxy_protocol": tproxy_protocol,
         "use_conntrack": use_conntrack,
+        "exclude_rfc1918": exclude_rfc1918,
         "refresh_enable": refresh_enable,
         "refresh_interval_minutes": interval,
         "api_controller": merged.get("external-controller", "0.0.0.0:9090"),

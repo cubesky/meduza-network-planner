@@ -825,6 +825,7 @@ def clash_refresh_loop():
                     _clash_exclude_ports(node, global_cfg),
                     out.get("tproxy_protocol", "tcp+udp"),
                     out.get("use_conntrack", False),
+                    out.get("exclude_rfc1918", False),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True
@@ -886,6 +887,7 @@ def clash_crash_monitor_loop():
                         # Get TPROXY settings
                         tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
                         use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
+                        exclude_rfc1918 = node.get(f"/nodes/{NODE_ID}/clash/exclude_rfc1918", "false") == "true"
 
                         _apply_tproxy_with_verify(
                             proxy_dst,
@@ -895,6 +897,7 @@ def clash_crash_monitor_loop():
                             _clash_exclude_ports(node, global_cfg),
                             tproxy_protocol,
                             use_conntrack,
+                            exclude_rfc1918,
                         )
                         print("[clash-monitor] TProxy reapplied successfully", flush=True)
 
@@ -2183,6 +2186,7 @@ def tproxy_apply(
     exclude_ports: List[str],
     protocol: str = "tcp+udp",
     use_conntrack: bool = False,
+    exclude_rfc1918: bool = False,
 ) -> None:
     """
     Apply TPROXY rules in include mode (only proxy specified destinations).
@@ -2195,6 +2199,7 @@ def tproxy_apply(
         exclude_ports: Ports to bypass proxy
         protocol: Protocol to proxy - "tcp", "udp", or "tcp+udp" (default)
         use_conntrack: Use conntrack to match connection original source (default: False)
+        exclude_rfc1918: Bypass destination RFC1918 prefixes before TPROXY (default: False)
     """
     if isinstance(exclude_ports, str):
         raise TypeError(f"exclude_ports must be a list of strings, got str: {exclude_ports!r}")
@@ -2208,6 +2213,7 @@ def tproxy_apply(
         f"PROXY_IPSET_NAME='{PROXY_IPSET_NAME}' "
         f"PROTOCOL='{protocol}' "
         f"USE_CONNTRACK='{ 'true' if use_conntrack else 'false' }' "
+        f"EXCLUDE_RFC1918='{ 'true' if exclude_rfc1918 else 'false' }' "
         f"TPROXY_PORT={TPROXY_PORT} MARK=0x1 TABLE=100 "
         f"/usr/local/bin/tproxy.sh apply"
     )
@@ -2225,13 +2231,23 @@ def _apply_tproxy_with_verify(
     exclude_ports: List[str],
     protocol: str = "tcp+udp",
     use_conntrack: bool = False,
+    exclude_rfc1918: bool = False,
     retries: int = 3,
     delay_seconds: float = 1.0,
 ) -> None:
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            tproxy_apply(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
+            tproxy_apply(
+                proxy_dst,
+                exclude_src,
+                exclude_ifaces,
+                exclude_ips,
+                exclude_ports,
+                protocol,
+                use_conntrack,
+                exclude_rfc1918,
+            )
             if _check_tproxy_iptables(protocol):
                 if attempt > 1:
                     print(f"[tproxy] iptables verified after retry {attempt}/{retries}", flush=True)
@@ -2324,11 +2340,21 @@ def _fix_tproxy_iptables(
     exclude_ports: List[str],
     protocol: str = "tcp+udp",
     use_conntrack: bool = False,
+    exclude_rfc1918: bool = False,
 ) -> None:
     """Fix tproxy iptables rules by reapplying them."""
     try:
         print(f"[tproxy-check] reapplying iptables rules", flush=True)
-        _apply_tproxy_with_verify(proxy_dst, exclude_src, exclude_ifaces, exclude_ips, exclude_ports, protocol, use_conntrack)
+        _apply_tproxy_with_verify(
+            proxy_dst,
+            exclude_src,
+            exclude_ifaces,
+            exclude_ips,
+            exclude_ports,
+            protocol,
+            use_conntrack,
+            exclude_rfc1918,
+        )
         print(f"[tproxy-check] iptables rules reapplied successfully", flush=True)
     except Exception as e:
         print(f"[tproxy-check] failed to reapply iptables: {e}", flush=True)
@@ -2355,6 +2381,7 @@ def tproxy_check_loop() -> None:
 
             tproxy_protocol = node.get(f"/nodes/{NODE_ID}/clash/tproxy_protocol", "tcp+udp")
             use_conntrack = node.get(f"/nodes/{NODE_ID}/clash/use_conntrack", "false") == "true"
+            exclude_rfc1918 = node.get(f"/nodes/{NODE_ID}/clash/exclude_rfc1918", "false") == "true"
             if _check_tproxy_iptables(tproxy_protocol):
                 continue
 
@@ -2367,6 +2394,7 @@ def tproxy_check_loop() -> None:
                 _clash_exclude_ports(node, global_cfg),
                 tproxy_protocol,
                 use_conntrack,
+                exclude_rfc1918,
             )
         except Exception as e:
             print(f"[tproxy-check] error: {e}", flush=True)
@@ -2934,6 +2962,7 @@ def handle_commit() -> None:
                     _clash_exclude_ports(node, global_cfg),
                     out.get("tproxy_protocol", "tcp+udp"),
                     out.get("use_conntrack", False),
+                    out.get("exclude_rfc1918", False),
                 )
                 _set_cached_tproxy_targets(out["tproxy_targets"])
                 tproxy_enabled = True

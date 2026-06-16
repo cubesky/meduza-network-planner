@@ -327,6 +327,7 @@ Network mapping provides 1:1 bidirectional address translation between two netwo
 /nodes/<NODE_ID>/clash/enable
 /nodes/<NODE_ID>/clash/mode                      # "mixed" | "tproxy"
 /nodes/<NODE_ID>/clash/active_subscription       # Selects subscription name
+/nodes/<NODE_ID>/clash/exclude_rfc1918           # "true" to bypass destination RFC1918 ranges in TPROXY
 /nodes/<NODE_ID>/clash/refresh/enable
 /nodes/<NODE_ID>/clash/refresh/interval_minutes
 /nodes/<NODE_ID>/clash/exclude_tproxy_port       # Ports to exclude from TPROXY
