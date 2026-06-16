@@ -123,6 +123,7 @@ The `watcher.py` is the central orchestrator:
 /nodes/<NODE_ID>/openvpn/<NAME>/proto           # tcp-server | tcp-client | udp
 /nodes/<NODE_ID>/openvpn/<NAME>/port
 /nodes/<NODE_ID>/openvpn/<NAME>/remote          # Newline-separated
+/nodes/<NODE_ID>/openvpn/<NAME>/pull            # "1" | "true" to emit `pull` + `route-nopull`
 /nodes/<NODE_ID>/openvpn/<NAME>/ifconfig        # "local remote"
 /nodes/<NODE_ID>/openvpn/<NAME>/keepalive       # "10 60"
 # ... plus standard OpenVPN directives

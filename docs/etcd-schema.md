@@ -207,6 +207,7 @@ Schema (per instance):
 /nodes/<NODE_ID>/openvpn/<NAME>/remote_cert_tls       # e.g. server
 /nodes/<NODE_ID>/openvpn/<NAME>/key_direction
 /nodes/<NODE_ID>/openvpn/<NAME>/client                # "1" to enable
+/nodes/<NODE_ID>/openvpn/<NAME>/pull                  # "1" | "true" to emit `pull` + `route-nopull`
 
 # Inline-only secrets (stored directly in etcd, not file paths):
 /nodes/<NODE_ID>/openvpn/<NAME>/secret

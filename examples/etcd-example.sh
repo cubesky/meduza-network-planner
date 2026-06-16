@@ -46,6 +46,7 @@ etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/dev tun0
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/proto tcp-client
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/port 1194
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/remote "vpn.example.com"
+etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/pull true
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/ifconfig "10.8.0.2 10.8.0.1"
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/keepalive "10 60"
 etcdctl put /nodes/${NODE_ID}/openvpn/ovpn-name/cipher AES-256-CBC

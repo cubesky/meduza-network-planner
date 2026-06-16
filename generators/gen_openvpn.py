@@ -42,6 +42,10 @@ def _maybe_line(lines: List[str], key: str, value: str) -> None:
     lines.append(f"{key} {value}")
 
 
+def _is_enabled(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def build_config(name: str, cfg: Dict[str, str]) -> Tuple[str, List[Dict[str, Any]]]:
     files: List[Dict[str, Any]] = []
     lines: List[str] = []
@@ -68,6 +72,9 @@ def build_config(name: str, cfg: Dict[str, str]) -> Tuple[str, List[Dict[str, An
 
     if cfg.get("client", "") == "1":
         lines.append("client")
+    if _is_enabled(cfg.get("pull", "")):
+        lines.append("pull")
+        lines.append("route-nopull")
     if cfg.get("tls_client", "") == "1":
         lines.append("tls-client")
     _maybe_line(lines, "remote-cert-tls", cfg.get("remote_cert_tls", ""))

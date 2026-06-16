@@ -1118,7 +1118,12 @@ def _parse_portforward_specs(raw: str) -> List[Tuple[int, str, int]]:
 
 
 def _iptables(args: List[str]) -> None:
-    subprocess.run(["iptables", *args], check=True)
+    subprocess.run(
+        ["iptables", *args],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _sysctl_enable_ip_forward() -> None:
@@ -1127,12 +1132,21 @@ def _sysctl_enable_ip_forward() -> None:
 
 def _ensure_iptables_chain(table: str, chain: str) -> None:
     cp = subprocess.run(
-        ["iptables", "-t", table, "-L", chain],
+        ["iptables", "-t", table, "-S", chain],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     if cp.returncode != 0:
         _iptables(["-t", table, "-N", chain])
+
+
+def _iptables_chain_exists(table: str, chain: str) -> bool:
+    cp = subprocess.run(
+        ["iptables", "-t", table, "-S", chain],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return cp.returncode == 0
 
 
 def _ensure_iptables_jump(table: str, parent: str, rule: List[str]) -> None:
@@ -1153,6 +1167,8 @@ def _safe_delete_iptables_jump(table: str, parent: str, rule: List[str]) -> None
 
 
 def _flush_delete_iptables_chain(table: str, chain: str) -> None:
+    if not _iptables_chain_exists(table, chain):
+        return
     try:
         _iptables(["-t", table, "-F", chain])
     except Exception:
