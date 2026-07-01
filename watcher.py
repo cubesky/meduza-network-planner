@@ -3116,6 +3116,23 @@ def _write_hosts_file(hosts: Dict[str, List[str]]) -> None:
     except Exception as e:
         print(f"[etcd_hosts] failed to write hosts file: {e}", flush=True)
 
+def _sighup_dnsmasq() -> bool:
+    cp = _supervisorctl(["signal", "HUP", "dnsmasq"])
+    return cp.returncode == 0
+
+
+def _reload_dnsmasq_hosts_if_running() -> None:
+    """Signal dnsmasq so addn-hosts changes are loaded."""
+    try:
+        if _supervisor_is_running("dnsmasq"):
+            if _sighup_dnsmasq():
+                print("[etcd_hosts] sent SIGHUP to dnsmasq to reload hosts file", flush=True)
+            else:
+                print("[etcd_hosts] failed to send SIGHUP to dnsmasq", flush=True)
+        else:
+            print("[etcd_hosts] dnsmasq not running; hosts file will load on next start", flush=True)
+    except Exception as e:
+        print(f"[etcd_hosts] failed to signal dnsmasq hosts reload: {e}", flush=True)
 
 _etcd_hosts_hash: str = ""
 
@@ -3132,6 +3149,7 @@ def update_etcd_hosts() -> None:
             _etcd_hosts_hash = current_hash
             total_ips = sum(len(ips) for ips in hosts.values())
             print(f"[etcd_hosts] updated: {len(hosts)} hostname(s), {total_ips} IP(s)", flush=True)
+            _reload_dnsmasq_hosts_if_running()
         else:
             total_ips = sum(len(ips) for ips in hosts.values())
             print(f"[etcd_hosts] no changes: {len(hosts)} hostname(s), {total_ips} IP(s)", flush=True)
