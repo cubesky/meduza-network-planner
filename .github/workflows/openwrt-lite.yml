@@ -91,9 +91,20 @@ jobs:
           fi
           curl --fail --show-error --location --retry 3 \
             --output "${DOWNLOAD_DIR}/sha256sums" "${base}/sha256sums"
-          expected="$(grep -E "  (\./)?${sdk_name}$" "${DOWNLOAD_DIR}/sha256sums" | head -n 1 | awk '{print $1}')"
-          test -n "${expected}"
-          echo "${expected}  ${sdk_archive}" | sha256sum --check --strict
+          expected="$(awk -v name="${sdk_name}" '
+            {
+              file=$2
+              if (substr(file, 1, 1) == "*") file=substr(file, 2)
+              if (substr(file, 1, 2) == "./") file=substr(file, 3)
+              if (file == name) { print $1; exit }
+            }
+          ' "${DOWNLOAD_DIR}/sha256sums")"
+          if [ -z "${expected}" ]; then
+            echo "SDK checksum entry not found: ${sdk_name}" >&2
+            grep -F "${sdk_name}" "${DOWNLOAD_DIR}/sha256sums" >&2 || true
+            exit 1
+          fi
+          printf '%s  %s\n' "${expected}" "${sdk_archive}" | sha256sum --check
 
           rm -rf openwrt-sdk
           mkdir openwrt-sdk
