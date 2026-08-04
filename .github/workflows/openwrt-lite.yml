@@ -1,0 +1,164 @@
+name: build-openwrt-lite
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+    paths:
+      - "alternative/openwrt-lite/**"
+      - ".github/workflows/openwrt-lite.yml"
+  pull_request:
+    paths:
+      - "alternative/openwrt-lite/**"
+      - ".github/workflows/openwrt-lite.yml"
+  workflow_dispatch:
+    inputs:
+      openwrt_release:
+        description: OpenWrt release
+        required: true
+        default: "25.12.2"
+        type: string
+      target:
+        description: OpenWrt target
+        required: true
+        default: x86
+        type: string
+      subtarget:
+        description: OpenWrt subtarget
+        required: true
+        default: "64"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-lite-${{ github.ref }}-${{ inputs.openwrt_release || '25.12.2' }}-${{ inputs.target || 'x86' }}-${{ inputs.subtarget || '64' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: OpenWrt ${{ inputs.openwrt_release || '25.12.2' }} ${{ inputs.target || 'x86' }}/${{ inputs.subtarget || '64' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      OPENWRT_RELEASE: ${{ inputs.openwrt_release || '25.12.2' }}
+      OPENWRT_TARGET: ${{ inputs.target || 'x86' }}
+      OPENWRT_SUBTARGET: ${{ inputs.subtarget || '64' }}
+      DOWNLOAD_DIR: ${{ github.workspace }}/.openwrt-downloads
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install SDK host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext \
+            git libncurses-dev libssl-dev python3 python3-setuptools rsync \
+            unzip zlib1g-dev file wget curl jq zstd
+
+      - name: Cache OpenWrt SDK archive and downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            .openwrt-downloads
+            openwrt-sdk/dl
+          key: openwrt-sdk-${{ env.OPENWRT_RELEASE }}-${{ env.OPENWRT_TARGET }}-${{ env.OPENWRT_SUBTARGET }}-${{ runner.os }}
+
+      - name: Download and verify OpenWrt SDK
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+          mkdir -p "${DOWNLOAD_DIR}"
+
+          sdk_name="$(curl --fail --silent --show-error --location "${base}/" \
+            | grep -oE 'openwrt-sdk-[^" ]+\.tar\.(zst|xz)' \
+            | sort -u \
+            | head -n 1)"
+          test -n "${sdk_name}"
+          sdk_archive="${DOWNLOAD_DIR}/${sdk_name}"
+
+          if [ ! -s "${sdk_archive}" ]; then
+            curl --fail --show-error --location --retry 3 \
+              --output "${sdk_archive}" "${base}/${sdk_name}"
+          fi
+          curl --fail --show-error --location --retry 3 \
+            --output "${DOWNLOAD_DIR}/sha256sums" "${base}/sha256sums"
+          expected="$(grep -E "  (\./)?${sdk_name}$" "${DOWNLOAD_DIR}/sha256sums" | head -n 1 | awk '{print $1}')"
+          test -n "${expected}"
+          echo "${expected}  ${sdk_archive}" | sha256sum --check --strict
+
+          rm -rf openwrt-sdk
+          mkdir openwrt-sdk
+          tar --extract --file "${sdk_archive}" --directory openwrt-sdk --strip-components=1
+          echo "sdk_name=${sdk_name}" >>"${GITHUB_OUTPUT}"
+
+      - name: Install feeds and Meduza package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt-sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          rm -rf package/meduza-openwrt-lite
+          cp -a ../alternative/openwrt-lite package/meduza-openwrt-lite
+          printf '%s\n' 'CONFIG_PACKAGE_meduza-openwrt-lite=m' >.config
+          make defconfig
+
+      - name: Compile package
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build-artifact
+          make -C openwrt-sdk package/meduza-openwrt-lite/compile \
+            -j"$(nproc)" V=s 2>&1 | tee build-artifact/build.log
+
+      - name: Collect packages and indexes
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-artifact/packages build-artifact/indexes
+
+          find openwrt-sdk/bin -type f \
+            \( -name 'meduza-openwrt-lite_*.ipk' -o -name 'meduza-openwrt-lite-*.apk' \) \
+            -exec cp -v {} build-artifact/packages/ \;
+          test -n "$(find build-artifact/packages -type f -print -quit)"
+
+          find openwrt-sdk/bin -type f \
+            \( -name 'Packages' -o -name 'Packages.gz' -o -name 'Packages.manifest' \
+               -o -name 'Packages.sig' -o -name 'packages.adb' \) \
+            -exec cp --parents {} build-artifact/indexes/ \;
+
+          printf '%s\n' \
+            "OpenWrt release: ${OPENWRT_RELEASE}" \
+            "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}" \
+            "SDK: ${{ steps.sdk.outputs.sdk_name }}" \
+            "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
+          cd build-artifact
+          find packages indexes -type f -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
+
+      - name: Upload OpenWrt package artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-lite-${{ env.OPENWRT_RELEASE }}-${{ env.OPENWRT_TARGET }}-${{ env.OPENWRT_SUBTARGET }}
+          path: build-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload failed build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-lite-build-log-${{ env.OPENWRT_RELEASE }}-${{ env.OPENWRT_TARGET }}-${{ env.OPENWRT_SUBTARGET }}
+          path: build-artifact/build.log
+          if-no-files-found: warn
+          retention-days: 14

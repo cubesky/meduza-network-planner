@@ -1,0 +1,11 @@
+{
+  "luci-app-meduza": {
+    "description": "Manage Meduza OpenWrt Lite",
+    "read": {
+      "uci": [ "meduza", "firewall" ]
+    },
+    "write": {
+      "uci": [ "meduza" ]
+    }
+  }
+}

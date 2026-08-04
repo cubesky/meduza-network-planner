@@ -1,0 +1,86 @@
+#!/bin/sh
+set -eu
+
+. /lib/functions.sh
+. /usr/libexec/meduza/meduza-lib.sh
+
+managed_sections() {
+	uci -q show network | sed -n "s/^network\.\([^.=]*\)\.meduza='1'$/\1/p"
+}
+
+zone_sections() {
+	uci -q show firewall | sed -n "s/^firewall\.\([^.=]*\)=zone$/\1/p"
+}
+
+remove_from_all_zones() {
+	local iface=$1 section
+	for section in $(zone_sections); do
+		uci -q del_list "firewall.$section.network=$iface" || true
+	done
+}
+
+ensure_interface() {
+	local logical=$1 device=$2
+	uci -q set "network.$logical=interface"
+	uci -q set "network.$logical.proto=none"
+	uci -q set "network.$logical.device=$device"
+	uci -q set "network.$logical.auto=1"
+	uci -q set "network.$logical.meduza=1"
+}
+
+find_zone() {
+	local wanted=$1 section name
+	for section in $(zone_sections); do
+		name=$(uci -q get "firewall.$section.name" || true)
+		[ "$name" = "$wanted" ] && { printf '%s' "$section"; return 0; }
+	done
+	return 1
+}
+
+main() {
+	local desired='' existing section name uci_name logical dev zone zone_section
+	load_settings
+	config_get zone main VPN_FIREWALL_ZONE
+
+	for name in $(cat "$MEDUZA_STATE/openvpn.instances" 2>/dev/null || true); do
+		uci_name=$(printf '%s' "$name" | tr - _)
+		logical="ovpn_$uci_name"
+		case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
+		dev=$(sed -n 's/^dev[[:space:]]\+//p' "/etc/openvpn/meduza-$name.conf" | head -n1)
+		[ -n "$dev" ] || continue
+		ensure_interface "$logical" "$dev"
+		desired="$desired $logical"
+	done
+
+	for name in $(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true); do
+		uci_name=$(printf '%s' "$name" | tr - _)
+		logical="wg_$uci_name"
+		case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
+		dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true)
+		[ -n "$dev" ] || continue
+		ensure_interface "$logical" "$dev"
+		desired="$desired $logical"
+	done
+
+	# Remove stale Meduza interfaces and all old zone memberships. User-owned
+	# network interfaces are never selected because they do not carry meduza=1.
+	existing=$(managed_sections)
+	for section in $existing; do
+		remove_from_all_zones "$section"
+		case " $desired " in *" $section "*) :;; *) uci -q delete "network.$section" || true;; esac
+	done
+	for logical in $desired; do remove_from_all_zones "$logical"; done
+
+	if [ -n "$zone" ] && [ -n "$desired" ]; then
+		zone_section=$(find_zone "$zone") || { log "VPN_FIREWALL_ZONE does not exist: $zone"; return 1; }
+		for logical in $desired; do uci -q add_list "firewall.$zone_section.network=$logical"; done
+	fi
+
+	uci commit network
+	uci commit firewall
+	ubus call network reload >/dev/null
+	/etc/init.d/firewall reload >/dev/null
+	log "OpenWrt VPN interfaces synchronized; firewall zone=${zone:-none}"
+}
+
+main "$@"

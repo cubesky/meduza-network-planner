@@ -1,0 +1,14 @@
+{
+  "admin/services/meduza": {
+    "title": "Meduza",
+    "order": 70,
+    "action": {
+      "type": "view",
+      "path": "meduza/settings"
+    },
+    "depends": {
+      "acl": [ "luci-app-meduza" ],
+      "uci": { "meduza": true }
+    }
+  }
+}
