@@ -12,10 +12,57 @@ on:
 permissions:
   contents: read
   packages: write
+  pull-requests: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      affected: ${{ steps.decide.outputs.affected }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect container-related changes
+        id: filter
+        if: ${{ github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            affected:
+              - 'Dockerfile'
+              - 'compose.yml'
+              - 'entrypoint.sh'
+              - 'supervisord.conf'
+              - 'watcher.py'
+              - 'generators/**'
+              - 'scripts/**'
+              - 'frr/**'
+              - 'clash/**'
+              - 'avahi/**'
+              - '.github/workflows/build.yml'
+
+      - name: Decide whether to build containers
+        id: decide
+        shell: bash
+        env:
+          FILTER_RESULT: ${{ steps.filter.outputs.affected }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" || "${GITHUB_REF}" == refs/tags/* ]]; then
+            affected=true
+          else
+            affected="${FILTER_RESULT:-false}"
+          fi
+          echo "affected=${affected}" >>"${GITHUB_OUTPUT}"
+          if [[ "${affected}" != "true" ]]; then
+            echo "Container build skipped: no container-related files changed."
+          fi
+
   build-amd64:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.affected == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +119,8 @@ jobs:
   build-arm64:
     runs-on: ubuntu-latest
     # Note: Update this to use self-hosted arm64 runner, e.g.:
+    needs: changes
+    if: ${{ needs.changes.outputs.affected == 'true' }}
     # runs-on: [self-hosted, linux, arm64]
     # or use actuated.dev for arm64 runners
     # For now, this will use qemu emulation (not native)
