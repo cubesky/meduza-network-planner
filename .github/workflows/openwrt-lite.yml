@@ -159,13 +159,11 @@ jobs:
           ln -s "${DOWNLOAD_DIR}/dl" openwrt-sdk/dl
           echo "sdk_name=${sdk_name}" >>"${GITHUB_OUTPUT}"
 
-      - name: Install feeds and Meduza package
+      - name: Install Meduza package definition
         shell: bash
         run: |
           set -euo pipefail
           cd openwrt-sdk
-          ./scripts/feeds update packages luci routing
-          ./scripts/feeds install jq procps-ng openvpn tinc luci-base frr
           rm -rf package/meduza-openwrt-lite
           cp -a ../alternative/openwrt-lite package/meduza-openwrt-lite
           printf '%s\n' 'CONFIG_PACKAGE_meduza-openwrt-lite=m' >.config

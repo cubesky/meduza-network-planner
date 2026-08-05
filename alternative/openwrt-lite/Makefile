@@ -11,7 +11,9 @@ define Package/meduza-openwrt-lite
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Lightweight Meduza etcd reconciler for OpenWrt
-  DEPENDS:=+ca-bundle +curl +jq +procps-ng-pgrep +frr +frr-vtysh +openvpn-openssl +tinc +wireguard-tools +kmod-wireguard +luci-base
+  EXTRA_DEPENDS:=ca-bundle (>=0), curl (>=0), jq (>=0), \
+    procps-ng-pgrep (>=0), frr (>=0), frr-vtysh (>=0), openvpn-openssl (>=0), \
+    tinc (>=0), wireguard-tools (>=0), kmod-wireguard (>=0), luci-base (>=0)
 endef
 
 define Package/meduza-openwrt-lite/description
