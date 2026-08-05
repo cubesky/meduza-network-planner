@@ -41,11 +41,20 @@ The `build-openwrt-lite` GitHub Actions workflow builds the package with the
 official OpenWrt SDK and uploads the package, repository indexes, checksums and
 build log as an artifact. Each build runs a two-entry matrix: OpenWrt 24.10
 produces legacy `.ipk`, while OpenWrt 25.12 produces `.apk`. A manual run accepts
-`ipk_release`, `apk_release`, `target` and `subtarget` inputs.
+`ipk_release` and `apk_release` inputs. The package is pure Shell/UCI/LuCI and
+is emitted with OpenWrt architecture `all` (the OpenWrt equivalent of
+`noarch`). A single x86/64 SDK is used only as the package-format toolchain; the
+resulting APK/IPK installs on ARM, ARM64, x86 and other OpenWrt architectures,
+so duplicate per-CPU builds are intentionally avoided.
 
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both
 packages, `SHA256SUMS` and release metadata. Pull requests build both formats
+
+Published package files use the same date/hash identity and explicitly expose
+their architecture-independent status:
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-noarch.ipk` and
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-noarch.apk`.
 but never publish a release.
 
 The workflow verifies the SDK against the target directory's official

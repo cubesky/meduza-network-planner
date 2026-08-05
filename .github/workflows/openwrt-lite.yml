@@ -20,23 +20,13 @@ on:
         required: true
         default: "25.12.2"
         type: string
-      target:
-        description: OpenWrt target
-        required: true
-        default: x86
-        type: string
-      subtarget:
-        description: OpenWrt subtarget
-        required: true
-        default: "64"
-        type: string
 
 permissions:
   contents: write
   pull-requests: read
 
 concurrency:
-  group: openwrt-lite-${{ github.ref }}-${{ inputs.target || 'x86' }}-${{ inputs.subtarget || '64' }}
+  group: openwrt-lite-${{ github.ref }}-noarch
   cancel-in-progress: true
 
 jobs:
@@ -76,7 +66,7 @@ jobs:
           fi
 
   build:
-    name: OpenWrt ${{ matrix.release }} ${{ matrix.package_format }} ${{ inputs.target || 'x86' }}/${{ inputs.subtarget || '64' }}
+    name: OpenWrt ${{ matrix.release }} ${{ matrix.package_format }} noarch
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: changes
@@ -91,8 +81,8 @@ jobs:
             release: ${{ inputs.apk_release || '25.12.2' }}
     env:
       OPENWRT_RELEASE: ${{ matrix.release }}
-      OPENWRT_TARGET: ${{ inputs.target || 'x86' }}
-      OPENWRT_SUBTARGET: ${{ inputs.subtarget || '64' }}
+      OPENWRT_TARGET: x86
+      OPENWRT_SUBTARGET: "64"
       PACKAGE_FORMAT: ${{ matrix.package_format }}
       DOWNLOAD_DIR: ${{ github.workspace }}/.openwrt-downloads
 
@@ -184,11 +174,17 @@ jobs:
           set -euo pipefail
           mkdir -p build-artifact/packages build-artifact/indexes
 
-          find openwrt-sdk/bin -type f \
-            \( -name 'meduza-openwrt-lite_*.ipk' -o -name 'meduza-openwrt-lite-*.apk' \) \
-            -exec cp -v {} build-artifact/packages/ \;
-          test -n "$(find build-artifact/packages -type f -print -quit)"
-          test -n "$(find build-artifact/packages -type f -name "*.${PACKAGE_FORMAT}" -print -quit)"
+          case "${PACKAGE_FORMAT}" in
+            ipk) source_pattern='meduza-openwrt-lite_*.ipk' ;;
+            apk) source_pattern='meduza-openwrt-lite-*.apk' ;;
+            *) echo "Unsupported package format: ${PACKAGE_FORMAT}" >&2; exit 1 ;;
+          esac
+          package_source="$(find openwrt-sdk/bin -type f -name "${source_pattern}" -print -quit)"
+          test -n "${package_source}"
+          release_date="$(date -u +%Y%m%d)"
+          short_hash="${GITHUB_SHA:0:7}"
+          package_filename="meduza-openwrt-lite-${release_date}-${short_hash}-noarch.${PACKAGE_FORMAT}"
+          cp -v "${package_source}" "build-artifact/packages/${package_filename}"
 
           find openwrt-sdk/bin -type f \
             \( -name 'Packages' -o -name 'Packages.gz' -o -name 'Packages.manifest' \
@@ -199,6 +195,8 @@ jobs:
             "OpenWrt release: ${OPENWRT_RELEASE}" \
             "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}" \
             "Package format: ${PACKAGE_FORMAT}" \
+            "Package architecture: all (noarch)" \
+            "Package file: ${package_filename}" \
             "SDK: ${{ steps.sdk.outputs.sdk_name }}" \
             "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
           cd build-artifact
@@ -208,7 +206,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: meduza-openwrt-lite-${{ env.OPENWRT_RELEASE }}-${{ env.OPENWRT_TARGET }}-${{ env.OPENWRT_SUBTARGET }}-${{ env.PACKAGE_FORMAT }}
+          name: meduza-openwrt-lite-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-noarch
           path: build-artifact/
           if-no-files-found: error
           retention-days: 30
@@ -217,7 +215,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: meduza-openwrt-lite-build-log-${{ env.OPENWRT_RELEASE }}-${{ env.OPENWRT_TARGET }}-${{ env.OPENWRT_SUBTARGET }}-${{ env.PACKAGE_FORMAT }}
+          name: meduza-openwrt-lite-build-log-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-noarch
           path: build-artifact/build.log
           if-no-files-found: warn
           retention-days: 14
@@ -231,7 +229,7 @@ jobs:
       - name: Download APK and IPK artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: meduza-openwrt-lite-*-${{ inputs.target || 'x86' }}-${{ inputs.subtarget || '64' }}-*
+          pattern: meduza-openwrt-lite-*-*-noarch
           path: release-assets
           merge-multiple: true
 
