@@ -260,6 +260,7 @@ jobs:
       - name: Create or update GitHub Release
         shell: bash
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
           RELEASE_NAME: ${{ steps.release_meta.outputs.name }}
