@@ -15,12 +15,6 @@ enabled() {
 safe_name() { printf '%s' "$1" | tr -cd 'A-Za-z0-9_-'; }
 lines() { printf '%s\n' "$1" | tr '\r' '\n' | sed '/^[[:space:]]*$/d'; }
 
-fetch_config() {
-	etcd_range "/nodes/$MEDUZA_NODE/" >"$NODE_JSON"
-	etcd_range /global/ >"$GLOBAL_JSON"
-	etcd_range /nodes/ >"$ALL_JSON"
-}
-
 render_tinc_host() {
 	local id=$1 name address port subnet pub ed
 	name=$(jget "/nodes/$id/tinc/name" "$ALL_JSON"); [ -n "$name" ] || name=$id
@@ -185,28 +179,19 @@ apply_frr() {
 }
 
 reconcile() {
-	fetch_config
 	apply_tinc
 	apply_openvpn
 	apply_wireguard
 	apply_frr
 	/usr/libexec/meduza/meduza-openwrt-sync
 	date +%s >"$MEDUZA_STATE/last-success"
-	etcd_put "/updated/$MEDUZA_NODE/last" "$(utc_now)"
 	log 'configuration reconciled'
 }
 
 main() {
 	load_settings
-	if [ "${1:-}" != --daemon ]; then reconcile; return; fi
-	local previous='' current
-	while :; do
-		current=$(etcd_get /commit 2>/dev/null || true)
-		if [ ! -f "$MEDUZA_STATE/initialized" ] || [ "$current" != "$previous" ]; then
-			if reconcile; then : >"$MEDUZA_STATE/initialized"; previous=$current; else log 'reconcile failed; will retry'; fi
-		fi
-		sleep "$MEDUZA_POLL"
-	done
+	[ "${1:-}" = --apply ] || { log 'generator must be invoked by meduza-agent.py'; return 2; }
+	reconcile
 }
 
 main "$@"

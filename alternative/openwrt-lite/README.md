@@ -11,8 +11,9 @@ etcd generator/reporter contract. It supports the existing `/global`,
 - multiple WireGuard interfaces;
 - online, service and tunnel status reporting.
 
-It deliberately uses OpenWrt's own packages and init system. There is no
-Python, supervisor, Docker, EasyTier, Clash, MosDNS, access VPN, NAT mapping or
+It deliberately uses OpenWrt's own packages and init system. A Python 3 agent
+handles etcd connectivity, while native shell helpers apply OpenWrt state.
+There is no supervisor, Docker, EasyTier, Clash, MosDNS, access VPN, NAT mapping or
 port-forward implementation in this lite variant.
 
 This package only supports the **routed side-gateway** deployment mode. The
@@ -41,7 +42,7 @@ The `build-openwrt-lite` GitHub Actions workflow builds the package with the
 official OpenWrt SDK and uploads the package, repository indexes, checksums and
 build log as an artifact. Each build runs a two-entry matrix: OpenWrt 24.10
 produces legacy `.ipk`, while OpenWrt 25.12 produces `.apk`. A manual run accepts
-`ipk_release` and `apk_release` inputs. The package is pure Shell/UCI/LuCI and
+`ipk_release` and `apk_release` inputs. The package contains architecture-independent Python, Shell, UCI and LuCI code and
 is emitted with OpenWrt architecture `all` (the OpenWrt equivalent of
 `noarch`). A single x86/64 SDK is used only as the package-format toolchain; the
 resulting APK/IPK installs on ARM, ARM64, x86 and other OpenWrt architectures,
@@ -60,9 +61,9 @@ but never publish a release.
 The workflow verifies the SDK against the target directory's official
 `sha256sums` file before extraction.
 
-The package directly depends on `tinc`, `frr`, `frr-vtysh`,
-`openvpn-openssl`, `wireguard-tools`, `kmod-wireguard`, `curl`, `jq` and the
-small `pgrep` utility used by the reporter.
+The package directly depends on `tinc`, `frr` (which provides `vtysh`),
+`openvpn-openssl`, `wireguard-tools`, `kmod-wireguard`, `python3`, `jq` and the
+small `pgrep` utility used by the Python agent.
 
 ## Configure
 
@@ -95,14 +96,15 @@ administrator's existing firewall configuration.
 
 Leave `ETCD_CA`, `ETCD_CERT` and `ETCD_KEY` empty when mutual TLS is not used.
 `ETCD_ENDPOINTS` accepts a comma-separated value for compatibility with the
-main project; the lite package uses the first endpoint. The generator polls `/commit`; it does
-not watch individual configuration keys. A changed commit triggers a complete,
-idempotent reconciliation.
+main project. The Python agent automatically fails over between all configured
+endpoints, refreshes expired authentication tokens, and retries failures with
+bounded exponential backoff. It polls `/commit` rather than watching individual
+configuration keys. A changed commit triggers a complete, idempotent reconciliation.
 
 For a one-shot diagnostic reconciliation run:
 
 ```sh
-/usr/libexec/meduza/meduza-generator
+/usr/bin/python3 /usr/libexec/meduza/meduza-agent.py
 logread -e meduza
 ```
 
