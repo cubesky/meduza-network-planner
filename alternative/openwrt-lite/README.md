@@ -59,7 +59,9 @@ their architecture-independent status:
 but never publish a release.
 
 The workflow verifies the SDK against the target directory's official
-`sha256sums` file before extraction.
+`sha256sums` file before extraction. It also verifies that IPK output uses the
+internal `all` architecture and that APK output uses OpenWrt's internal
+`noarch` architecture before uploading artifacts or publishing a release.
 
 The package directly depends on `tinc`, `frr` (which provides `vtysh`),
 `openvpn-openssl`, `wireguard-tools`, `kmod-wireguard`, `python3`, `jq` and the

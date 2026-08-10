@@ -175,12 +175,21 @@ jobs:
           mkdir -p build-artifact/packages build-artifact/indexes
 
           case "${PACKAGE_FORMAT}" in
-            ipk) source_pattern='meduza-openwrt-lite_*.ipk' ;;
+            ipk) source_pattern='meduza-openwrt-lite_*_all.ipk' ;;
             apk) source_pattern='meduza-openwrt-lite-*.apk' ;;
             *) echo "Unsupported package format: ${PACKAGE_FORMAT}" >&2; exit 1 ;;
           esac
           package_source="$(find openwrt-sdk/bin -type f -name "${source_pattern}" -print -quit)"
           test -n "${package_source}"
+
+          # A noarch filename is not sufficient: verify the architecture used
+          # by OpenWrt's package builder before publishing the package.
+          if [[ "${PACKAGE_FORMAT}" == "apk" ]]; then
+            grep -Eq -- '--info[[:space:]]+"?arch:noarch"?' build-artifact/build.log || {
+              echo "APK was not built with internal architecture noarch" >&2
+              exit 1
+            }
+          fi
           release_date="$(date -u +%Y%m%d)"
           short_hash="${GITHUB_SHA:0:7}"
           package_filename="meduza-openwrt-lite-${release_date}-${short_hash}-noarch.${PACKAGE_FORMAT}"
