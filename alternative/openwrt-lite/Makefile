@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=15
+PKG_RELEASE:=16
 
 MEDUZA_PKGARCH?=$(ARCH_PACKAGES)
 
@@ -14,7 +14,7 @@ define Package/meduza-openwrt-lite
   TITLE:=Lightweight Meduza etcd reconciler for OpenWrt
   PKGARCH:=all
   DEPENDS:=+python3 +python3-etcd3 +python3-grpcio +python3-protobuf \
-    +python3-six +python3-typing-extensions
+    +python3-six +python3-tenacity +python3-typing-extensions
 endef
 
 define Package/python3-etcd3
@@ -23,7 +23,8 @@ define Package/python3-etcd3
   SUBMENU:=Python
   TITLE:=Python etcd v3 client for Meduza
   PKGARCH:=all
-  DEPENDS:=+python3 +python3-grpcio +python3-protobuf +python3-six
+  DEPENDS:=+python3 +python3-grpcio +python3-protobuf +python3-six \
+    +python3-tenacity
 endef
 
 define Package/python3-grpcio
@@ -58,6 +59,15 @@ define Package/python3-typing-extensions
   CATEGORY:=Languages
   SUBMENU:=Python
   TITLE:=Backported Python typing extensions for Meduza
+  PKGARCH:=all
+  DEPENDS:=+python3
+endef
+
+define Package/python3-tenacity
+  SECTION:=lang
+  CATEGORY:=Languages
+  SUBMENU:=Python
+  TITLE:=Python retrying library for Meduza
   PKGARCH:=all
   DEPENDS:=+python3
 endef
@@ -114,9 +124,15 @@ define Package/python3-typing-extensions/install
 	$(CP) ./vendor/typing-extensions/. $(1)/usr/lib/meduza-python/
 endef
 
+define Package/python3-tenacity/install
+	$(INSTALL_DIR) $(1)/usr/lib/meduza-python
+	$(CP) ./vendor/tenacity/. $(1)/usr/lib/meduza-python/
+endef
+
 $(eval $(call BuildPackage,meduza-openwrt-lite))
 $(eval $(call BuildPackage,python3-etcd3))
 $(eval $(call BuildPackage,python3-grpcio))
 $(eval $(call BuildPackage,python3-protobuf))
 $(eval $(call BuildPackage,python3-six))
 $(eval $(call BuildPackage,python3-typing-extensions))
+$(eval $(call BuildPackage,python3-tenacity))

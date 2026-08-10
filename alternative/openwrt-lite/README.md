@@ -52,7 +52,7 @@ official OpenWrt SDK and uploads the package, repository indexes, checksums and
 build log as an artifact. The build matrix produces OpenWrt 24.10 `.ipk` and
 OpenWrt 25.12 `.apk` packages for ARM64 and x86-64. A manual run accepts
 `ipk_release` and `apk_release` inputs. The Python `etcd3`, `protobuf`, `six`,
-`typing-extensions` and native `grpcio` runtime are built as separate
+`tenacity`, `typing-extensions` and native `grpcio` runtime are built as separate
 `python3-*` packages, so installation never runs pip. The Meduza package uses
 normal package-manager dependencies to install them. ARM64 and x86-64 use
 grpcio's official musllinux wheels. Before
@@ -70,7 +70,7 @@ family, for example
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.apk` or
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-x86-64.apk`.
 Each architecture build publishes `meduza-openwrt-lite`, `python3-etcd3`,
-`python3-grpcio`, `python3-protobuf`, `python3-six`, and
+`python3-grpcio`, `python3-protobuf`, `python3-six`, `python3-tenacity`, and
 `python3-typing-extensions`. The display filename records the build's real CPU
 family. Pure Python and main packages are architecture-independent. OpenWrt
 24.10 IPK metadata for `python3-grpcio` uses `aarch64_generic` or `x86_64`.
