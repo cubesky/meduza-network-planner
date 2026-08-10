@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# OpenWrt's /lib/functions.sh references this package-install root without a
+# default. Define it before sourcing/calling the library when nounset is active.
+IPKG_INSTROOT=${IPKG_INSTROOT:-}
 . /lib/functions.sh
 . /usr/libexec/meduza/meduza-lib.sh
 

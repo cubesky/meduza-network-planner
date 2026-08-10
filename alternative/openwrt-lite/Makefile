@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=16
+PKG_RELEASE:=17
 
 MEDUZA_PKGARCH?=$(ARCH_PACKAGES)
 

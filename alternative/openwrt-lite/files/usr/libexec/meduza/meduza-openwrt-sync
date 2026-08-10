@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# OpenWrt's /lib/functions.sh assumes this variable exists. Runtime services
+# use an empty root; package installation may provide a non-empty value.
+IPKG_INSTROOT=${IPKG_INSTROOT:-}
 . /lib/functions.sh
 . /usr/libexec/meduza/meduza-lib.sh
 
