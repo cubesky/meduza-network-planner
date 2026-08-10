@@ -47,7 +47,10 @@ OpenWrt 25.12 `.apk` packages for ARMv7, ARM64 and x86-64. A manual run accepts
 so installation never runs pip and does not depend on unavailable OpenWrt feed
 packages. ARM64 and x86-64 use grpcio's official musllinux wheels; ARMv7 builds
 grpcio in an emulated Alpine ARM environment so the extension is linked for
-musl rather than copying an incompatible glibc wheel.
+musl rather than copying an incompatible glibc wheel. Before packaging, native
+wheel libraries are normalized from the Python wheel musl SONAME
+(`libc.musl-<arch>.so.1`) to OpenWrt's standard `libc.so`; this lets OpenWrt's
+dependency scanner and runtime linker resolve the normal libc package.
 
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both
