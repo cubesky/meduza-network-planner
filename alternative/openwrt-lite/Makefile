@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=7
+PKG_RELEASE:=8
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -10,7 +10,7 @@ define Package/meduza-openwrt-lite
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Lightweight Meduza etcd reconciler for OpenWrt
-  EXTRA_DEPENDS:=ca-bundle (>=0), python3 (>=0), jq (>=0), \
+  EXTRA_DEPENDS:=ca-bundle (>=0), python3 (>=0), jq (>=0), libstdcpp6 (>=0), \
     procps-ng-pgrep (>=0), frr (>=0), openvpn-openssl (>=0), \
     tinc (>=0), wireguard-tools (>=0), kmod-wireguard (>=0), luci-base (>=0)
 endef

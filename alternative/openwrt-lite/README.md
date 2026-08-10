@@ -51,6 +51,9 @@ musl rather than copying an incompatible glibc wheel. Before packaging, native
 wheel libraries are normalized from the Python wheel musl SONAME
 (`libc.musl-<arch>.so.1`) to OpenWrt's standard `libc.so`; this lets OpenWrt's
 dependency scanner and runtime linker resolve the normal libc package.
+The ARM build forces a grpcio source build and rejects `libc.so.6` or
+`libm.so.6` dependencies before invoking the OpenWrt SDK, preventing pip from
+silently selecting its incompatible prebuilt ARM glibc wheel.
 
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both

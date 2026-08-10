@@ -208,7 +208,8 @@ jobs:
               --volume "${PWD}/vendor-wheels:/wheels" \
               "python:${python_version}-alpine" sh -ec '
                 apk add --no-cache build-base linux-headers
-                python -m pip wheel --wheel-dir /wheels --no-deps grpcio==1.76.0
+                python -m pip wheel --wheel-dir /wheels --no-deps \
+                  --no-binary=grpcio grpcio==1.76.0
               '
           else
             python3 -m pip download --dest vendor-wheels --only-binary=:all: --no-deps \
@@ -258,6 +259,12 @@ jobs:
             if patchelf --print-needed "${shared_object}" \
               | grep -q '^libc\.musl-.*\.so\.1$'; then
               echo "Foreign musl libc SONAME remains in ${shared_object}" >&2
+              exit 1
+            fi
+            if patchelf --print-needed "${shared_object}" \
+              | grep -Eq '^(libc|libm)\.so\.6$'; then
+              echo "glibc-linked library is not valid on OpenWrt musl: ${shared_object}" >&2
+              patchelf --print-needed "${shared_object}" >&2
               exit 1
             fi
           done < <(find alternative/openwrt-lite/vendor -type f -name '*.so' -print0)
