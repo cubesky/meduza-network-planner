@@ -200,8 +200,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf alternative/openwrt-lite/vendor vendor-wheels
-          mkdir -p alternative/openwrt-lite/vendor vendor-wheels
+          rm -rf alternative/openwrt-lite/vendor vendor-wheels vendor-sources
+          mkdir -p alternative/openwrt-lite/vendor vendor-wheels vendor-sources
           if [[ "${PACKAGE_ARCH}" == "arm" ]]; then
             python_version="${PYTHON_ABI:0:1}.${PYTHON_ABI:1}"
             docker run --rm --platform linux/arm/v7 \
@@ -216,8 +216,21 @@ jobs:
               --python-version "${PYTHON_ABI}" --abi "cp${PYTHON_ABI}" \
               'grpcio==1.76.0'
           fi
+          # etcd3 0.12.0 is published as a source distribution only. It is
+          # pure Python; extract the module directly instead of invoking its
+          # unnecessary and slower PEP 517 wheel build environment.
+          curl --fail --show-error --location --retry 3 \
+            --output vendor-sources/etcd3-0.12.0.tar.gz \
+            'https://files.pythonhosted.org/packages/9c/eb/6d1ef4d6a3e8b74e45c502cbd3ea6c5c6c786d003829db9369c2530f5e3f/etcd3-0.12.0.tar.gz'
+          printf '%s  %s\n' \
+            '89a704cb389bf0a010a1fa050ce19342d23bf6371ebda1c21cfe8ff3ed488726' \
+            'vendor-sources/etcd3-0.12.0.tar.gz' | sha256sum --check
+          tar --extract --gzip --file vendor-sources/etcd3-0.12.0.tar.gz \
+            --directory vendor-sources
+          cp -a vendor-sources/etcd3-0.12.0/etcd3 \
+            alternative/openwrt-lite/vendor/
           python3 -m pip download --dest vendor-wheels --only-binary=:all: --no-deps \
-            'etcd3==0.12.0' 'protobuf==3.20.3' 'six==1.17.0' \
+            'protobuf==3.20.3' 'six==1.17.0' \
             'typing-extensions==4.15.0'
           python3 - <<'PY'
           import pathlib
