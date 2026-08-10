@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -178,6 +179,8 @@ def openvpn_state(name):
 
 
 def wireguard_state(name):
+    if shutil.which("wg") is None:
+        return "unavailable"
     try:
         with open(os.path.join(STATE, "wireguard.{}.dev".format(name)), encoding="utf-8") as handle:
             device = handle.read().strip()

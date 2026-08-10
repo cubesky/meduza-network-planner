@@ -1,8 +1,8 @@
 #!/bin/sh
-set -eu
+set -e
 
-# OpenWrt's /lib/functions.sh assumes this variable exists. Runtime services
-# use an empty root; package installation may provide a non-empty value.
+# OpenWrt's /lib/functions.sh intentionally uses unset CONFIG_* state variables,
+# so this script must not enable the shell's nounset mode.
 IPKG_INSTROOT=${IPKG_INSTROOT:-}
 . /lib/functions.sh
 . /usr/libexec/meduza/meduza-lib.sh
@@ -41,48 +41,65 @@ find_zone() {
 }
 
 main() {
-	local desired='' existing section name uci_name logical dev zone zone_section
+	local desired='' existing section name uci_name logical dev zone zone_section firewall_available=0
 	load_settings
 	config_get zone main VPN_FIREWALL_ZONE
+	[ -f /etc/config/firewall ] && firewall_available=1
 
-	for name in $(cat "$MEDUZA_STATE/openvpn.instances" 2>/dev/null || true); do
-		uci_name=$(printf '%s' "$name" | tr - _)
-		logical="ovpn_$uci_name"
-		case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
-		dev=$(sed -n 's/^dev[[:space:]]\+//p' "/etc/openvpn/meduza-$name.conf" | head -n1)
-		[ -n "$dev" ] || continue
-		ensure_interface "$logical" "$dev"
-		desired="$desired $logical"
-	done
+	if command -v openvpn >/dev/null 2>&1; then
+		for name in $(cat "$MEDUZA_STATE/openvpn.instances" 2>/dev/null || true); do
+			uci_name=$(printf '%s' "$name" | tr - _)
+			logical="ovpn_$uci_name"
+			case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
+			dev=$(sed -n 's/^dev[[:space:]]\+//p' "/etc/openvpn/meduza-$name.conf" | head -n1)
+			[ -n "$dev" ] || continue
+			ensure_interface "$logical" "$dev"
+			desired="$desired $logical"
+		done
+	fi
 
-	for name in $(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true); do
-		uci_name=$(printf '%s' "$name" | tr - _)
-		logical="wg_$uci_name"
-		case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
-		dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true)
-		[ -n "$dev" ] || continue
-		ensure_interface "$logical" "$dev"
-		desired="$desired $logical"
-	done
+	if command -v wg >/dev/null 2>&1; then
+		for name in $(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true); do
+			uci_name=$(printf '%s' "$name" | tr - _)
+			logical="wg_$uci_name"
+			case " $desired " in *" $logical "*) log "duplicate UCI VPN interface: $logical"; return 1;; esac
+			dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true)
+			[ -n "$dev" ] || continue
+			ensure_interface "$logical" "$dev"
+			desired="$desired $logical"
+		done
+	fi
 
 	# Remove stale Meduza interfaces and all old zone memberships. User-owned
 	# network interfaces are never selected because they do not carry meduza=1.
 	existing=$(managed_sections)
 	for section in $existing; do
-		remove_from_all_zones "$section"
+		[ "$firewall_available" = 0 ] || remove_from_all_zones "$section"
 		case " $desired " in *" $section "*) :;; *) uci -q delete "network.$section" || true;; esac
 	done
-	for logical in $desired; do remove_from_all_zones "$logical"; done
+	if [ "$firewall_available" = 1 ]; then
+		for logical in $desired; do remove_from_all_zones "$logical"; done
+	fi
 
-	if [ -n "$zone" ] && [ -n "$desired" ]; then
+	if [ "$firewall_available" = 1 ] && [ -n "$zone" ] && [ -n "$desired" ]; then
 		zone_section=$(find_zone "$zone") || { log "VPN_FIREWALL_ZONE does not exist: $zone"; return 1; }
 		for logical in $desired; do uci -q add_list "firewall.$zone_section.network=$logical"; done
+	elif [ "$firewall_available" = 0 ] && [ -n "$zone" ]; then
+		log 'firewall is not installed; VPN_FIREWALL_ZONE skipped'
 	fi
 
 	uci commit network
-	uci commit firewall
-	ubus call network reload >/dev/null
-	/etc/init.d/firewall reload >/dev/null
+	[ "$firewall_available" = 0 ] || uci commit firewall
+	if command -v ubus >/dev/null 2>&1; then
+		ubus call network reload >/dev/null || log 'network reload failed'
+	else
+		log 'ubus is not installed; network reload skipped'
+	fi
+	if [ "$firewall_available" = 1 ] && [ -x /etc/init.d/firewall ]; then
+		/etc/init.d/firewall reload >/dev/null || log 'firewall reload failed'
+	else
+		log 'firewall service is not installed; firewall reload skipped'
+	fi
 	log "OpenWrt VPN interfaces synchronized; firewall zone=${zone:-none}"
 }
 

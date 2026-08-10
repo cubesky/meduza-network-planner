@@ -1,8 +1,8 @@
 #!/bin/sh
-set -eu
+set -e
 
-# OpenWrt's /lib/functions.sh references this package-install root without a
-# default. Define it before sourcing/calling the library when nounset is active.
+# OpenWrt's /lib/functions.sh intentionally uses unset CONFIG_* state variables,
+# so this script must not enable the shell's nounset mode.
 IPKG_INSTROOT=${IPKG_INSTROOT:-}
 . /lib/functions.sh
 . /usr/libexec/meduza/meduza-lib.sh
@@ -17,6 +17,14 @@ enabled() {
 }
 safe_name() { printf '%s' "$1" | tr -cd 'A-Za-z0-9_-'; }
 lines() { printf '%s\n' "$1" | tr '\r' '\n' | sed '/^[[:space:]]*$/d'; }
+installed() { command -v "$1" >/dev/null 2>&1; }
+
+reload_or_restart() {
+	local service=$1
+	[ -x "/etc/init.d/$service" ] || return 0
+	"/etc/init.d/$service" reload >/dev/null 2>&1 || \
+		"/etc/init.d/$service" restart
+}
 
 render_tinc_host() {
 	local id=$1 name address port subnet pub ed
@@ -107,7 +115,7 @@ apply_openvpn() {
 	old=$(cat "$MEDUZA_STATE/openvpn.instances" 2>/dev/null || true)
 	for name in $old; do case " $names " in *" $name "*) :;; *) rm -f "/etc/openvpn/meduza-$name.conf" "/etc/openvpn/meduza-$name."*;; esac; done
 	printf '%s\n' "$names" >"$MEDUZA_STATE/openvpn.instances"
-	/etc/init.d/openvpn restart
+	reload_or_restart openvpn
 }
 
 apply_wireguard() {
@@ -178,14 +186,22 @@ apply_frr() {
 		fi
 		echo 'line vty'; echo '!'
 	} | atomic_write /etc/frr/frr.conf 640
-	/etc/init.d/frr restart
+	reload_or_restart frr
 }
 
 reconcile() {
-	apply_tinc
-	apply_openvpn
-	apply_wireguard
-	apply_frr
+	if installed tincd; then apply_tinc; else log 'tinc is not installed; skipping tinc'; fi
+	if installed openvpn && [ -x /etc/init.d/openvpn ]; then
+		apply_openvpn
+	else
+		log 'OpenVPN is not installed; skipping OpenVPN'
+	fi
+	if installed wg && installed ip; then
+		apply_wireguard
+	else
+		log 'WireGuard tools are not installed; skipping WireGuard'
+	fi
+	if [ -x /etc/init.d/frr ]; then apply_frr; else log 'FRR is not installed; skipping FRR'; fi
 	/usr/libexec/meduza/meduza-openwrt-sync
 	date +%s >"$MEDUZA_STATE/last-success"
 	log 'configuration reconciled'
