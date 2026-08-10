@@ -41,19 +41,14 @@ apk add --allow-untrusted meduza-openwrt-lite-*.apk
 The `build-openwrt-lite` GitHub Actions workflow builds the package with the
 official OpenWrt SDK and uploads the package, repository indexes, checksums and
 build log as an artifact. The build matrix produces OpenWrt 24.10 `.ipk` and
-OpenWrt 25.12 `.apk` packages for ARMv7, ARM64 and x86-64. A manual run accepts
+OpenWrt 25.12 `.apk` packages for ARM64 and x86-64. A manual run accepts
 `ipk_release` and `apk_release` inputs. The Python `etcd3`, `protobuf`, `six`,
 `typing-extensions` and native `grpcio` runtime are bundled into each package,
 so installation never runs pip and does not depend on unavailable OpenWrt feed
-packages. ARM64 and x86-64 use grpcio's official musllinux wheels; ARMv7 builds
-grpcio in an emulated Alpine ARM environment so the extension is linked for
-musl rather than copying an incompatible glibc wheel. Before packaging, native
-wheel libraries are normalized from the Python wheel musl SONAME
+packages. ARM64 and x86-64 use grpcio's official musllinux wheels. Before
+packaging, native wheel libraries are normalized from the Python wheel musl SONAME
 (`libc.musl-<arch>.so.1`) to OpenWrt's standard `libc.so`; this lets OpenWrt's
 dependency scanner and runtime linker resolve the normal libc package.
-The ARM build forces a grpcio source build and rejects `libc.so.6` or
-`libm.so.6` dependencies before invoking the OpenWrt SDK, preventing pip from
-silently selecting its incompatible prebuilt ARM glibc wheel.
 
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both
@@ -61,7 +56,7 @@ packages, `SHA256SUMS` and release metadata. Pull requests build both formats
 
 Published package files use the same date/hash identity and expose their CPU
 family, for example
-`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm.ipk` and
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.ipk` and
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.apk` or
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-x86-64.apk`.
 but never publish a release.
