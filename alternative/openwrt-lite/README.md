@@ -59,6 +59,9 @@ family, for example
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.ipk` and
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.apk` or
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-x86-64.apk`.
+The display filename uses `arm64`, while package metadata follows the package
+manager ABI: OpenWrt 24.10 IPK uses `aarch64_generic`, OpenWrt 25.12 APK uses
+`aarch64`, and x86-64 uses `x86_64` in both formats.
 but never publish a release.
 
 The workflow verifies the SDK against the target directory's official

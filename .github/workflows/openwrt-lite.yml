@@ -80,6 +80,7 @@ jobs:
             target: armsr
             subtarget: armv8
             package_arch: arm64
+            metadata_arch: aarch64_generic
             python_abi: "311"
             grpc_platform: musllinux_1_2_aarch64
           - package_format: ipk
@@ -87,6 +88,7 @@ jobs:
             target: x86
             subtarget: "64"
             package_arch: x86-64
+            metadata_arch: x86_64
             python_abi: "311"
             grpc_platform: musllinux_1_2_x86_64
           - package_format: apk
@@ -94,6 +96,7 @@ jobs:
             target: armsr
             subtarget: armv8
             package_arch: arm64
+            metadata_arch: aarch64
             python_abi: "313"
             grpc_platform: musllinux_1_2_aarch64
           - package_format: apk
@@ -101,6 +104,7 @@ jobs:
             target: x86
             subtarget: "64"
             package_arch: x86-64
+            metadata_arch: x86_64
             python_abi: "313"
             grpc_platform: musllinux_1_2_x86_64
     env:
@@ -108,6 +112,7 @@ jobs:
       OPENWRT_TARGET: ${{ matrix.target }}
       OPENWRT_SUBTARGET: ${{ matrix.subtarget }}
       PACKAGE_ARCH: ${{ matrix.package_arch }}
+      PACKAGE_METADATA_ARCH: ${{ matrix.metadata_arch }}
       PYTHON_ABI: ${{ matrix.python_abi }}
       GRPC_PLATFORM: ${{ matrix.grpc_platform }}
       PACKAGE_FORMAT: ${{ matrix.package_format }}
@@ -252,6 +257,7 @@ jobs:
           set -o pipefail
           mkdir -p build-artifact
           make -C openwrt-sdk package/meduza-openwrt-lite/compile \
+            MEDUZA_PKGARCH="${PACKAGE_METADATA_ARCH}" \
             -j"$(nproc)" V=s 2>&1 | tee build-artifact/build.log
 
       - name: Collect packages and indexes
@@ -276,8 +282,13 @@ jobs:
               echo "APK containing grpcio was incorrectly built as noarch" >&2
               exit 1
             fi
-          elif [[ "${package_source}" == *_all.ipk ]]; then
-            echo "IPK containing grpcio was incorrectly built as all" >&2
+            grep -Eq -- "--info[[:space:]]+\"?arch:${PACKAGE_METADATA_ARCH}\"?" \
+              build-artifact/build.log || {
+                echo "APK metadata architecture is not ${PACKAGE_METADATA_ARCH}" >&2
+                exit 1
+              }
+          elif [[ "${package_source}" != *_"${PACKAGE_METADATA_ARCH}".ipk ]]; then
+            echo "IPK metadata architecture is not ${PACKAGE_METADATA_ARCH}: ${package_source}" >&2
             exit 1
           fi
           release_date="$(date -u +%Y%m%d)"
@@ -295,6 +306,7 @@ jobs:
             "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}" \
             "Package format: ${PACKAGE_FORMAT}" \
             "Package architecture family: ${PACKAGE_ARCH}" \
+            "Package metadata architecture: ${PACKAGE_METADATA_ARCH}" \
             "Package file: ${package_filename}" \
             "SDK: ${{ steps.sdk.outputs.sdk_name }}" \
             "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
