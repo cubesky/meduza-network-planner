@@ -97,6 +97,10 @@ input/output/forward and masquerading policies remain entirely under the
 administrator's existing firewall configuration.
 
 Leave `ETCD_CA`, `ETCD_CERT` and `ETCD_KEY` empty when mutual TLS is not used.
+The Python agent accepts legacy private CA certificates that predate the strict
+X.509 `keyUsage` requirement while continuing to verify the certificate chain,
+validity period and endpoint hostname. Regenerating the CA with proper
+`basicConstraints` and `keyUsage = keyCertSign, cRLSign` remains recommended.
 `ETCD_ENDPOINTS` accepts a comma-separated value for compatibility with the
 main project. The Python agent automatically fails over between all configured
 endpoints, refreshes expired authentication tokens, and retries failures with

@@ -62,6 +62,13 @@ class EtcdClient:
         cert = uci_get("ETCD_CERT") or None
         key = uci_get("ETCD_KEY") or None
         self.context = ssl.create_default_context(cafile=ca)
+        # Python 3.13 enables VERIFY_X509_STRICT in create_default_context().
+        # Many existing etcd installations use an older private CA without a
+        # critical keyUsage extension. Keep normal chain, expiry and hostname
+        # verification, but accept those otherwise valid legacy CA files.
+        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict_flag:
+            self.context.verify_flags &= ~strict_flag
         if cert:
             self.context.load_cert_chain(cert, key)
 
