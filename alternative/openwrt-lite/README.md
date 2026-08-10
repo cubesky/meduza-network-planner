@@ -69,8 +69,15 @@ The workflow verifies the SDK against the target directory's official
 that is accidentally marked architecture-independent.
 
 The package directly depends on `tinc`, `frr` (which provides `vtysh`),
-`openvpn-openssl`, `wireguard-tools`, `kmod-wireguard`, `python3`, `jq` and the
-small `pgrep` utility used by the Python agent.
+`openvpn-openssl`, `wireguard-tools`, `python3`, `jq` and the small `pgrep`
+utility used by the Python agent.
+
+`kmod-wireguard` is intentionally not a package dependency. OpenWrt kernel
+modules are tied to the exact firmware kernel ABI, so a package built by a
+generic SDK cannot safely require a kernel module from another target or
+firmware build. The firmware must provide WireGuard kernel support itself (or
+install its matching `kmod-wireguard` from the firmware vendor's feed). Meduza
+detects missing support when it creates the WireGuard link.
 
 ## Configure
 

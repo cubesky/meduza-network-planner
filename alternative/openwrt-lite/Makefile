@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=11
+PKG_RELEASE:=12
 
 MEDUZA_PKGARCH?=$(ARCH_PACKAGES)
 
@@ -15,7 +15,7 @@ define Package/meduza-openwrt-lite
   PKGARCH:=$(MEDUZA_PKGARCH)
   EXTRA_DEPENDS:=ca-bundle (>=0), python3 (>=0), jq (>=0), libstdcpp6 (>=0), \
     procps-ng-pgrep (>=0), frr (>=0), openvpn-openssl (>=0), \
-    tinc (>=0), wireguard-tools (>=0), kmod-wireguard (>=0), luci-base (>=0)
+    tinc (>=0), wireguard-tools (>=0), luci-base (>=0)
 endef
 
 define Package/meduza-openwrt-lite/description
