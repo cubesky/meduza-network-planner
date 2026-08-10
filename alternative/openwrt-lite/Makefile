@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=5
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -10,7 +10,6 @@ define Package/meduza-openwrt-lite
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Lightweight Meduza etcd reconciler for OpenWrt
-  PKGARCH:=all
   EXTRA_DEPENDS:=ca-bundle (>=0), python3 (>=0), jq (>=0), \
     procps-ng-pgrep (>=0), frr (>=0), openvpn-openssl (>=0), \
     tinc (>=0), wireguard-tools (>=0), kmod-wireguard (>=0), luci-base (>=0)
@@ -31,6 +30,8 @@ endef
 
 define Package/meduza-openwrt-lite/install
 	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d $(1)/usr/libexec/meduza $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d $(1)/www/luci-static/resources/view/meduza
+	$(INSTALL_DIR) $(1)/usr/lib/meduza-python
+	$(CP) ./vendor/. $(1)/usr/lib/meduza-python/
 	$(INSTALL_CONF) ./files/etc/config/meduza $(1)/etc/config/meduza
 	$(INSTALL_BIN) ./files/etc/init.d/meduza $(1)/etc/init.d/meduza
 	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-lib.sh $(1)/usr/libexec/meduza/meduza-lib.sh

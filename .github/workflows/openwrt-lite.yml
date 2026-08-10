@@ -26,7 +26,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: openwrt-lite-${{ github.ref }}-noarch
+  group: openwrt-lite-${{ github.ref }}-native-grpc
   cancel-in-progress: true
 
 jobs:
@@ -66,9 +66,9 @@ jobs:
           fi
 
   build:
-    name: OpenWrt ${{ matrix.release }} ${{ matrix.package_format }} noarch
+    name: OpenWrt ${{ matrix.release }} ${{ matrix.package_format }} ${{ matrix.package_arch }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     needs: changes
     if: ${{ needs.changes.outputs.affected == 'true' }}
     strategy:
@@ -77,12 +77,53 @@ jobs:
         include:
           - package_format: ipk
             release: ${{ inputs.ipk_release || '24.10.0' }}
+            target: armsr
+            subtarget: armv7
+            package_arch: arm
+            python_abi: "311"
+            grpc_platform: linux_armv7l
+          - package_format: ipk
+            release: ${{ inputs.ipk_release || '24.10.0' }}
+            target: armsr
+            subtarget: armv8
+            package_arch: arm64
+            python_abi: "311"
+            grpc_platform: musllinux_1_2_aarch64
+          - package_format: ipk
+            release: ${{ inputs.ipk_release || '24.10.0' }}
+            target: x86
+            subtarget: "64"
+            package_arch: x86-64
+            python_abi: "311"
+            grpc_platform: musllinux_1_2_x86_64
           - package_format: apk
             release: ${{ inputs.apk_release || '25.12.2' }}
+            target: armsr
+            subtarget: armv7
+            package_arch: arm
+            python_abi: "313"
+            grpc_platform: linux_armv7l
+          - package_format: apk
+            release: ${{ inputs.apk_release || '25.12.2' }}
+            target: armsr
+            subtarget: armv8
+            package_arch: arm64
+            python_abi: "313"
+            grpc_platform: musllinux_1_2_aarch64
+          - package_format: apk
+            release: ${{ inputs.apk_release || '25.12.2' }}
+            target: x86
+            subtarget: "64"
+            package_arch: x86-64
+            python_abi: "313"
+            grpc_platform: musllinux_1_2_x86_64
     env:
       OPENWRT_RELEASE: ${{ matrix.release }}
-      OPENWRT_TARGET: x86
-      OPENWRT_SUBTARGET: "64"
+      OPENWRT_TARGET: ${{ matrix.target }}
+      OPENWRT_SUBTARGET: ${{ matrix.subtarget }}
+      PACKAGE_ARCH: ${{ matrix.package_arch }}
+      PYTHON_ABI: ${{ matrix.python_abi }}
+      GRPC_PLATFORM: ${{ matrix.grpc_platform }}
       PACKAGE_FORMAT: ${{ matrix.package_format }}
       DOWNLOAD_DIR: ${{ github.workspace }}/.openwrt-downloads
 
@@ -90,12 +131,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Enable ARM emulation for grpcio build
+        if: ${{ matrix.package_arch == 'arm' }}
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
       - name: Install SDK host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             build-essential clang flex bison g++ gawk gcc-multilib gettext \
-            git libncurses-dev libssl-dev python3 python3-setuptools rsync \
+            git libncurses-dev libssl-dev python3 python3-pip python3-setuptools rsync \
             unzip zlib1g-dev file wget curl jq zstd
 
       - name: Cache OpenWrt SDK archive and downloads
@@ -153,6 +200,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf alternative/openwrt-lite/vendor vendor-wheels
+          mkdir -p alternative/openwrt-lite/vendor vendor-wheels
+          if [[ "${PACKAGE_ARCH}" == "arm" ]]; then
+            python_version="${PYTHON_ABI:0:1}.${PYTHON_ABI:1}"
+            docker run --rm --platform linux/arm/v7 \
+              --volume "${PWD}/vendor-wheels:/wheels" \
+              "python:${python_version}-alpine" sh -ec '
+                apk add --no-cache build-base linux-headers
+                python -m pip wheel --wheel-dir /wheels --no-deps grpcio==1.76.0
+              '
+          else
+            python3 -m pip download --dest vendor-wheels --only-binary=:all: --no-deps \
+              --platform "${GRPC_PLATFORM}" --implementation cp \
+              --python-version "${PYTHON_ABI}" --abi "cp${PYTHON_ABI}" \
+              'grpcio==1.76.0'
+          fi
+          python3 -m pip download --dest vendor-wheels --only-binary=:all: --no-deps \
+            'etcd3==0.12.0' 'protobuf==3.20.3' 'six==1.17.0' \
+            'typing-extensions==4.15.0'
+          python3 - <<'PY'
+          import pathlib
+          import zipfile
+
+          destination = pathlib.Path('alternative/openwrt-lite/vendor')
+          for wheel in pathlib.Path('vendor-wheels').glob('*.whl'):
+              with zipfile.ZipFile(wheel) as archive:
+                  archive.extractall(destination)
+          cygrpc = list(destination.glob('grpc/_cython/cygrpc*.so'))
+          if len(cygrpc) != 1:
+              raise SystemExit(f'expected one bundled cygrpc extension, found: {cygrpc}')
+          print(f'bundled native gRPC extension: {cygrpc[0]}')
+          PY
           cd openwrt-sdk
           rm -rf package/meduza-openwrt-lite
           cp -a ../alternative/openwrt-lite package/meduza-openwrt-lite
@@ -175,24 +254,27 @@ jobs:
           mkdir -p build-artifact/packages build-artifact/indexes
 
           case "${PACKAGE_FORMAT}" in
-            ipk) source_pattern='meduza-openwrt-lite_*_all.ipk' ;;
+            ipk) source_pattern='meduza-openwrt-lite_*.ipk' ;;
             apk) source_pattern='meduza-openwrt-lite-*.apk' ;;
             *) echo "Unsupported package format: ${PACKAGE_FORMAT}" >&2; exit 1 ;;
           esac
           package_source="$(find openwrt-sdk/bin -type f -name "${source_pattern}" -print -quit)"
           test -n "${package_source}"
 
-          # A noarch filename is not sufficient: verify the architecture used
-          # by OpenWrt's package builder before publishing the package.
+          # grpcio contains a native _cygrpc extension; publishing this package
+          # as noarch would make apk/opkg accept it on incompatible CPUs.
           if [[ "${PACKAGE_FORMAT}" == "apk" ]]; then
-            grep -Eq -- '--info[[:space:]]+"?arch:noarch"?' build-artifact/build.log || {
-              echo "APK was not built with internal architecture noarch" >&2
+            if grep -Eq -- '--info[[:space:]]+"?arch:noarch"?' build-artifact/build.log; then
+              echo "APK containing grpcio was incorrectly built as noarch" >&2
               exit 1
-            }
+            fi
+          elif [[ "${package_source}" == *_all.ipk ]]; then
+            echo "IPK containing grpcio was incorrectly built as all" >&2
+            exit 1
           fi
           release_date="$(date -u +%Y%m%d)"
           short_hash="${GITHUB_SHA:0:7}"
-          package_filename="meduza-openwrt-lite-${release_date}-${short_hash}-noarch.${PACKAGE_FORMAT}"
+          package_filename="meduza-openwrt-lite-${release_date}-${short_hash}-${PACKAGE_ARCH}.${PACKAGE_FORMAT}"
           cp -v "${package_source}" "build-artifact/packages/${package_filename}"
 
           find openwrt-sdk/bin -type f \
@@ -204,7 +286,7 @@ jobs:
             "OpenWrt release: ${OPENWRT_RELEASE}" \
             "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}" \
             "Package format: ${PACKAGE_FORMAT}" \
-            "Package architecture: all (noarch)" \
+            "Package architecture family: ${PACKAGE_ARCH}" \
             "Package file: ${package_filename}" \
             "SDK: ${{ steps.sdk.outputs.sdk_name }}" \
             "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
@@ -215,7 +297,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: meduza-openwrt-lite-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-noarch
+          name: meduza-openwrt-lite-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-${{ env.PACKAGE_ARCH }}
           path: build-artifact/
           if-no-files-found: error
           retention-days: 30
@@ -224,7 +306,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: meduza-openwrt-lite-build-log-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-noarch
+          name: meduza-openwrt-lite-build-log-${{ env.OPENWRT_RELEASE }}-${{ env.PACKAGE_FORMAT }}-${{ env.PACKAGE_ARCH }}
           path: build-artifact/build.log
           if-no-files-found: warn
           retention-days: 14
@@ -238,7 +320,7 @@ jobs:
       - name: Download APK and IPK artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: meduza-openwrt-lite-*-*-noarch
+          pattern: meduza-openwrt-lite-*-*-*
           path: release-assets
           merge-multiple: true
 
@@ -251,8 +333,8 @@ jobs:
           short_hash="${GITHUB_SHA:0:7}"
           release_name="${release_date}-${short_hash}"
           release_tag="meduza-openwrt-lite-${release_name}"
-          test -n "$(find release-assets/packages -type f -name '*.apk' -print -quit)"
-          test -n "$(find release-assets/packages -type f -name '*.ipk' -print -quit)"
+          test "$(find release-assets/packages -type f -name '*.apk' | wc -l)" -eq 3
+          test "$(find release-assets/packages -type f -name '*.ipk' | wc -l)" -eq 3
           find release-assets/packages -type f \( -name '*.apk' -o -name '*.ipk' \) \
             -printf '%f\0' | sort -z | while IFS= read -r -d '' filename; do
               sha256sum "release-assets/packages/${filename}"

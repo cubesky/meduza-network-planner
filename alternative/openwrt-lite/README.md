@@ -40,28 +40,29 @@ apk add --allow-untrusted meduza-openwrt-lite-*.apk
 
 The `build-openwrt-lite` GitHub Actions workflow builds the package with the
 official OpenWrt SDK and uploads the package, repository indexes, checksums and
-build log as an artifact. Each build runs a two-entry matrix: OpenWrt 24.10
-produces legacy `.ipk`, while OpenWrt 25.12 produces `.apk`. A manual run accepts
-`ipk_release` and `apk_release` inputs. The package contains architecture-independent Python, Shell, UCI and LuCI code and
-is emitted with OpenWrt architecture `all` (the OpenWrt equivalent of
-`noarch`). A single x86/64 SDK is used only as the package-format toolchain; the
-resulting APK/IPK installs on ARM, ARM64, x86 and other OpenWrt architectures,
-so duplicate per-CPU builds are intentionally avoided.
+build log as an artifact. The build matrix produces OpenWrt 24.10 `.ipk` and
+OpenWrt 25.12 `.apk` packages for ARMv7, ARM64 and x86-64. A manual run accepts
+`ipk_release` and `apk_release` inputs. The Python `etcd3`, `protobuf`, `six`,
+`typing-extensions` and native `grpcio` runtime are bundled into each package,
+so installation never runs pip and does not depend on unavailable OpenWrt feed
+packages. ARM64 and x86-64 use grpcio's official musllinux wheels; ARMv7 builds
+grpcio in an emulated Alpine ARM environment so the extension is linked for
+musl rather than copying an incompatible glibc wheel.
 
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both
 packages, `SHA256SUMS` and release metadata. Pull requests build both formats
 
-Published package files use the same date/hash identity and explicitly expose
-their architecture-independent status:
-`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-noarch.ipk` and
-`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-noarch.apk`.
+Published package files use the same date/hash identity and expose their CPU
+family, for example
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm.ipk` and
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.apk` or
+`meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-x86-64.apk`.
 but never publish a release.
 
 The workflow verifies the SDK against the target directory's official
-`sha256sums` file before extraction. It also verifies that IPK output uses the
-internal `all` architecture and that APK output uses OpenWrt's internal
-`noarch` architecture before uploading artifacts or publishing a release.
+`sha256sums` file before extraction. It rejects any grpcio-containing IPK/APK
+that is accidentally marked architecture-independent.
 
 The package directly depends on `tinc`, `frr` (which provides `vtysh`),
 `openvpn-openssl`, `wireguard-tools`, `kmod-wireguard`, `python3`, `jq` and the
@@ -97,10 +98,6 @@ input/output/forward and masquerading policies remain entirely under the
 administrator's existing firewall configuration.
 
 Leave `ETCD_CA`, `ETCD_CERT` and `ETCD_KEY` empty when mutual TLS is not used.
-The Python agent accepts legacy private CA certificates that predate the strict
-X.509 `keyUsage` requirement while continuing to verify the certificate chain,
-validity period and endpoint hostname. Regenerating the CA with proper
-`basicConstraints` and `keyUsage = keyCertSign, cRLSign` remains recommended.
 `ETCD_ENDPOINTS` accepts a comma-separated value for compatibility with the
 main project. The Python agent automatically fails over between all configured
 endpoints, refreshes expired authentication tokens, and retries failures with
@@ -156,7 +153,8 @@ when the interface exists without a recent handshake, and `down` when absent.
 
 ## Operational notes
 
-- The etcd endpoint must expose the v3 JSON gRPC gateway (`/v3/...`).
+- The agent connects directly to etcd's native v3 gRPC service; the HTTP/JSON
+  gateway does not need to be enabled.
 - Instance and interface names are restricted to letters, digits, `_` and `-`.
 - Configuration is written atomically before native services are restarted.
 - Give the etcd account read access to `/commit`, `/global/`, `/nodes/` and

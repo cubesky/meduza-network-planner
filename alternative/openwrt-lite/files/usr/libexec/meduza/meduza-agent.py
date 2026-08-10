@@ -1,16 +1,18 @@
 #!/usr/bin/python3
 """Reliable Meduza controller for routed OpenWrt side gateways."""
 
-import base64
 import json
 import os
-import ssl
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+sys.path.insert(0, "/usr/lib/meduza-python")
+
+import etcd3
+import grpc
 
 
 STATE = os.environ.get("MEDUZA_STATE", "/var/run/meduza")
@@ -32,110 +34,83 @@ def uci_get(option, default=""):
     return result.stdout.strip() if result.returncode == 0 else default
 
 
-def b64(value):
-    if isinstance(value, str):
-        value = value.encode()
-    return base64.b64encode(value).decode()
-
-
-def prefix_end(prefix):
-    value = bytearray(prefix.encode())
-    for index in range(len(value) - 1, -1, -1):
-        if value[index] < 255:
-            value[index] += 1
-            return bytes(value[:index + 1])
-    return b"\0"
-
-
 class EtcdClient:
     def __init__(self):
         raw = uci_get("ETCD_ENDPOINTS", "https://127.0.0.1:2379")
-        self.endpoints = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+        self.endpoints = [self._parse(item) for item in raw.split(",") if item.strip()]
         if not self.endpoints:
             raise RuntimeError("UCI option ETCD_ENDPOINTS is required")
         self.user = uci_get("ETCD_USER")
         self.password = uci_get("ETCD_PASS")
-        self.token = None
+        self.ca = uci_get("ETCD_CA") or "/etc/ssl/certs/ca-certificates.crt"
+        self.cert = uci_get("ETCD_CERT") or None
+        self.key = uci_get("ETCD_KEY") or None
         self.endpoint_index = 0
-        self.timeout = 10
-        ca = uci_get("ETCD_CA") or None
-        cert = uci_get("ETCD_CERT") or None
-        key = uci_get("ETCD_KEY") or None
-        self.context = ssl.create_default_context(cafile=ca)
-        # Python 3.13 enables VERIFY_X509_STRICT in create_default_context().
-        # Many existing etcd installations use an older private CA without a
-        # critical keyUsage extension. Keep normal chain, expiry and hostname
-        # verification, but accept those otherwise valid legacy CA files.
-        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
-        if strict_flag:
-            self.context.verify_flags &= ~strict_flag
-        if cert:
-            self.context.load_cert_chain(cert, key)
+        self.client = None
 
-    def _request_once(self, endpoint, path, payload, authenticate=True):
-        headers = {"Content-Type": "application/json"}
-        if authenticate and self.user:
-            if not self.token:
-                self.token = self._authenticate(endpoint)
-            headers["Authorization"] = self.token
-        request = urllib.request.Request(endpoint + path,
-                                         json.dumps(payload).encode(), headers)
-        with urllib.request.urlopen(request, timeout=self.timeout,
-                                    context=self.context) as response:
-            return json.load(response)
+    @staticmethod
+    def _parse(raw):
+        value = raw.strip()
+        if "://" not in value:
+            value = "https://" + value
+        parsed = urlparse(value)
+        if not parsed.hostname or not parsed.port:
+            raise ValueError("invalid etcd endpoint: {!r}".format(raw))
+        return parsed
 
-    def _authenticate(self, endpoint):
-        result = self._request_once(endpoint, "/v3/auth/authenticate",
-                                    {"name": self.user, "password": self.password}, False)
-        token = result.get("token")
-        if not token:
-            raise RuntimeError("etcd authentication returned no token")
-        return token
+    def _connect(self, index):
+        endpoint = self.endpoints[index]
+        secure = endpoint.scheme == "https"
+        self.client = etcd3.client(
+            host=endpoint.hostname,
+            port=endpoint.port,
+            ca_cert=self.ca if secure else None,
+            cert_cert=self.cert if secure else None,
+            cert_key=self.key if secure else None,
+            user=self.user or None,
+            password=self.password or None,
+            timeout=10,
+        )
 
-    def request(self, path, payload):
+    def _call(self, operation):
         last_error = None
         for offset in range(len(self.endpoints)):
             index = (self.endpoint_index + offset) % len(self.endpoints)
-            endpoint = self.endpoints[index]
             for auth_attempt in range(2):
                 try:
-                    result = self._request_once(endpoint, path, payload)
+                    if self.client is None or index != self.endpoint_index:
+                        self._connect(index)
+                    result = operation(self.client)
                     self.endpoint_index = index
                     return result
-                except urllib.error.HTTPError as error:
+                except grpc.RpcError as error:
                     last_error = error
-                    if error.code in (401, 403) and auth_attempt == 0 and self.user:
-                        self.token = None
+                    self.client = None
+                    if error.code() == grpc.StatusCode.UNAUTHENTICATED and auth_attempt == 0:
                         continue
                     break
-                except (OSError, ValueError, urllib.error.URLError) as error:
+                except (OSError, ValueError) as error:
                     last_error = error
+                    self.client = None
                     break
         raise RuntimeError("all etcd endpoints failed: {}".format(last_error))
 
     def get(self, key):
-        result = self.request("/v3/kv/range", {"key": b64(key)})
-        values = result.get("kvs", [])
-        return base64.b64decode(values[0]["value"]).decode() if values else ""
+        value, _metadata = self._call(lambda client: client.get(key))
+        return value.decode() if value is not None else ""
 
     def get_prefix(self, prefix):
-        result = self.request("/v3/kv/range", {
-            "key": b64(prefix), "range_end": b64(prefix_end(prefix))})
         output = {}
-        for item in result.get("kvs", []):
-            key = base64.b64decode(item["key"]).decode()
-            output[key] = base64.b64decode(item["value"]).decode()
+        rows = self._call(lambda client: list(client.get_prefix(prefix)))
+        for value, metadata in rows:
+            output[metadata.key.decode()] = value.decode()
         return output
 
     def put(self, key, value, lease=None):
-        payload = {"key": b64(key), "value": b64(str(value))}
-        if lease:
-            payload["lease"] = str(lease)
-        self.request("/v3/kv/put", payload)
+        self._call(lambda client: client.put(key, str(value), lease=lease))
 
     def lease(self, ttl):
-        result = self.request("/v3/lease/grant", {"TTL": ttl})
-        return result.get("ID")
+        return self._call(lambda client: client.lease(ttl))
 
 
 def atomic_json(path, value):
