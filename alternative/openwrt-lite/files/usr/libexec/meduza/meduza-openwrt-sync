@@ -42,8 +42,9 @@ find_zone() {
 
 main() {
 	local desired='' existing section name uci_name logical dev zone zone_section firewall_available=0
-	load_settings
+	config_load meduza
 	config_get zone main VPN_FIREWALL_ZONE
+	mkdir -p "$MEDUZA_STATE"
 	[ -f /etc/config/firewall ] && firewall_available=1
 
 	if command -v openvpn >/dev/null 2>&1; then

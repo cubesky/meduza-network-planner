@@ -92,6 +92,13 @@ on the router. At service startup Meduza checks its core commands and reports
 missing commands through syslog instead of failing package installation.
 The reporter reads `/proc` directly and does not require `procps-ng-pgrep`.
 JSON processing uses Python's standard library and does not require `jq`.
+For legacy OpenVPN static-key configurations, Meduza detects OpenVPN 2.7's
+compatibility option and adds `allow-deprecated-insecure-static-crypto`
+automatically. TLS-based configurations are not changed.
+
+Stopping the Meduza service also stops its tinc instance, removes its tinc and
+WireGuard devices, removes generated OpenVPN files, clears its FRR configuration,
+and deletes the OpenWrt interfaces and firewall-zone memberships it manages.
 
 `kmod-wireguard` is intentionally not a package dependency. OpenWrt kernel
 modules are tied to the exact firmware kernel ABI, so a package built by a

@@ -27,6 +27,10 @@ reload_or_restart() {
 		"/etc/init.d/$service" restart
 }
 
+openvpn_supports_static_compat() {
+	openvpn --help 2>&1 | grep -q -- '--allow-deprecated-insecure-static-crypto'
+}
+
 render_tinc_host() {
 	local id=$1 name address port subnet pub ed
 	name=$(jget "/nodes/$id/tinc/name" "$ALL_JSON"); [ -n "$name" ] || name=$id
@@ -54,6 +58,10 @@ apply_tinc() {
 	if [ "$mesh" != tinc ] || ! enabled "/nodes/$MEDUZA_NODE/tinc/enable" "$NODE_JSON"; then
 		oldnet=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
 		[ -z "$oldnet" ] || tincd -n "$oldnet" -k >/dev/null 2>&1 || true
+		sleep 1
+		dev=$(cat "$MEDUZA_STATE/tinc.dev" 2>/dev/null || true)
+		[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
+		rm -f "$MEDUZA_STATE/tinc.net" "$MEDUZA_STATE/tinc.dev"
 		return
 	fi
 	TINC_NET=$(jget /global/tinc/netname "$GLOBAL_JSON"); [ -n "$TINC_NET" ] || TINC_NET=mesh
@@ -87,13 +95,17 @@ apply_tinc() {
 	oldnet=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
 	[ -z "$oldnet" ] || tincd -n "$oldnet" -k >/dev/null 2>&1 || true
 	[ "$oldnet" = "$TINC_NET" ] || tincd -n "$TINC_NET" -k >/dev/null 2>&1 || true
+	# tinc termination is asynchronous. Give the previous daemon time to close
+	# /dev/net/tun before removing/recreating its interface.
+	sleep 1
 	ip link del "$dev" >/dev/null 2>&1 || true
 	tincd -n "$TINC_NET"
 	printf '%s\n' "$TINC_NET" >"$MEDUZA_STATE/tinc.net"
+	printf '%s\n' "$dev" >"$MEDUZA_STATE/tinc.dev"
 }
 
 apply_openvpn() {
-	local names='' raw name dev key val opt old
+	local names='' raw name dev key val opt old static_secret
 	for raw in $(children "/nodes/$MEDUZA_NODE/openvpn/" "$NODE_JSON"); do
 		name=$(safe_name "$raw"); [ -n "$name" ] || continue
 		enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/enable" "$NODE_JSON" || continue
@@ -102,6 +114,10 @@ apply_openvpn() {
 		{
 			dev=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || dev="tun-$name"
 			echo "dev $dev"
+			static_secret=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/secret" "$NODE_JSON")
+			if [ -n "$static_secret" ] && openvpn_supports_static_compat; then
+				echo 'allow-deprecated-insecure-static-crypto'
+			fi
 			for key in dev_type proto port ifconfig keepalive verb auth cipher comp_lzo allow_compression remote_cert_tls key_direction; do
 				val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/$key" "$NODE_JSON"); [ -n "$val" ] || continue
 				opt=$(echo "$key" | tr _ -); echo "$opt $val"
@@ -214,10 +230,46 @@ reconcile() {
 	log 'configuration reconciled'
 }
 
+cleanup() {
+	local name net dev
+	net=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
+	[ -z "$net" ] || tincd -n "$net" -k >/dev/null 2>&1 || true
+	sleep 1
+	dev=$(cat "$MEDUZA_STATE/tinc.dev" 2>/dev/null || true)
+	[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
+
+	if installed openvpn; then
+		rm -f /etc/openvpn/meduza-*.conf /etc/openvpn/meduza-*.secret \
+			/etc/openvpn/meduza-*.ca /etc/openvpn/meduza-*.cert \
+			/etc/openvpn/meduza-*.key /etc/openvpn/meduza-*.tls_auth \
+			/etc/openvpn/meduza-*.tls_crypt
+		reload_or_restart openvpn
+	fi
+
+	for name in $(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true); do
+		dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true)
+		[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
+	done
+
+	if [ -x /etc/init.d/frr ]; then
+		printf '%s\n' 'frr defaults traditional' 'service integrated-vtysh-config' \
+			'line vty' '!' | atomic_write /etc/frr/frr.conf 640
+		reload_or_restart frr
+	fi
+
+	rm -f "$MEDUZA_STATE/tinc.net" "$MEDUZA_STATE/tinc.dev" \
+		"$MEDUZA_STATE/openvpn.instances" "$MEDUZA_STATE/wireguard.instances" \
+		"$MEDUZA_STATE"/wireguard.*.dev
+	/usr/libexec/meduza/meduza-openwrt-sync
+	log 'managed components stopped and cleaned up'
+}
+
 main() {
-	load_settings
-	[ "${1:-}" = --apply ] || { log 'generator must be invoked by meduza-agent.py'; return 2; }
-	reconcile
+	case "${1:-}" in
+		--apply) load_settings; reconcile;;
+		--stop) mkdir -p "$MEDUZA_STATE"; cleanup;;
+		*) log 'generator must be invoked with --apply or --stop'; return 2;;
+	esac
 }
 
 main "$@"

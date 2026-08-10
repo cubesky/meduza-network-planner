@@ -39,3 +39,9 @@ reload_service() {
 	stop
 	start
 }
+
+stop_service() {
+	[ -x /usr/libexec/meduza/meduza-generator ] || return 0
+	/usr/libexec/meduza/meduza-generator --stop || \
+		logger -t meduza 'managed component cleanup failed'
+}
