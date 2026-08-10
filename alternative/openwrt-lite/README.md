@@ -83,7 +83,7 @@ The workflow verifies the SDK against the target directory's official
 expected metadata architecture.
 
 The package uses the native `tinc`, `frr` (which provides `vtysh`),
-`openvpn-openssl`, `wireguard-tools`, `python3` and `jq` packages. They are not
+`openvpn-openssl`, `wireguard-tools` and `python3` packages. They are not
 encoded as hard APK/IPK dependencies because vendor OpenWrt feeds frequently
 rename, omit, or pin these packages to a firmware-specific ABI. A single
 unavailable integration package would otherwise make the Meduza package itself
@@ -91,6 +91,7 @@ uninstallable. Install the native packages needed for the integrations enabled
 on the router. At service startup Meduza checks its core commands and reports
 missing commands through syslog instead of failing package installation.
 The reporter reads `/proc` directly and does not require `procps-ng-pgrep`.
+JSON processing uses Python's standard library and does not require `jq`.
 
 `kmod-wireguard` is intentionally not a package dependency. OpenWrt kernel
 modules are tied to the exact firmware kernel ABI, so a package built by a

@@ -19,7 +19,10 @@ load_settings() {
 }
 
 atomic_write() {
-	local target=$1 mode=${2:-600} tmp="${target}.meduza.$$"
+	local target mode tmp
+	target=$1
+	mode=${2:-600}
+	tmp="${target}.meduza.$$"
 	mkdir -p "${target%/*}"
 	cat >"$tmp" && chmod "$mode" "$tmp" && mv "$tmp" "$target"
 }

@@ -11,7 +11,8 @@ NODE_JSON=$MEDUZA_STATE/node.json
 GLOBAL_JSON=$MEDUZA_STATE/global.json
 ALL_JSON=$MEDUZA_STATE/all-nodes.json
 
-jget() { jq -r --arg k "$1" '.[$k] // empty' "$2"; }
+jget() { /usr/libexec/meduza/meduza-json.py get "$2" "$1"; }
+children() { /usr/libexec/meduza/meduza-json.py children "$2" "$1"; }
 enabled() {
 	case "$(jget "$1" "$2" | tr 'A-Z' 'a-z')" in 1|true|yes|on) return 0;; *) return 1;; esac
 }
@@ -37,7 +38,7 @@ render_tinc_host() {
 	[ -n "$subnet" ] || subnet=$(jget "/nodes/$id/tinc/ipv4" "$ALL_JSON")
 	pub=$(jget "/nodes/$id/tinc/public_key" "$ALL_JSON")
 	ed=$(jget "/nodes/$id/tinc/ed25519_public_key" "$ALL_JSON")
-	[ -n "$pub$ed" ] || return 0
+	[ -n "$pub$ed" ] || [ "$id" = "$MEDUZA_NODE" ] || return 0
 	{
 		[ -z "$address" ] || echo "Address=$address"
 		echo "Port=$port"
@@ -62,8 +63,9 @@ apply_tinc() {
 	port=$(jget "/nodes/$MEDUZA_NODE/tinc/port" "$NODE_JSON"); [ -n "$port" ] || port=655
 	ipv4=$(jget "/nodes/$MEDUZA_NODE/tinc/ipv4" "$NODE_JSON")
 	mkdir -p "/etc/tinc/$TINC_NET/hosts"
+	render_tinc_host "$MEDUZA_NODE"
 	peers=''
-	for id in $(jq -r 'keys[] | select(test("^/nodes/[^/]+/tinc/enable$")) | split("/")[2]' "$ALL_JSON"); do
+	for id in $(children /nodes/ "$ALL_JSON"); do
 		[ "$(jget "/nodes/$id/tinc/enable" "$ALL_JSON")" = true ] || continue
 		render_tinc_host "$id"
 		[ "$id" = "$MEDUZA_NODE" ] && continue
@@ -84,13 +86,15 @@ apply_tinc() {
 	{ echo '#!/bin/sh'; echo 'ip link set "$INTERFACE" up'; [ -z "$ipv4" ] || echo "ip addr replace $ipv4 dev \"\$INTERFACE\""; } | atomic_write "/etc/tinc/$TINC_NET/tinc-up" 755
 	oldnet=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
 	[ -z "$oldnet" ] || tincd -n "$oldnet" -k >/dev/null 2>&1 || true
+	[ "$oldnet" = "$TINC_NET" ] || tincd -n "$TINC_NET" -k >/dev/null 2>&1 || true
+	ip link del "$dev" >/dev/null 2>&1 || true
 	tincd -n "$TINC_NET"
 	printf '%s\n' "$TINC_NET" >"$MEDUZA_STATE/tinc.net"
 }
 
 apply_openvpn() {
 	local names='' raw name dev key val opt old
-	for raw in $(jq -r --arg p "/nodes/$MEDUZA_NODE/openvpn/" 'keys[] | select(startswith($p)) | .[($p|length):] | split("/")[0]' "$NODE_JSON" | sort -u); do
+	for raw in $(children "/nodes/$MEDUZA_NODE/openvpn/" "$NODE_JSON"); do
 		name=$(safe_name "$raw"); [ -n "$name" ] || continue
 		enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/enable" "$NODE_JSON" || continue
 		names="$names $name"
@@ -120,7 +124,7 @@ apply_openvpn() {
 
 apply_wireguard() {
 	local names='' raw name dev key value peer peers addr mtu old
-	for raw in $(jq -r --arg p "/nodes/$MEDUZA_NODE/wireguard/" 'keys[] | select(startswith($p)) | .[($p|length):] | split("/")[0]' "$NODE_JSON" | sort -u); do
+	for raw in $(children "/nodes/$MEDUZA_NODE/wireguard/" "$NODE_JSON"); do
 		name=$(safe_name "$raw"); [ -n "$name" ] || continue
 		enabled "/nodes/$MEDUZA_NODE/wireguard/$raw/enable" "$NODE_JSON" || continue
 		names="$names $name"
@@ -129,7 +133,7 @@ apply_wireguard() {
 			echo '[Interface]'
 			value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/private_key" "$NODE_JSON"); [ -z "$value" ] || echo "PrivateKey = $value"
 			value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/listen_port" "$NODE_JSON"); [ -z "$value" ] || echo "ListenPort = $value"
-			peers=$(jq -r --arg p "/nodes/$MEDUZA_NODE/wireguard/$raw/peer/" 'keys[] | select(startswith($p)) | .[($p|length):] | split("/")[0]' "$NODE_JSON" | sort -u)
+			peers=$(children "/nodes/$MEDUZA_NODE/wireguard/$raw/peer/" "$NODE_JSON")
 			for peer in $peers; do
 				echo; echo '[Peer]'
 				for key in public_key preshared_key allowed_ips endpoint persistent_keepalive; do
@@ -171,13 +175,16 @@ apply_frr() {
 		fi
 		if [ -n "$asn" ]; then
 			echo "router bgp $asn"; [ -z "$rid" ] || echo " bgp router-id $rid"
-			for raw in $(jq -r --arg p "/nodes/$MEDUZA_NODE/" 'keys[] | select(startswith($p)) | .[($p|length):] | select(test("^(openvpn|wireguard)/[^/]+/bgp/peer_ip$")) | split("/")[0:2] | join("/")' "$NODE_JSON"); do
-				peer_ip=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_ip" "$NODE_JSON"); peer_asn=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_asn" "$NODE_JSON")
-				[ -n "$peer_ip$peer_asn" ] || continue; name=${raw#*/}; dev=$(jget "/nodes/$MEDUZA_NODE/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || { case $raw in wireguard/*) dev="wg-$name";; *) dev="tun-$name";; esac; }
-				echo " neighbor $peer_ip remote-as $peer_asn"; echo " neighbor $peer_ip update-source $dev"
+			for behavior in openvpn wireguard; do
+				for name in $(children "/nodes/$MEDUZA_NODE/$behavior/" "$NODE_JSON"); do
+					raw="$behavior/$name"
+					peer_ip=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_ip" "$NODE_JSON"); peer_asn=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_asn" "$NODE_JSON")
+					[ -n "$peer_ip$peer_asn" ] || continue; dev=$(jget "/nodes/$MEDUZA_NODE/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || { case $raw in wireguard/*) dev="wg-$name";; *) dev="tun-$name";; esac; }
+					echo " neighbor $peer_ip remote-as $peer_asn"; echo " neighbor $peer_ip update-source $dev"
+				done
 			done
 			if [ "$internal" = bgp ]; then
-				for id in $(jq -r 'keys[] | select(test("^/nodes/[^/]+/(bgp/)?router_id$")) | split("/")[2]' "$ALL_JSON" | sort -u); do
+				for id in $(children /nodes/ "$ALL_JSON"); do
 					[ "$id" = "$MEDUZA_NODE" ] && continue; peer_ip=$(jget "/nodes/$id/router_id" "$ALL_JSON"); [ -n "$peer_ip" ] || peer_ip=$(jget "/nodes/$id/bgp/router_id" "$ALL_JSON"); [ -z "$peer_ip" ] || echo " neighbor $peer_ip remote-as internal"
 				done
 			fi

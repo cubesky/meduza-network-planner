@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=19
+PKG_RELEASE:=21
 
 MEDUZA_PKGARCH?=$(ARCH_PACKAGES)
 
@@ -91,6 +91,7 @@ define Package/meduza-openwrt-lite/install
 	$(INSTALL_BIN) ./files/etc/init.d/meduza $(1)/etc/init.d/meduza
 	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-lib.sh $(1)/usr/libexec/meduza/meduza-lib.sh
 	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-agent.py $(1)/usr/libexec/meduza/meduza-agent.py
+	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-json.py $(1)/usr/libexec/meduza/meduza-json.py
 	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-generator $(1)/usr/libexec/meduza/meduza-generator
 	$(INSTALL_BIN) ./files/usr/libexec/meduza/meduza-openwrt-sync $(1)/usr/libexec/meduza/meduza-openwrt-sync
 	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-meduza.json $(1)/usr/share/luci/menu.d/luci-app-meduza.json
