@@ -38,14 +38,24 @@ opkg install meduza-openwrt-lite_*.ipk
 apk add --allow-untrusted meduza-openwrt-lite-*.apk
 ```
 
+For downloaded release assets (rather than a configured package repository),
+pass the matching dependency files to the package manager together so it can
+resolve the local dependencies. For example on ARM64:
+
+```sh
+apk add --allow-untrusted ./*-arm64.apk
+opkg install ./*-arm64.ipk
+```
+
 The `build-openwrt-lite` GitHub Actions workflow builds the package with the
 official OpenWrt SDK and uploads the package, repository indexes, checksums and
 build log as an artifact. The build matrix produces OpenWrt 24.10 `.ipk` and
 OpenWrt 25.12 `.apk` packages for ARM64 and x86-64. A manual run accepts
 `ipk_release` and `apk_release` inputs. The Python `etcd3`, `protobuf`, `six`,
-`typing-extensions` and native `grpcio` runtime are bundled into each package,
-so installation never runs pip and does not depend on unavailable OpenWrt feed
-packages. ARM64 and x86-64 use grpcio's official musllinux wheels. Before
+`typing-extensions` and native `grpcio` runtime are built as separate
+`python3-*` packages, so installation never runs pip. The Meduza package uses
+normal package-manager dependencies to install them. ARM64 and x86-64 use
+grpcio's official musllinux wheels. Before
 packaging, native wheel libraries are normalized from the Python wheel musl SONAME
 (`libc.musl-<arch>.so.1`) to OpenWrt's standard `libc.so`; this lets OpenWrt's
 dependency scanner and runtime linker resolve the normal libc package.
@@ -59,18 +69,28 @@ family, for example
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.ipk` and
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-arm64.apk` or
 `meduza-openwrt-lite-<YYYYMMDD>-<short-hash>-x86-64.apk`.
-The display filename uses `arm64`, while package metadata follows the package
-manager ABI: OpenWrt 24.10 IPK uses `aarch64_generic`, OpenWrt 25.12 APK uses
-`aarch64`, and x86-64 uses `x86_64` in both formats.
-but never publish a release.
+Each architecture build publishes `meduza-openwrt-lite`, `python3-etcd3`,
+`python3-grpcio`, `python3-protobuf`, `python3-six`, and
+`python3-typing-extensions`. The display filename records the build's real CPU
+family. Pure Python and main packages are architecture-independent. OpenWrt
+24.10 IPK metadata for `python3-grpcio` uses `aarch64_generic` or `x86_64`.
+APK metadata uses `noarch` for compatibility with vendor APK implementations,
+but the `python3-grpcio` APK still contains native code: install the `arm64`
+package set only on ARM64 and the `x86-64` set only on x86-64.
 
 The workflow verifies the SDK against the target directory's official
-`sha256sums` file before extraction. It rejects any grpcio-containing IPK/APK
-that is accidentally marked architecture-independent.
+`sha256sums` file before extraction and verifies each produced package's
+expected metadata architecture.
 
-The package directly depends on `tinc`, `frr` (which provides `vtysh`),
-`openvpn-openssl`, `wireguard-tools`, `python3`, `jq` and the small `pgrep`
-utility used by the Python agent.
+The package uses the native `tinc`, `frr` (which provides `vtysh`),
+`openvpn-openssl`, `wireguard-tools`, `python3` and `jq` packages. They are not
+encoded as hard APK/IPK dependencies because vendor OpenWrt feeds frequently
+rename, omit, or pin these packages to a firmware-specific ABI. A single
+unavailable integration package would otherwise make the Meduza package itself
+uninstallable. Install the native packages needed for the integrations enabled
+on the router. At service startup Meduza checks its core commands and reports
+missing commands through syslog instead of failing package installation.
+The reporter reads `/proc` directly and does not require `procps-ng-pgrep`.
 
 `kmod-wireguard` is intentionally not a package dependency. OpenWrt kernel
 modules are tied to the exact firmware kernel ABI, so a package built by a

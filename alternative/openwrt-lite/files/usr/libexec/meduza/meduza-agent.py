@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -131,8 +132,24 @@ def read_names(filename):
 
 
 def process_running(pattern):
-    return run("pgrep", "-f", pattern, check=False,
-               capture=True).returncode == 0
+    expression = re.compile(pattern)
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return False
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(os.path.join(entry.path, "cmdline"), "rb") as handle:
+                    command_line = handle.read().replace(b"\0", b" ").decode(
+                        errors="replace")
+            except OSError:
+                continue
+            if expression.search(command_line):
+                return True
+    return False
 
 
 def link_up(device):
