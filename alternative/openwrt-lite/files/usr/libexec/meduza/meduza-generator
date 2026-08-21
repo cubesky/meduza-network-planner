@@ -1,41 +1,1180 @@
 #!/bin/sh
 set -e
 
-# OpenWrt's /lib/functions.sh intentionally uses unset CONFIG_* state variables,
-# so this script must not enable the shell's nounset mode.
+# OpenWrt's /lib/functions.sh intentionally uses unset CONFIG_* variables.
 IPKG_INSTROOT=${IPKG_INSTROOT:-}
 . /lib/functions.sh
-. /usr/libexec/meduza/meduza-lib.sh
+MEDUZA_LIBEXEC=${MEDUZA_LIBEXEC:-/usr/libexec/meduza}
+. "$MEDUZA_LIBEXEC/meduza-lib.sh"
 
 NODE_JSON=$MEDUZA_STATE/node.json
 GLOBAL_JSON=$MEDUZA_STATE/global.json
 ALL_JSON=$MEDUZA_STATE/all-nodes.json
+DESIRED=$MEDUZA_STATE/desired.interfaces
+INVENTORY=$MEDUZA_STATE/inventory.interfaces
+LEGACY_AUTH=$MEDUZA_LEGACY_AUTH
+TAB=$(printf '\t')
+UCI_HELPER=$MEDUZA_LIBEXEC/meduza-uci-session.py
+UCI_MIGRATION=$MEDUZA_DATA/managed/uci-migration.interfaces
+UCI_MIGRATION_ZONE=$MEDUZA_DATA/managed/uci-migration.zone
+UCI_MIGRATION_ZONE_SEAL=$MEDUZA_DATA/managed/uci-migration.zone.seal
+UCI_MIGRATION_ZONE_DISABLED=$MEDUZA_DATA/managed/uci-migration.zone.disabled
+UPGRADE_STATE=$MEDUZA_DATA/managed/upgrade.state
+UPGRADE_INTENT=$MEDUZA_DATA/managed/upgrade.intent
+BUILD_ID_FILE=${MEDUZA_BUILD_ID_FILE:-/usr/share/meduza/openwrt-lite-build}
+INSTALL_COMPLETE=${MEDUZA_INSTALL_COMPLETE:-$MEDUZA_DATA/managed/install-complete}
 
-jget() { /usr/libexec/meduza/meduza-json.py get "$2" "$1"; }
-children() { /usr/libexec/meduza/meduza-json.py children "$2" "$1"; }
+jget() { "$MEDUZA_LIBEXEC/meduza-json.py" get "$2" "$1"; }
+children() { "$MEDUZA_LIBEXEC/meduza-json.py" children "$2" "$1"; }
 enabled() {
-	case "$(jget "$1" "$2" | tr 'A-Z' 'a-z')" in 1|true|yes|on) return 0;; *) return 1;; esac
+	local value
+	value=$(jget "$1" "$2") || { log "could not read JSON boolean: $1"; exit 1; }
+	value=$(printf '%s' "$value" | tr 'A-Z' 'a-z') || exit 1
+	case "$value" in 1|true|yes|on) return 0;; *) return 1;; esac
 }
-safe_name() { printf '%s' "$1" | tr -cd 'A-Za-z0-9_-'; }
 lines() { printf '%s\n' "$1" | tr '\r' '\n' | sed '/^[[:space:]]*$/d'; }
 installed() { command -v "$1" >/dev/null 2>&1; }
+
+commit_stage() {
+	local stage=$1 target=$2 mode=${3:-600} changed=${4:-}
+	atomic_write "$target" "$mode" "$changed" <"$stage" || return 1
+	rm -f "$stage" || return 1
+}
+
+rename_noreplace() {
+	python3 -c '
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    renameat2 = libc.renameat2
+except AttributeError:
+    raise SystemExit(2)
+renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p,
+                      ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+renameat2.restype = ctypes.c_int
+if renameat2(-100, os.fsencode(sys.argv[1]),
+             -100, os.fsencode(sys.argv[2]), 1) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), sys.argv[2])
+' "$1" "$2"
+}
+
+atomic_value() {
+	local target=$1 mode=$2 changed=$3 value=$4 stage
+	stage="$MEDUZA_STATE/stage.value.$$"
+	printf '%s\n' "$value" >"$stage" || return 1
+	commit_stage "$stage" "$target" "$mode" "$changed"
+}
+
+cleanup_orphan_temps() {
+	local marker dir path
+	for marker in "$MEDUZA_GENERATED"/*/*/.meduza-owner; do
+		[ -f "$marker" ] && [ ! -L "$marker" ] || continue
+		[ "$(cat "$marker" 2>/dev/null || true)" = "$MEDUZA_OWNER" ] || continue
+		dir=${marker%/.meduza-owner}
+		find "$dir" -type f -name '*.meduza.*' 2>/dev/null | while IFS= read -r path; do
+			rm -f "$path"
+		done
+	done
+	rm -f "$MEDUZA_DATA/managed"/interfaces.meduza.* \
+		"$MEDUZA_DATA/managed"/interfaces.pending.meduza.* \
+		"$MEDUZA_DATA/managed"/uci-migration.interfaces.meduza.* \
+		"$MEDUZA_DATA/managed"/uci-migration.zone.meduza.* \
+		"$MEDUZA_DATA/managed"/uci-migration.zone.candidate.* \
+		"$MEDUZA_DATA/managed"/uci-migration.zone.raw.* \
+		"$MEDUZA_DATA/managed"/uci-migration.zone.seal.new.* \
+		"$MEDUZA_DATA/managed"/upgrade.state.meduza.* \
+		"$MEDUZA_DATA/managed"/upgrade.first-install.meduza.* \
+		"$MEDUZA_DATA/managed"/upgrade.intent.meduza.* \
+		"$MEDUZA_DATA/managed"/upgrade.intent.new.* \
+		"$MEDUZA_DATA/managed"/install-complete.meduza.* \
+		"$MEDUZA_DATA/managed"/uci-ownership.json.tmp.* \
+		"$MEDUZA_DATA/managed"/frr.conf.backup.meduza.* \
+		"$MEDUZA_DATA/managed"/generated.*.owner.meduza.* 2>/dev/null || true
+	rm -f "$MEDUZA_STATE"/stage.* 2>/dev/null || true
+}
+
+payload_allows_apply() {
+	local build line old_ifs version transaction
+	[ -f "$BUILD_ID_FILE" ] && [ ! -L "$BUILD_ID_FILE" ] || {
+		log 'package build identity is missing; refusing reconciliation'
+		return 1
+	}
+	[ -f "$INSTALL_COMPLETE" ] && [ ! -L "$INSTALL_COMPLETE" ] || {
+		log 'package installation is incomplete; refusing reconciliation'
+		return 1
+	}
+	build=$(cat "$BUILD_ID_FILE") || return 1
+	case "$build" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
+	line=$(cat "$INSTALL_COMPLETE") || return 1
+	old_ifs=$IFS
+	IFS=$TAB
+	set -- $line
+	IFS=$old_ifs
+	[ "$#" -eq 3 ] && [ "$1" = v1 ] && [ "$2" = "$build" ] || return 1
+	version=$2
+	transaction=$3
+	case "$transaction" in ''|*[!0-9a-f]*) return 1;; esac
+	[ "${#transaction}" -eq 32 ] || return 1
+	PAYLOAD_BUILD=$version
+	PAYLOAD_TX=$transaction
+}
+
+upgrade_allows_apply() {
+	local value old_ifs phase transaction build
+	[ ! -e "$UPGRADE_STATE" ] && return 0
+	[ -f "$UPGRADE_STATE" ] && [ ! -L "$UPGRADE_STATE" ] || {
+		log 'unsafe package-upgrade state; refusing reconciliation'
+		return 1
+	}
+	value=$(cat "$UPGRADE_STATE") || return 1
+	old_ifs=$IFS
+	IFS=:
+	set -- $value
+	IFS=$old_ifs
+	[ "$#" -eq 3 ] || { log 'invalid package-upgrade state; refusing reconciliation'; return 1; }
+	phase=$1
+	transaction=$2
+	build=$3
+	case "$transaction" in ''|*[!0-9a-f]*) phase=invalid;; esac
+	[ "${#transaction}" -eq 32 ] || phase=invalid
+	[ "$transaction" = "$PAYLOAD_TX" ] && [ "$build" = "$PAYLOAD_BUILD" ] || phase=invalid
+	case "$phase" in
+		ready) return 0;;
+		blocked) log 'package upgrade did not quiesce safely; refusing reconciliation'; return 1;;
+		*) log 'invalid package-upgrade state; refusing reconciliation'; return 1;;
+	esac
+}
 
 reload_or_restart() {
 	local service=$1
 	[ -x "/etc/init.d/$service" ] || return 0
-	"/etc/init.d/$service" reload >/dev/null 2>&1 || \
-		"/etc/init.d/$service" restart
+	"/etc/init.d/$service" reload >/dev/null 2>&1 || "/etc/init.d/$service" restart
+}
+
+manifest_line() { printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$5"; }
+
+manifest_field() {
+	local kind=$1 instance=$2 field=$3 file=${4:-$DESIRED}
+	awk -F '\t' -v k="$kind" -v i="$instance" -v f="$field" \
+		'$1 == k && $2 == i { print $f; exit }' "$file"
+}
+
+collect_manifest_file() {
+	local file=$1 target=$2 kind instance logical device config extra
+	[ -f "$file" ] || return 0
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config$extra" ] || continue
+		if [ -n "$extra" ] || ! valid_managed_entry "$kind" "$instance" "$logical" "$device" "$config"; then
+			log "ignoring unsafe managed-interface record in $file"
+			continue
+		fi
+		manifest_line "$kind" "$instance" "$logical" "$device" "$config" >>"$target"
+		printf '\n' >>"$target"
+	done <"$file"
+}
+
+freeze_uci_migration_inventory() {
+	# Snapshot only state that existed at generator entry.  The helper may use
+	# this one invocation's snapshot to recover an interrupted previous commit,
+	# but never the DESIRED rows that write_journal() is about to add.
+	local stage="$MEDUZA_STATE/stage.uci-migration.$$" sorted="$MEDUZA_STATE/stage.uci-migration.sorted.$$"
+	: >"$stage" || return 1
+	collect_manifest_file "$MEDUZA_MANAGED" "$stage" || return 1
+	collect_manifest_file "$MEDUZA_PENDING" "$stage" || return 1
+	sort -u "$stage" >"$sorted" || return 1
+	commit_stage "$sorted" "$UCI_MIGRATION" 600 || return 1
+	rm -f "$stage" || return 1
+}
+
+generated_record_path() {
+	printf '%s/managed/generated.%s.%s.owner' "$MEDUZA_DATA" "$1" "$2"
+}
+
+valid_generated_state() {
+	local nonce
+	case "$1" in
+		owned) return 0;;
+		creating-????????????????|deleting-????????????????|empty-????????????????)
+			nonce=${1#*-}
+			case "$nonce" in *[!0-9a-f]*) return 1;; *) return 0;; esac
+			;;
+		*) return 1;;
+	esac
+}
+
+generated_record_state() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 record owner state rk ri rl rd rc extra
+	record=$(generated_record_path "$kind" "$instance")
+	[ -f "$record" ] && [ ! -L "$record" ] || return 1
+	IFS="$TAB" read -r owner state rk ri rl rd rc extra <"$record" || return 1
+	[ -z "$extra" ] && [ "$owner" = "$MEDUZA_OWNER" ] && \
+		[ "$rk" = "$kind" ] && [ "$ri" = "$instance" ] && \
+		[ "$rl" = "$logical" ] && [ "$rd" = "$device" ] && \
+		[ "$rc" = "$config" ] || return 1
+	valid_generated_state "$state" || return 1
+	printf '%s' "$state"
+}
+
+write_generated_record() {
+	local state=$1 kind=$2 instance=$3 logical=$4 device=$5 config=$6 record value
+	valid_managed_entry "$kind" "$instance" "$logical" "$device" "$config" || return 1
+	case "$kind:$config" in
+		"tinc:$MEDUZA_GENERATED/tinc/$instance/tinc.conf"|\
+		"openvpn:$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf"|\
+		"wireguard:$MEDUZA_GENERATED/wireguard/$instance/wg.conf") :;;
+		*) return 1;;
+	esac
+	valid_generated_state "$state" || return 1
+	record=$(generated_record_path "$kind" "$instance")
+	[ ! -L "$record" ] || { log "refusing symlinked generated ownership record: $record"; return 1; }
+	value=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+		"$MEDUZA_OWNER" "$state" "$kind" "$instance" "$logical" "$device" "$config") || return 1
+	atomic_value "$record" 600 '' "$value"
+}
+
+remove_generated_record() {
+	local kind=$1 instance=$2 record
+	record=$(generated_record_path "$kind" "$instance")
+	[ -e "$record" ] || [ -L "$record" ] || { fsync "$MEDUZA_DATA/managed" || return 1; return 0; }
+	[ ! -L "$record" ] || { log "refusing symlinked generated ownership record: $record"; return 1; }
+	rm -f "$record" || return 1
+	fsync "$MEDUZA_DATA/managed" || return 1
+}
+
+collect_generated_records() {
+	local target=$1 record owner state kind instance logical device config extra expected
+	for record in "$MEDUZA_DATA/managed"/generated.*.owner; do
+		[ -f "$record" ] && [ ! -L "$record" ] || continue
+		IFS="$TAB" read -r owner state kind instance logical device config extra <"$record" || continue
+		expected=$(generated_record_path "$kind" "$instance")
+		if [ -n "$extra" ] || [ "$record" != "$expected" ] || \
+			[ "$owner" != "$MEDUZA_OWNER" ] || \
+			! valid_managed_entry "$kind" "$instance" "$logical" "$device" "$config"; then
+			log "ignoring unsafe generated ownership record: $record"
+			continue
+		fi
+		valid_generated_state "$state" || { log "ignoring invalid generated ownership state: $record"; continue; }
+		case "$kind:$config" in
+			"tinc:$MEDUZA_GENERATED/tinc/$instance/tinc.conf"|\
+			"openvpn:$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf"|\
+			"wireguard:$MEDUZA_GENERATED/wireguard/$instance/wg.conf") :;;
+			*) log "ignoring non-generated ownership path: $record"; continue;;
+		esac
+		manifest_line "$kind" "$instance" "$logical" "$device" "$config" >>"$target" || return 1
+		printf '\n' >>"$target" || return 1
+	done
+}
+
+entry_is_desired() {
+	local line
+	line=$(manifest_line "$1" "$2" "$3" "$4" "$5")
+	grep -Fqx "$line" "$DESIRED" 2>/dev/null
+}
+
+remove_inventory_entry() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 tmp
+	tmp="$INVENTORY.remove.$$"
+	awk -F '\t' -v k="$kind" -v i="$instance" -v l="$logical" -v d="$device" -v c="$config" \
+		'!($1 == k && $2 == i && $3 == l && $4 == d && $5 == c)' "$INVENTORY" >"$tmp"
+	mv "$tmp" "$INVENTORY"
+}
+
+stop_reused_stale_devices() {
+	local kind instance logical device config extra old_kind old_instance old_logical old_device old_config old_extra count line
+	local desired_owned stale_file owned_file
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		ip link show dev "$device" >/dev/null 2>&1 || continue
+		line=$(manifest_line "$kind" "$instance" "$logical" "$device" "$config")
+		stale_file="$MEDUZA_STATE/reused.entries"
+		owned_file="$MEDUZA_STATE/reused.owned"
+		awk -F '\t' -v d="$device" -v wanted="$line" '$4 == d && $0 != wanted { print }' \
+			"$INVENTORY" >"$stale_file"
+		[ -s "$stale_file" ] || continue
+
+		desired_owned=0
+		device_is_owned "$kind" "$instance" "$device" && desired_owned=1
+		if [ "$desired_owned" = 1 ]; then
+			# A previous attempt already switched the kernel object but crashed
+			# before publishing MANAGED.  Retire only the stale journal rows; never
+			# stop the now-desired device on recovery.
+			while IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config old_extra; do
+				[ -n "$old_kind" ] || continue
+				desired_uses_config "$old_kind" "$old_config" || \
+					remove_generated_config "$old_kind" "$old_instance" "$old_device" "$old_config"
+				remove_inventory_entry "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config"
+			done <"$stale_file"
+			continue
+		fi
+
+		: >"$owned_file"
+		while IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config old_extra; do
+			case "$old_kind" in openvpn|tinc|wireguard) :;; *) continue;; esac
+			device_is_owned "$old_kind" "$old_instance" "$old_device" || continue
+			manifest_line "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" >>"$owned_file"
+			printf '\n' >>"$owned_file"
+		done <"$stale_file"
+		count=$(awk -F '\t' '!seen[$1 SUBSEP $2 SUBSEP $4]++ { count++ } END { print count+0 }' "$owned_file")
+		[ "$count" -eq 1 ] || { log "device rename has no unique strong owner; refusing to reuse $device"; return 1; }
+		# A crash journal may contain both legacy and generated config rows for
+		# the same kernel identity.  Stop every representation of that one owner
+		# before the device name is reused; counting rows would invent ambiguity.
+		while IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config old_extra; do
+			[ -n "$old_kind" ] || continue
+			stop_runtime_entry "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || return 1
+		done <"$owned_file"
+	done <"$DESIRED"
+	rm -f "$MEDUZA_STATE/reused.entries" "$MEDUZA_STATE/reused.owned"
+}
+
+desired_uses_config() {
+	local kind=$1 config=$2
+	awk -F '\t' -v k="$kind" -v c="$config" \
+		'$1 == k && $5 == c { found=1 } END { exit !found }' "$DESIRED"
+}
+
+owned_network_sections() {
+	local snapshot="$MEDUZA_STATE/network.show.$$" extracted="$MEDUZA_STATE/network.owned.$$" status logical
+	uci -q show network >"$snapshot" 2>/dev/null || { log 'could not read UCI network configuration'; return 1; }
+	sed -n "s/^network\.\([^.=]*\)\.meduza_owner='$MEDUZA_OWNER'$/\1/p" \
+		"$snapshot" >"$extracted" || return 1
+	sort -u "$extracted" -o "$extracted" || return 1
+	status=0
+	while IFS= read -r logical; do
+		[ -n "$logical" ] || continue
+		if "$UCI_HELPER" verify-live "network.$logical" >/dev/null 2>&1; then
+			printf '%s\n' "$logical"
+		else
+			[ "$?" -eq 3 ] || status=1
+		fi
+	done <"$extracted"
+	rm -f "$snapshot" "$extracted" || return 1
+	return "$status"
+}
+
+uci_network_optional_get() {
+	local value status
+	if value=$(uci -q get "$1" 2>/dev/null); then
+		printf '%s' "$value"
+		return 0
+	else
+		status=$?
+	fi
+	# `uci get` uses the same status for a missing option and package I/O
+	# failures.  A successful full package parse is the required proof that
+	# this was only an absent value; otherwise inventory collection must abort.
+	uci -q show network >/dev/null 2>&1 || {
+		log "could not verify missing UCI value: $1"
+		return 2
+	}
+	[ "$status" -ne 0 ] || return 2
+	return 0
+}
+
+legacy_network_sections() {
+	local logical owner snapshot="$MEDUZA_STATE/network.legacy-show.$$" extracted="$MEDUZA_STATE/network.legacy.$$"
+	uci -q show network >"$snapshot" 2>/dev/null || { log 'could not read legacy UCI network configuration'; return 1; }
+	sed -n "s/^network\.\([^.=]*\)\.meduza='1'$/\1/p" "$snapshot" >"$extracted" || return 1
+	while IFS= read -r logical; do
+		[ -n "$logical" ] || continue
+		owner=$(uci_network_optional_get "network.$logical.meduza_owner") || return 1
+		[ -n "$owner" ] || printf '%s\n' "$logical"
+	done <"$extracted"
+	rm -f "$snapshot" "$extracted" || return 1
+}
+
+collect_inventory() {
+	local tmp logical kind instance device config owner owned legacy type proto
+	tmp=$MEDUZA_STATE/inventory.raw
+	: >"$tmp"
+	for config in "$MEDUZA_MANAGED" "$MEDUZA_PENDING"; do
+		collect_manifest_file "$config" "$tmp"
+	done
+	# A directory-level transaction record survives even if the aggregate
+	# manifest rename was the operation interrupted by power loss.
+	collect_generated_records "$tmp" || return 1
+	# UCI is a second source of truth if a manifest write was interrupted.
+	owned=$(owned_network_sections) || return 1
+	legacy=$(legacy_network_sections) || return 1
+	for logical in $owned $legacy; do
+		kind=$(uci_network_optional_get "network.$logical.meduza_kind") || return 1
+		instance=$(uci_network_optional_get "network.$logical.meduza_instance") || return 1
+		device=$(uci_network_optional_get "network.$logical.meduza_device") || return 1
+		[ -n "$device" ] || device=$(uci_network_optional_get "network.$logical.device") || return 1
+		config=$(uci_network_optional_get "network.$logical.meduza_config") || return 1
+		if [ -z "$kind" ]; then
+			case "$logical" in ovpn_*) kind=openvpn;; wg_*) kind=wireguard;; tinc_*) kind=tinc;; esac
+		fi
+		[ -n "$instance" ] || instance=${logical#*_}
+		if [ -z "$config" ]; then
+			case "$kind" in
+				openvpn) config="/etc/openvpn/meduza-$instance.conf" ;;
+				wireguard) config="$MEDUZA_DATA/wireguard/$instance.conf" ;;
+				tinc) config="/etc/tinc/$instance/tinc.conf" ;;
+			esac
+		fi
+		owner=$(uci_network_optional_get "network.$logical.meduza_owner") || return 1
+		if [ "$owner" != "$MEDUZA_OWNER" ]; then
+			type=$(uci_network_optional_get "network.$logical") || return 1
+			proto=$(uci_network_optional_get "network.$logical.proto") || return 1
+			[ "$type" = interface ] && [ "$proto" = none ] || continue
+			case "$kind" in
+				tinc) legacy_tinc_is_owned "$instance" "$device" "$config" || continue ;;
+				openvpn) legacy_openvpn_is_owned "$instance" "$device" "$config" || continue ;;
+				wireguard) [ -f "$config" ] && grep -q '^\[Interface\]' "$config" || continue ;;
+				*) continue;;
+			esac
+		fi
+		if valid_managed_entry "$kind" "$instance" "$logical" "$device" "$config"; then
+			manifest_line "$kind" "$instance" "$logical" "$device" "$config" >>"$tmp"
+			printf '\n' >>"$tmp"
+		else
+			log "ignoring unsafe owner-marked UCI interface: $logical"
+		fi
+	done
+	sort -u "$tmp" >"$INVENTORY"
+	chmod 600 "$INVENTORY"
+}
+
+legacy_tinc_is_owned() {
+	local instance=$1 device=$2 config=$3
+	[ "$config" = "/etc/tinc/$instance/tinc.conf" ] || return 1
+	[ -f "$config" ] || return 1
+	grep -qxF 'AddressFamily=ipv4' "$config" &&
+		grep -qxF 'Mode=switch' "$config" &&
+		grep -qxF 'DeviceType=tap' "$config" &&
+		grep -qxF "Interface=$device" "$config" &&
+		grep -qxF 'TCPOnly=yes' "$config" &&
+		grep -qxF 'ip link set "$INTERFACE" up' "/etc/tinc/$instance/tinc-up" 2>/dev/null
+}
+
+adopt_legacy_tinc_inventory() {
+	# r23 did not persist an unambiguous tinc ownership marker.  A common
+	# switch/tap config fingerprint is not sufficient authority to delete an
+	# administrator's /etc/tinc tree.  Legacy entries are migrated only when
+	# collect_inventory() found an explicit owner-marked UCI section/manifest.
+	return 0
+}
+
+append_desired() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 count
+	valid_instance_name "$instance" || { log "invalid $kind instance name: $instance"; return 1; }
+	valid_uci_name "$logical" || { log "invalid UCI interface name: $logical"; return 1; }
+	valid_device_name "$device" || { log "unsafe $kind device name (utun is reserved for OpenClash): $device"; return 1; }
+	case "$config" in "$MEDUZA_GENERATED"/*) :;; *) log "unsafe generated path: $config"; return 1;; esac
+	count=$(awk -F '\t' -v value="$logical" '$3 == value { count++ } END { print count+0 }' "$DESIRED")
+	[ "$count" -eq 0 ] || { log "duplicate UCI interface after name normalization: $logical"; return 1; }
+	count=$(awk -F '\t' -v value="$device" '$4 == value { count++ } END { print count+0 }' "$DESIRED")
+	[ "$count" -eq 0 ] || { log "duplicate VPN device: $device"; return 1; }
+	manifest_line "$kind" "$instance" "$logical" "$device" "$config" >>"$DESIRED"
+	printf '\n' >>"$DESIRED"
+}
+
+build_desired() {
+	local mesh net dev logical raw name requested path
+	: >"$DESIRED"
+	mesh=$(jget /global/mesh_type "$GLOBAL_JSON")
+	if installed tincd && [ "$mesh" = tinc ] && enabled "/nodes/$MEDUZA_NODE/tinc/enable" "$NODE_JSON"; then
+		net=$(jget /global/tinc/netname "$GLOBAL_JSON"); [ -n "$net" ] || net=mesh
+		valid_instance_name "$net" || { log "invalid tinc netname: $net"; return 1; }
+		dev=$(jget "/nodes/$MEDUZA_NODE/tinc/dev_name" "$NODE_JSON"); [ -n "$dev" ] || dev=tnc0
+		logical="tinc_$(uci_instance_name "$net")"
+		append_desired tinc "$net" "$logical" "$dev" "$MEDUZA_GENERATED/tinc/$net/tinc.conf"
+	elif ! installed tincd; then
+		log 'tinc is not installed; only previously owned tinc resources will be cleaned'
+	fi
+
+	if installed openvpn && { [ -f /lib/netifd/proto/openvpn.sh ] || [ -x /etc/init.d/openvpn ]; }; then
+		children "/nodes/$MEDUZA_NODE/openvpn/" "$NODE_JSON" >"$MEDUZA_STATE/openvpn.children" || return 1
+		while IFS= read -r raw; do
+			[ -n "$raw" ] || continue
+			enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/enable" "$NODE_JSON" || continue
+			valid_instance_name "$raw" || { log "invalid OpenVPN instance name: $raw"; return 1; }
+			name=$raw
+			requested=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/dev" "$NODE_JSON")
+			dev=${requested:-$(default_device_name openvpn "$name")}
+			logical="ovpn_$(uci_instance_name "$name")"
+			path="$MEDUZA_GENERATED/openvpn/$name/openvpn.conf"
+			append_desired openvpn "$name" "$logical" "$dev" "$path"
+		done <"$MEDUZA_STATE/openvpn.children"
+	else
+		log 'OpenVPN integration is not installed; only previously owned OpenVPN resources will be cleaned'
+	fi
+
+	if installed wg && installed ip; then
+		children "/nodes/$MEDUZA_NODE/wireguard/" "$NODE_JSON" >"$MEDUZA_STATE/wireguard.children" || return 1
+		while IFS= read -r raw; do
+			[ -n "$raw" ] || continue
+			enabled "/nodes/$MEDUZA_NODE/wireguard/$raw/enable" "$NODE_JSON" || continue
+			valid_instance_name "$raw" || { log "invalid WireGuard instance name: $raw"; return 1; }
+			name=$raw
+			requested=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/dev" "$NODE_JSON")
+			dev=${requested:-$(default_device_name wireguard "$name")}
+			logical="wg_$(uci_instance_name "$name")"
+			path="$MEDUZA_GENERATED/wireguard/$name/wg.conf"
+			append_desired wireguard "$name" "$logical" "$dev" "$path"
+		done <"$MEDUZA_STATE/wireguard.children"
+	else
+		log 'WireGuard tools are not installed; only previously owned WireGuard resources will be cleaned'
+	fi
+	chmod 600 "$DESIRED"
+}
+
+validate_existing_devices() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		ip link show dev "$device" >/dev/null 2>&1 || continue
+		manifest_has_device "$kind" "$instance" "$device" "$INVENTORY" || {
+			log "refusing to adopt existing non-Meduza device: $device"; return 1;
+		}
+		device_is_owned "$kind" "$instance" "$device" || {
+			log "refusing to adopt $kind device without its kernel ownership marker: $device"
+			return 1
+		}
+	done <"$DESIRED"
+}
+
+preflight_existing_devices() {
+	local kind instance logical device config extra old_kind old_instance old_logical old_device old_config old_extra count line old_line pidfile section_type legacy_count legacy_retired identities identity
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		ip link show dev "$device" >/dev/null 2>&1 || continue
+		device_is_owned "$kind" "$instance" "$device" && continue
+		# Live r23 upgrades can have the same kind/instance/device but a legacy
+		# config path and no ifalias.  Retire the one strictly hashed legacy row
+		# while its UCI/procd identity still exists, then rebuild with the private
+		# generated path.  A manifest alone never authorizes this migration.
+		legacy_count=0
+		legacy_retired=0
+		while IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config old_extra; do
+			[ "$old_device" = "$device" ] || continue
+			legacy_config_path "$old_kind" "$old_instance" "$old_config" || continue
+			legacy_entry_authorized "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || continue
+			legacy_authorized_hash_matches "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || continue
+			legacy_count=$((legacy_count + 1))
+			[ "$legacy_count" -eq 1 ] || continue
+			old_line=$(manifest_line "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config")
+		done <"$INVENTORY"
+		if [ "$legacy_count" -gt 1 ]; then
+			log "ambiguous legacy ownership for device: $device"
+			return 1
+		elif [ "$legacy_count" -eq 1 ]; then
+			IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config <<-EOF
+			$old_line
+			EOF
+			stop_runtime_entry "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || return 1
+			ip link show dev "$device" >/dev/null 2>&1 || legacy_retired=1
+		fi
+		[ "$legacy_retired" = 0 ] || continue
+		line=$(manifest_line "$kind" "$instance" "$logical" "$device" "$config")
+		if grep -Fqx "$line" "$INVENTORY" 2>/dev/null; then
+			case "$kind" in
+				openvpn)
+					if owned_openvpn_process_running "$instance" "$logical" "$device" "$config"; then
+						openvpn_runtime_stop_authorized "$instance" "$logical" "$device" "$config" || {
+							log "refusing to stop OpenVPN process without current ownership proof: $instance"
+							return 1
+						}
+						if [ "$config" = "$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf" ]; then
+							stop_registered_modern_openvpn "$logical" "$config" || return 1
+						elif legacy_entry_authorized "$kind" "$instance" "$logical" "$device" "$config" && \
+							legacy_authorized_hash_matches "$kind" "$instance" "$logical" "$device" "$config"; then
+							[ ! -x /etc/init.d/openvpn ] || /etc/init.d/openvpn stop "meduza-$instance" >/dev/null 2>&1 || return 1
+						fi
+						stop_owned_openvpn_processes "$instance" "$logical" "$device" "$config"
+						if ! wait_openvpn_process_absent "$instance" "$logical" "$device" "$config"; then
+							stop_owned_openvpn_processes "$instance" "$logical" "$device" "$config" KILL
+							wait_openvpn_process_absent "$instance" "$logical" "$device" "$config" || return 1
+						fi
+						wait_link_absent "$device" || true
+						ip link show dev "$device" >/dev/null 2>&1 || continue
+					fi
+					;;
+				tinc)
+					if owned_tinc_process_running "$instance"; then
+						pidfile="$MEDUZA_STATE/tinc.$instance.pid"
+						stop_owned_tinc_processes "$instance" "$pidfile"
+						if ! wait_tinc_process_absent "$instance" 0; then
+							stop_owned_tinc_processes "$instance" "$pidfile" KILL
+							wait_tinc_process_absent "$instance" 0 || return 1
+						fi
+						wait_link_absent "$device" || true
+						ip link show dev "$device" >/dev/null 2>&1 || continue
+					elif legacy_entry_authorized "$kind" "$instance" "$logical" "$device" "$config" && \
+						legacy_authorized_hash_matches "$kind" "$instance" "$logical" "$device" "$config" && \
+						legacy_tinc_process_running "$instance"; then
+						stop_authorized_legacy_tinc_processes "$instance"
+						if ! wait_tinc_process_absent "$instance" 1; then
+							stop_authorized_legacy_tinc_processes "$instance" KILL
+							wait_tinc_process_absent "$instance" 1 || return 1
+						fi
+						wait_link_absent "$device" || true
+						ip link show dev "$device" >/dev/null 2>&1 || continue
+					fi
+					;;
+				wireguard)
+					if legacy_wireguard_device_is_owned "$instance" "$logical" "$device" "$config"; then
+						mark_device_owned wireguard "$instance" "$device" || return 1
+						continue
+					fi
+					;;
+			esac
+		fi
+		count=0
+		identities=''
+		while IFS="$TAB" read -r old_kind old_instance old_logical old_device old_config old_extra; do
+			[ "$old_device" = "$device" ] || continue
+			[ "$old_kind" = "$kind" ] && [ "$old_instance" = "$instance" ] && continue
+			device_is_owned "$old_kind" "$old_instance" "$old_device" || continue
+			identity="$old_kind/$old_instance/$old_device"
+			case " $identities " in *" $identity "*) continue;; esac
+			identities="$identities $identity"
+			count=$((count + 1))
+		done <"$INVENTORY"
+		[ "$count" -eq 1 ] || {
+			log "refusing UCI changes for existing non-Meduza device: $device"
+			return 1
+		}
+	done <"$DESIRED"
+}
+
+legacy_wireguard_device_is_owned() {
+	local instance=$1 logical=$2 device=$3 config=$4 expected actual
+	[ "$config" = "$MEDUZA_DATA/wireguard/$instance.conf" ] || return 1
+	legacy_entry_authorized wireguard "$instance" "$logical" "$device" "$config" || return 1
+	legacy_authorized_hash_matches wireguard "$instance" "$logical" "$device" "$config" || return 1
+	network_entry_is_owned wireguard "$instance" "$logical" "$device" "$config" || return 1
+	command -v wg >/dev/null 2>&1 && wg show "$device" >/dev/null 2>&1 || return 1
+	expected=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$config" | sed -n '1p')
+	[ -n "$expected" ] || return 1
+	actual=$(wg show "$device" private-key 2>/dev/null) || return 1
+	[ "$actual" = "$expected" ]
+}
+
+prepare_legacy_runtime_ownership() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ "$kind" = wireguard ] || continue
+		legacy_config_path "$kind" "$instance" "$config" || continue
+		ip link show dev "$device" >/dev/null 2>&1 || continue
+		device_is_owned "$kind" "$instance" "$device" && continue
+		legacy_wireguard_device_is_owned "$instance" "$logical" "$device" "$config" || {
+			log "cannot safely migrate aliasless legacy WireGuard device: $device"
+			return 1
+		}
+		mark_device_owned "$kind" "$instance" "$device" || return 1
+	done <"$INVENTORY"
+}
+
+write_journal() {
+	local raw="$MEDUZA_STATE/stage.journal.raw.$$" sorted="$MEDUZA_STATE/stage.journal.sorted.$$"
+	cat "$INVENTORY" "$DESIRED" >"$raw" || return 1
+	sort -u "$raw" >"$sorted" || return 1
+	commit_stage "$sorted" "$MEDUZA_PENDING" 600 || return 1
+	rm -f "$raw" || return 1
+}
+
+remove_if_present() {
+	local path=$1 marker=$2
+	[ -e "$path" ] || { fsync "${path%/*}" || return 1; return 0; }
+	: >"$marker" || return 1
+	fsync "${marker%/*}" || return 1
+	rm -f "$path" || return 1
+	fsync "${path%/*}" || return 1
+}
+
+generated_dir_is_owned() {
+	local dir=$1 marker="$1/.meduza-owner"
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	[ "$(cat "$marker" 2>/dev/null || true)" = "$MEDUZA_OWNER" ]
+}
+
+generated_create_identity() {
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+		"$MEDUZA_OWNER" "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+generated_delete_identity() {
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+		"$MEDUZA_OWNER" "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+generated_delete_marker_is_owned() {
+	local dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 marker expected actual
+	marker="$dir/.meduza-delete"
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	expected=$(generated_delete_identity "$nonce" "$kind" "$instance" "$logical" "$device" "$config") || return 1
+	actual=$(cat "$marker" 2>/dev/null) || return 1
+	[ "$actual" = "$expected" ]
+}
+
+write_generated_delete_marker() {
+	local dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 identity
+	identity=$(generated_delete_identity "$nonce" "$kind" "$instance" "$logical" "$device" "$config") || return 1
+	atomic_value "$dir/.meduza-delete" 600 '' "$identity" || return 1
+	fsync "$dir" || return 1
+}
+
+clear_generated_tombstone_contents() {
+	# Keep the exact nonce marker until all recursive work has completed.  This
+	# avoids relying on OverlayFS inode stability and lets a reboot resume after
+	# any child unlink without losing the tombstone's identity.
+	python3 -c '
+import os, stat, sys
+
+root = sys.argv[1]
+keep = {".meduza-owner", ".meduza-create", ".meduza-delete"}
+
+def clear(path, top=False):
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("unsafe generated tombstone")
+    with os.scandir(path) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        if top and name in keep:
+            continue
+        child = os.path.join(path, name)
+        value = os.lstat(child)
+        if stat.S_ISDIR(value.st_mode) and not stat.S_ISLNK(value.st_mode):
+            clear(child)
+            os.rmdir(child)
+        else:
+            os.unlink(child)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+clear(root, top=True)
+' "$1"
+}
+
+generated_tombstone_ready_for_rmdir() {
+	local dir=$1 path
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	for path in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		case "$path" in
+			"$dir/.meduza-owner"|"$dir/.meduza-create"|"$dir/.meduza-delete")
+				[ -f "$path" ] && [ ! -L "$path" ] || return 1
+				;;
+			*) return 1;;
+		esac
+	done
+}
+
+generated_create_stage_is_owned() {
+	local dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 marker expected actual
+	marker="$dir/.meduza-create"
+	generated_dir_is_owned "$dir" || return 1
+	generated_create_marker_is_owned "$dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config"
+}
+
+generated_create_marker_is_owned() {
+	local dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 marker expected actual
+	marker="$dir/.meduza-create"
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	expected=$(generated_create_identity "$nonce" "$kind" "$instance" "$logical" "$device" "$config") || return 1
+	actual=$(cat "$marker" 2>/dev/null) || return 1
+	[ "$actual" = "$expected" ]
+}
+
+generated_create_stage_prepare_markers() {
+	local dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 changed=$8 path suffix seen_create=0 seen_owner=0 identity
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	# Before any rendered configuration exists, the build directory may only
+	# contain the two identity files.  This lets a crash after mkdir or after
+	# either atomic marker write resume without adopting arbitrary contents.
+	for path in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		case "$path" in
+			"$dir/.meduza-create") seen_create=1;;
+			"$dir/.meduza-owner") seen_owner=1;;
+			"$dir/.meduza-create.meduza."*|"$dir/.meduza-owner.meduza."*)
+				suffix=${path##*.meduza.}
+				case "$suffix" in ''|*[!0-9]*) return 1;; esac
+				[ -f "$path" ] && [ ! -L "$path" ] || return 1
+				# atomic_write may have fsynced this temporary and lost power
+				# immediately before rename.  The external creating nonce binds
+				# this exact private stage, so discard only these exact temp names.
+				rm -f "$path" || return 1
+				;;
+			*) return 1;;
+		esac
+	done
+	fsync "$dir" || return 1
+	if [ "$seen_create" = 1 ]; then
+		generated_create_marker_is_owned "$dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+	else
+		identity=$(generated_create_identity "$nonce" "$kind" "$instance" "$logical" "$device" "$config") || return 1
+		atomic_value "$dir/.meduza-create" 600 '' "$identity" || return 1
+	fi
+	if [ "$seen_owner" = 1 ]; then
+		[ -f "$dir/.meduza-owner" ] && [ ! -L "$dir/.meduza-owner" ] && \
+			[ "$(cat "$dir/.meduza-owner" 2>/dev/null || true)" = "$MEDUZA_OWNER" ] || return 1
+	else
+		atomic_value "$dir/.meduza-owner" 600 "$changed" "$MEDUZA_OWNER" || return 1
+	fi
+	fsync "$dir" || return 1
+}
+
+generated_final_create_marker_is_owned() {
+	local dir=$1 kind=$2 instance=$3 logical=$4 device=$5 config=$6 marker owner nonce rk ri rl rd rc extra
+	marker="$dir/.meduza-create"
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	IFS="$TAB" read -r owner nonce rk ri rl rd rc extra <"$marker" || return 1
+	[ -z "$extra" ] && [ "$owner" = "$MEDUZA_OWNER" ] && \
+		[ "$rk" = "$kind" ] && [ "$ri" = "$instance" ] && \
+		[ "$rl" = "$logical" ] && [ "$rd" = "$device" ] && [ "$rc" = "$config" ] || return 1
+	case "$nonce" in ????????????????) case "$nonce" in *[!0-9a-f]*) return 1;; esac;; *) return 1;; esac
+}
+
+prepare_generated_create_stage() {
+	local create_dir=$1 nonce=$2 kind=$3 instance=$4 logical=$5 device=$6 config=$7 changed=$8 parent
+	parent=${create_dir%/*}
+	if [ -e "$create_dir" ] || [ -L "$create_dir" ]; then
+		generated_create_stage_prepare_markers "$create_dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" "$changed" || {
+			log "generated creation stage was replaced: $create_dir"; return 1;
+		}
+		return 0
+	fi
+	# The external creating record already contains this random nonce and binds
+	# the exact stage pathname.  Build directly there so no unjournaled
+	# .meduza-create-build-* directory can leak after power loss.  An existing
+	# non-empty/unmarked replacement is rejected by the marker preparation.
+	mkdir "$create_dir" || return 1
+	fsync "$parent" || return 1
+	generated_create_stage_prepare_markers "$create_dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" "$changed"
+}
+
+remove_generated_create_marker() {
+	local dir=$1 marker="$1/.meduza-create"
+	[ -e "$marker" ] || [ -L "$marker" ] || { fsync "$dir" || return 1; return 0; }
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	rm -f "$marker" || return 1
+	fsync "$dir" || return 1
+}
+
+finish_generated_delete() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 dir parent tombstone state nonce marker
+	dir=${config%/*}
+	parent=${dir%/*}
+	state=$(generated_record_state "$kind" "$instance" "$logical" "$device" "$config") || return 1
+	case "$state" in
+		deleting-????????????????|empty-????????????????) nonce=${state#*-};;
+		*) return 1;;
+	esac
+	tombstone="$dir.meduza-delete-$nonce"
+	[ ! -L "$parent" ] && [ ! -L "$dir" ] && [ ! -L "$tombstone" ] || {
+		log "refusing symlinked generated deletion path: $dir"; return 1;
+	}
+	[ -d "$parent" ] || durable_mkdir "$parent" 700 || return 1
+
+	if [ "${state%%-*}" = deleting ]; then
+		if [ ! -e "$tombstone" ]; then
+			if [ -e "$dir" ]; then
+				[ -d "$dir" ] || { log "generated path is not a directory: $dir"; return 1; }
+				generated_dir_is_owned "$dir" || {
+					log "generated directory was replaced during deletion: $dir"; return 1;
+				}
+				mv "$dir" "$tombstone" || return 1
+				fsync "$parent" || return 1
+			else
+				# The tombstone was removed before the external phase advanced.
+				# Replaying the parent barrier is sufficient; never touch a new
+				# unmarked object at the original pathname.
+				fsync "$parent" || return 1
+				write_generated_record "empty-$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+				state="empty-$nonce"
+			fi
+		fi
+		if [ -e "$tombstone" ]; then
+			[ -d "$tombstone" ] || { log "invalid generated tombstone: $tombstone"; return 1; }
+			if [ -e "$tombstone/.meduza-delete" ] || [ -L "$tombstone/.meduza-delete" ]; then
+				generated_delete_marker_is_owned "$tombstone" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || {
+					log "generated deletion marker changed: $tombstone"; return 1;
+				}
+			else
+				generated_dir_is_owned "$tombstone" || {
+					log "generated deletion tombstone was replaced: $tombstone"; return 1;
+				}
+				write_generated_delete_marker "$tombstone" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			fi
+			clear_generated_tombstone_contents "$tombstone" || return 1
+			generated_delete_marker_is_owned "$tombstone" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			write_generated_record "empty-$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			state="empty-$nonce"
+		fi
+	fi
+
+	if [ "${state%%-*}" = empty ] && [ -e "$tombstone" ]; then
+		generated_tombstone_ready_for_rmdir "$tombstone" || {
+			log "generated tombstone gained unexpected contents: $tombstone"; return 1;
+		}
+		marker="$tombstone/.meduza-delete"
+		if [ -e "$marker" ] || [ -L "$marker" ]; then
+			generated_delete_marker_is_owned "$tombstone" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			if [ -e "$tombstone/.meduza-create" ] || [ -L "$tombstone/.meduza-create" ]; then
+				[ -f "$tombstone/.meduza-create" ] && [ ! -L "$tombstone/.meduza-create" ] || return 1
+				rm -f "$tombstone/.meduza-create" || return 1
+			fi
+			if [ -e "$tombstone/.meduza-owner" ] || [ -L "$tombstone/.meduza-owner" ]; then
+				[ -f "$tombstone/.meduza-owner" ] && [ ! -L "$tombstone/.meduza-owner" ] && \
+					[ "$(cat "$tombstone/.meduza-owner" 2>/dev/null || true)" = "$MEDUZA_OWNER" ] || return 1
+				rm -f "$tombstone/.meduza-owner" || return 1
+			fi
+			fsync "$tombstone" || return 1
+			rm -f "$marker" || return 1
+			fsync "$tombstone" || return 1
+		fi
+		rmdir "$tombstone" || return 1
+		fsync "$parent" || return 1
+	elif [ "${state%%-*}" = empty ]; then
+		fsync "$parent" || return 1
+	fi
+	remove_generated_record "$kind" "$instance"
+}
+
+ensure_owned_generated_dir() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 changed=$6 dir parent record state='' nonce create_dir
+	local owner old_state old_kind old_instance old_logical old_device old_config extra
+	dir=${config%/*}
+	parent=${dir%/*}
+	record=$(generated_record_path "$kind" "$instance")
+	[ ! -L "$MEDUZA_GENERATED" ] && [ ! -L "$parent" ] && [ ! -L "$dir" ] || {
+		log "refusing symlinked generated path: $dir"; return 1;
+	}
+	case "$kind:$config" in
+		"tinc:$MEDUZA_GENERATED/tinc/$instance/tinc.conf"|\
+		"openvpn:$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf"|\
+		"wireguard:$MEDUZA_GENERATED/wireguard/$instance/wg.conf") :;;
+		*) log "invalid generated ownership path: $config"; return 1;;
+	esac
+	if [ -e "$record" ] || [ -L "$record" ]; then
+		if ! state=$(generated_record_state "$kind" "$instance" "$logical" "$device" "$config"); then
+			[ -f "$record" ] && [ ! -L "$record" ] || { log "invalid generated ownership record: $record"; return 1; }
+			IFS="$TAB" read -r owner old_state old_kind old_instance old_logical old_device old_config extra <"$record" || return 1
+			[ -z "$extra" ] && [ "$owner" = "$MEDUZA_OWNER" ] && \
+				[ "$old_kind" = "$kind" ] && [ "$old_instance" = "$instance" ] && \
+				[ "$old_config" = "$config" ] && \
+				valid_managed_entry "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || {
+				log "generated ownership record conflicts with desired interface: $record"; return 1;
+			}
+			case "$old_state" in
+				deleting-*|empty-*)
+					finish_generated_delete "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || return 1
+					ensure_owned_generated_dir "$kind" "$instance" "$logical" "$device" "$config" "$changed"
+					return
+					;;
+				creating-*)
+					# A create marker is bound to the old logical/device identity.
+					# Retire that transaction under its original record before starting
+					# a fresh nonce; rewriting the record first makes crash replay reject
+					# the already-durable old marker.
+					remove_owned_generated_dir "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || return 1
+					ensure_owned_generated_dir "$kind" "$instance" "$logical" "$device" "$config" "$changed"
+					return
+					;;
+				owned)
+					if [ -e "$dir" ] || [ -L "$dir" ]; then
+						generated_dir_is_owned "$dir" || { log "owned generated directory lost its marker: $dir"; return 1; }
+						if [ -e "$dir/.meduza-create" ] || [ -L "$dir/.meduza-create" ]; then
+							generated_final_create_marker_is_owned "$dir" "$old_kind" "$old_instance" "$old_logical" "$old_device" "$old_config" || {
+								log "generated creation marker conflicts with old identity: $dir"; return 1;
+							}
+							remove_generated_create_marker "$dir" || return 1
+						fi
+					fi
+					write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+					state=owned
+					;;
+				*) log "invalid generated ownership phase: $record"; return 1;;
+			esac
+		fi
+		case "$state" in deleting-*|empty-*)
+			finish_generated_delete "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			ensure_owned_generated_dir "$kind" "$instance" "$logical" "$device" "$config" "$changed"
+			return
+			;;
+		esac
+	else
+		# Before reserving a new path, accept only an absent or genuinely empty
+		# directory.  Once the external creating record is durable, a retry may
+		# safely finish files left there by the interrupted creator.
+		if generated_dir_is_owned "$dir"; then
+			# Upgrade from the previous release, which already had a strong
+			# internal marker but not the new external phase record.
+			write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			state=owned
+		elif [ -e "$dir" ] || [ -L "$dir" ]; then
+			log "refusing to adopt unmarked generated directory: $dir"
+			return 1
+		else
+			nonce=$(python3 -c 'import secrets; print(secrets.token_hex(8))') || return 1
+			create_dir="$dir.meduza-create-$nonce"
+			[ ! -e "$create_dir" ] && [ ! -L "$create_dir" ] || return 1
+			write_generated_record "creating-$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+			state="creating-$nonce"
+		fi
+	fi
+	if [ "$state" = owned ]; then
+		if generated_dir_is_owned "$dir"; then
+			if [ -e "$dir/.meduza-create" ] || [ -L "$dir/.meduza-create" ]; then
+				generated_final_create_marker_is_owned "$dir" "$kind" "$instance" "$logical" "$device" "$config" || {
+					log "generated creation marker conflicts with owned directory: $dir"; return 1;
+				}
+				remove_generated_create_marker "$dir" || return 1
+			fi
+			return 0
+		fi
+		if [ -e "$dir" ]; then
+			log "owned generated directory lost its internal marker: $dir"
+			return 1
+		fi
+		# A user removed the whole package-owned directory.  Re-enter creation
+		# durably before rebuilding it; an unmarked replacement still fails closed.
+		nonce=$(python3 -c 'import secrets; print(secrets.token_hex(8))') || return 1
+		write_generated_record "creating-$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+		state="creating-$nonce"
+	fi
+	durable_mkdir "$parent" 700 || return 1
+	case "$state" in
+		creating-*)
+			nonce=${state#creating-}
+			create_dir="$dir.meduza-create-$nonce"
+			[ ! -L "$create_dir" ] || { log "symlinked generated creation stage: $create_dir"; return 1; }
+			if [ -e "$dir" ] || [ -L "$dir" ]; then
+				[ ! -e "$create_dir" ] && [ ! -L "$create_dir" ] && \
+					generated_create_stage_is_owned "$dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || {
+					log "generated target appeared during creation: $dir"; return 1;
+				}
+				write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+				remove_generated_create_marker "$dir" || return 1
+				return 0
+			fi
+			prepare_generated_create_stage "$create_dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" "$changed" || return 1
+			rename_noreplace "$create_dir" "$dir" || { log "generated target changed before activation: $dir"; return 1; }
+			fsync "$parent" || return 1
+			;;
+		*) return 1;;
+	esac
+	write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+	remove_generated_create_marker "$dir"
+}
+
+remove_owned_generated_dir() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 dir record tombstone proof state='' nonce create_dir
+	local owner record_state record_kind record_instance record_logical record_device record_config extra line
+	dir=${config%/*}
+	record=$(generated_record_path "$kind" "$instance")
+	if [ -e "$record" ] || [ -L "$record" ]; then
+		state=$(generated_record_state "$kind" "$instance" "$logical" "$device" "$config") || {
+			# A crash journal can contain old and new device rows that share one
+			# generated directory.  Defer this historical row to the exact row from
+			# the external record instead of turning a safe purge into a two-pass job.
+			[ -f "$record" ] && [ ! -L "$record" ] || {
+				log "generated ownership record does not match cleanup target: $record"; return 1;
+			}
+			IFS="$TAB" read -r owner record_state record_kind record_instance record_logical record_device record_config extra <"$record" || return 1
+			[ -z "$extra" ] && [ "$owner" = "$MEDUZA_OWNER" ] && \
+				[ "$record_kind" = "$kind" ] && [ "$record_instance" = "$instance" ] && \
+				[ "$record_config" = "$config" ] && valid_generated_state "$record_state" && \
+				valid_managed_entry "$record_kind" "$record_instance" "$record_logical" "$record_device" "$record_config" || {
+				log "generated ownership record does not match cleanup target: $record"; return 1;
+			}
+			line=$(manifest_line "$record_kind" "$record_instance" "$record_logical" "$record_device" "$record_config") || return 1
+			grep -Fqx "$line" "$INVENTORY" 2>/dev/null || {
+				log "generated ownership record has no matching inventory row: $record"; return 1;
+			}
+			return 0
+		}
+	elif generated_dir_is_owned "$dir"; then
+		# Migrate directories created by the immediately preceding package
+		# revision before beginning the replayable delete transaction.
+		write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+		state=owned
+	else
+		[ ! -e "$dir" ] && [ ! -L "$dir" ] || {
+			log "refusing to delete generated directory without ownership proof: $dir"; return 1;
+		}
+		[ -d "${dir%/*}" ] || durable_mkdir "${dir%/*}" 700 || return 1
+		fsync "${dir%/*}" || return 1
+		return 0
+	fi
+	if [ "$state" = owned ] && [ -e "$dir" ]; then
+		generated_dir_is_owned "$dir" || { log "generated directory ownership changed: $dir"; return 1; }
+	fi
+	case "$state" in
+		creating-*)
+			nonce=${state#creating-}
+			create_dir="$dir.meduza-create-$nonce"
+			if [ -e "$dir" ] || [ -L "$dir" ]; then
+				generated_create_stage_is_owned "$dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" || {
+					log "unmarked target replaced an interrupted creation: $dir"; return 1;
+				}
+				[ ! -e "$create_dir" ] && [ ! -L "$create_dir" ] || return 1
+				write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+				remove_generated_create_marker "$dir" || return 1
+				state=owned
+			else
+				# Recover a fully built stage (including one left at the unique
+				# .meduza-create-build-* name), publish it atomically, and then use
+				# the normal inode-bound deletion transaction.  Dropping the record
+				# here would orphan a pre-rename build directory after power loss.
+				[ -d "${dir%/*}" ] || durable_mkdir "${dir%/*}" 700 || return 1
+				prepare_generated_create_stage "$create_dir" "$nonce" "$kind" "$instance" "$logical" "$device" "$config" '' || return 1
+				rename_noreplace "$create_dir" "$dir" || {
+					log "generated target changed while cancelling creation: $dir"; return 1;
+				}
+				fsync "${dir%/*}" || return 1
+				write_generated_record owned "$kind" "$instance" "$logical" "$device" "$config" || return 1
+				state=owned
+			fi
+			;;
+	esac
+	case "$state" in deleting-*|empty-*) :;; *)
+		nonce=$(python3 -c 'import secrets; print(secrets.token_hex(8))') || return 1
+		tombstone="$dir.meduza-delete-$nonce"
+		proof="$tombstone.meduza-proof"
+		[ ! -e "$tombstone" ] && [ ! -L "$tombstone" ] && \
+			[ ! -e "$proof" ] && [ ! -L "$proof" ] || {
+			log "refusing pre-existing generated deletion tombstone: $tombstone"; return 1;
+		}
+		write_generated_record "deleting-$nonce" "$kind" "$instance" "$logical" "$device" "$config" || return 1
+		;;
+	esac
+	finish_generated_delete "$kind" "$instance" "$logical" "$device" "$config"
 }
 
 openvpn_supports_static_compat() {
 	openvpn --help 2>&1 | grep -q -- '--allow-deprecated-insecure-static-crypto'
 }
 
+tinc_host_name() {
+	local id=$1 explicit value
+	explicit=$(jget "/nodes/$id/tinc/name" "$ALL_JSON")
+	if [ -n "$explicit" ]; then
+		case "$explicit" in *[!A-Za-z0-9_]*) return 1;; esac
+		value=$explicit
+	else
+		# Node IDs also allow '.' and '-'; map them instead of silently
+		# deleting characters, which could turn distinct IDs into one host.
+		value=$(printf '%s' "$id" | sed 's/[.-]/_/g')
+	fi
+	[ -n "$value" ] || return 1
+	printf '%s' "$value"
+}
+
 render_tinc_host() {
-	local id=$1 name address port subnet pub ed
-	name=$(jget "/nodes/$id/tinc/name" "$ALL_JSON"); [ -n "$name" ] || name=$id
-	name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9')
-	[ -n "$name" ] || return 0
+	local id=$1 dir=$2 marker=$3 expected=$4 name address port subnet pub ed stage
+	name=$(tinc_host_name "$id") || { log "invalid tinc node name: $id"; return 1; }
 	address=$(jget "/nodes/$id/tinc/address" "$ALL_JSON")
 	port=$(jget "/nodes/$id/tinc/port" "$ALL_JSON"); [ -n "$port" ] || port=655
 	subnet=$(jget "/nodes/$id/tinc/subnet" "$ALL_JSON")
@@ -43,232 +1182,1361 @@ render_tinc_host() {
 	pub=$(jget "/nodes/$id/tinc/public_key" "$ALL_JSON")
 	ed=$(jget "/nodes/$id/tinc/ed25519_public_key" "$ALL_JSON")
 	[ -n "$pub$ed" ] || [ "$id" = "$MEDUZA_NODE" ] || return 0
+	grep -qxF "$name" "$expected" 2>/dev/null && { log "duplicate tinc host name: $name"; return 1; }
+	printf '%s\n' "$name" >>"$expected"
+	stage="$MEDUZA_STATE/stage.tinc-host.$$"
 	{
 		[ -z "$address" ] || echo "Address=$address"
 		echo "Port=$port"
 		lines "$subnet" | sed 's/^/Subnet=/'
 		[ -z "$pub" ] || printf '\n%s\n' "$pub"
 		[ -z "$ed" ] || { case "$ed" in Ed25519PublicKey*) echo "$ed";; *) echo "Ed25519PublicKey = $ed";; esac; }
-	} | atomic_write "/etc/tinc/$TINC_NET/hosts/$name" 644
+	} >"$stage"
+	commit_stage "$stage" "$dir/hosts/$name" 644 "$marker"
 }
 
-apply_tinc() {
-	local mesh self name dev port ipv4 priv edpriv peers id peername addr
-	mesh=$(jget /global/mesh_type "$GLOBAL_JSON")
-	if [ "$mesh" != tinc ] || ! enabled "/nodes/$MEDUZA_NODE/tinc/enable" "$NODE_JSON"; then
-		oldnet=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
-		[ -z "$oldnet" ] || tincd -n "$oldnet" -k >/dev/null 2>&1 || true
-		sleep 1
-		dev=$(cat "$MEDUZA_STATE/tinc.dev" 2>/dev/null || true)
-		[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
-		rm -f "$MEDUZA_STATE/tinc.net" "$MEDUZA_STATE/tinc.dev"
-		return
-	fi
-	TINC_NET=$(jget /global/tinc/netname "$GLOBAL_JSON"); [ -n "$TINC_NET" ] || TINC_NET=mesh
-	self=$(jget "/nodes/$MEDUZA_NODE/tinc/name" "$NODE_JSON"); [ -n "$self" ] || self=$MEDUZA_NODE
-	self=$(printf '%s' "$self" | tr -cd 'A-Za-z0-9')
-	dev=$(jget "/nodes/$MEDUZA_NODE/tinc/dev_name" "$NODE_JSON"); [ -n "$dev" ] || dev=tnc0
-	port=$(jget "/nodes/$MEDUZA_NODE/tinc/port" "$NODE_JSON"); [ -n "$port" ] || port=655
-	ipv4=$(jget "/nodes/$MEDUZA_NODE/tinc/ipv4" "$NODE_JSON")
-	mkdir -p "/etc/tinc/$TINC_NET/hosts"
-	render_tinc_host "$MEDUZA_NODE"
-	peers=''
-	for id in $(children /nodes/ "$ALL_JSON"); do
-		[ "$(jget "/nodes/$id/tinc/enable" "$ALL_JSON")" = true ] || continue
-		render_tinc_host "$id"
+render_tinc() {
+	local net=$1 logical device config dir marker expected self port ipv4 priv edpriv peers='' id peername addr host stage ids
+	dir=${config%/*}
+	marker="$MEDUZA_STATE/changed.$logical"
+	expected="$MEDUZA_STATE/tinc.$net.hosts"
+	rm -f "$expected"
+	ensure_owned_generated_dir tinc "$net" "$logical" "$device" "$config" "$marker"
+	[ ! -L "$dir/hosts" ] || { log "refusing symlinked tinc hosts directory: $dir/hosts"; return 1; }
+	mkdir -p "$dir/hosts"
+	self=$(tinc_host_name "$MEDUZA_NODE") || { log 'local tinc name is empty'; return 1; }
+	render_tinc_host "$MEDUZA_NODE" "$dir" "$marker" "$expected"
+	ids="$MEDUZA_STATE/tinc.nodes"
+	children /nodes/ "$ALL_JSON" >"$ids" || return 1
+	while IFS= read -r id; do
+		[ -n "$id" ] || continue
 		[ "$id" = "$MEDUZA_NODE" ] && continue
+		valid_node_id "$id" || { log "invalid remote node ID: $id"; return 1; }
+		[ "$(jget "/nodes/$id/tinc/enable" "$ALL_JSON")" = true ] || continue
+		render_tinc_host "$id" "$dir" "$marker" "$expected"
 		addr=$(jget "/nodes/$id/tinc/address" "$ALL_JSON"); [ -n "$addr" ] || continue
-		peername=$(jget "/nodes/$id/tinc/name" "$ALL_JSON"); [ -n "$peername" ] || peername=$id
-		peername=$(printf '%s' "$peername" | tr -cd 'A-Za-z0-9')
+		peername=$(tinc_host_name "$id") || continue
+		grep -qxF "$peername" "$expected" 2>/dev/null || continue
 		peers="$peers $peername"
+	done <"$ids"
+	for host in "$dir"/hosts/*; do
+		[ -f "$host" ] || continue
+		grep -qxF "${host##*/}" "$expected" 2>/dev/null || remove_if_present "$host" "$marker"
 	done
+	port=$(jget "/nodes/$MEDUZA_NODE/tinc/port" "$NODE_JSON"); [ -n "$port" ] || port=655
+	stage="$MEDUZA_STATE/stage.tinc.$$"
 	{
 		echo "Name=$self"; echo 'AddressFamily=ipv4'; echo 'Mode=switch'; echo 'DeviceType=tap'
-		echo "Interface=$dev"; echo "Port=$port"; echo 'TCPOnly=yes'
+		echo "Interface=$device"; echo "Port=$port"; echo 'TCPOnly=yes'
 		for peername in $peers; do echo "ConnectTo = $peername"; done
-	} | atomic_write "/etc/tinc/$TINC_NET/tinc.conf" 644
+	} >"$stage"
+	commit_stage "$stage" "$config" 644 "$marker"
 	priv=$(jget "/nodes/$MEDUZA_NODE/tinc/private_key" "$NODE_JSON")
 	edpriv=$(jget "/nodes/$MEDUZA_NODE/tinc/ed25519_private_key" "$NODE_JSON")
-	[ -z "$priv" ] || printf '%s\n' "$priv" | atomic_write "/etc/tinc/$TINC_NET/rsa_key.priv" 600
-	[ -z "$edpriv" ] || printf '%s\n' "$edpriv" | atomic_write "/etc/tinc/$TINC_NET/ed25519_key.priv" 600
-	{ echo '#!/bin/sh'; echo 'ip link set "$INTERFACE" up'; [ -z "$ipv4" ] || echo "ip addr replace $ipv4 dev \"\$INTERFACE\""; } | atomic_write "/etc/tinc/$TINC_NET/tinc-up" 755
-	oldnet=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
-	[ -z "$oldnet" ] || tincd -n "$oldnet" -k >/dev/null 2>&1 || true
-	[ "$oldnet" = "$TINC_NET" ] || tincd -n "$TINC_NET" -k >/dev/null 2>&1 || true
-	# tinc termination is asynchronous. Give the previous daemon time to close
-	# /dev/net/tun before removing/recreating its interface.
-	sleep 1
-	ip link del "$dev" >/dev/null 2>&1 || true
-	tincd -n "$TINC_NET"
-	printf '%s\n' "$TINC_NET" >"$MEDUZA_STATE/tinc.net"
-	printf '%s\n' "$dev" >"$MEDUZA_STATE/tinc.dev"
+	if [ -n "$priv" ]; then atomic_value "$dir/rsa_key.priv" 600 "$marker" "$priv"; else remove_if_present "$dir/rsa_key.priv" "$marker"; fi
+	if [ -n "$edpriv" ]; then atomic_value "$dir/ed25519_key.priv" 600 "$marker" "$edpriv"; else remove_if_present "$dir/ed25519_key.priv" "$marker"; fi
+	ipv4=$(jget "/nodes/$MEDUZA_NODE/tinc/ipv4" "$NODE_JSON")
+	stage="$MEDUZA_STATE/stage.tinc-up.$$"
+	{ echo '#!/bin/sh'; echo "ip link set dev \"\$INTERFACE\" alias '$(managed_device_alias tinc "$net")' || exit 1"; echo 'ip link set "$INTERFACE" up'; [ -z "$ipv4" ] || echo "ip addr replace $ipv4 dev \"\$INTERFACE\""; } >"$stage"
+	commit_stage "$stage" "$dir/tinc-up" 755 "$marker"
+	stage="$MEDUZA_STATE/stage.tinc-down.$$"
+	{ echo '#!/bin/sh'; echo 'ip link set "$INTERFACE" down 2>/dev/null || true'; } >"$stage"
+	commit_stage "$stage" "$dir/tinc-down" 755 "$marker"
 }
 
-apply_openvpn() {
-	local names='' raw name dev key val opt old static_secret
-	for raw in $(children "/nodes/$MEDUZA_NODE/openvpn/" "$NODE_JSON"); do
-		name=$(safe_name "$raw"); [ -n "$name" ] || continue
-		enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/enable" "$NODE_JSON" || continue
-		names="$names $name"
-		rm -f "/etc/openvpn/meduza-$name.conf" "/etc/openvpn/meduza-$name.secret" "/etc/openvpn/meduza-$name.ca" "/etc/openvpn/meduza-$name.cert" "/etc/openvpn/meduza-$name.key" "/etc/openvpn/meduza-$name.tls_auth" "/etc/openvpn/meduza-$name.tls_crypt"
-		{
-			dev=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || dev="tun-$name"
-			echo "dev $dev"
-			static_secret=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/secret" "$NODE_JSON")
-			if [ -n "$static_secret" ] && openvpn_supports_static_compat; then
-				echo 'allow-deprecated-insecure-static-crypto'
+render_openvpn() {
+	local name=$1 logical=$2 device=$3 config=$4 dir marker key val opt static_secret enabled_client=0 path stage remote_values
+	dir=${config%/*}
+	marker="$MEDUZA_STATE/changed.$logical"
+	ensure_owned_generated_dir openvpn "$name" "$logical" "$device" "$config" "$marker"
+	static_secret=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/secret" "$NODE_JSON")
+	for key in secret ca cert key tls_auth tls_crypt; do
+		val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/$key" "$NODE_JSON")
+		path="$dir/$key.pem"
+		if [ -n "$val" ]; then atomic_value "$path" 600 "$marker" "$val"; else remove_if_present "$path" "$marker"; fi
+	done
+	for key in client tls_client pull; do enabled "/nodes/$MEDUZA_NODE/openvpn/$name/$key" "$NODE_JSON" && enabled_client=1; done
+	remote_values=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/remote" "$NODE_JSON")
+	stage="$MEDUZA_STATE/stage.openvpn-up.$$"
+	{
+		echo '#!/bin/sh'
+		echo "[ \"\${dev:-}\" = '$device' ] || exit 1"
+		echo "ip link set dev '$device' alias '$(managed_device_alias openvpn "$name")'"
+	} >"$stage"
+	commit_stage "$stage" "$dir/link-up" 755 "$marker"
+	stage="$MEDUZA_STATE/stage.openvpn.$$"
+	{
+		echo "dev $device"
+		val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/dev_type" "$NODE_JSON")
+		[ -n "$val" ] || val=tun
+		echo "dev-type $val"
+		echo "setenv MEDUZA_OWNER $MEDUZA_OWNER"
+		echo "setenv MEDUZA_INSTANCE $name"
+		echo 'script-security 2'
+		echo "up $dir/link-up"
+		if [ -n "$static_secret" ] && openvpn_supports_static_compat; then echo 'allow-deprecated-insecure-static-crypto'; fi
+		for key in proto port ifconfig keepalive verb auth cipher comp_lzo allow_compression remote_cert_tls key_direction; do
+			val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/$key" "$NODE_JSON"); [ -n "$val" ] || continue
+			opt=$(echo "$key" | tr _ -); echo "$opt $val"
+		done
+		lines "$remote_values" | while IFS= read -r val; do echo "remote $val"; done
+		for key in client tls_client persist_tun; do enabled "/nodes/$MEDUZA_NODE/openvpn/$name/$key" "$NODE_JSON" && echo "$(echo "$key" | tr _ -)"; done
+		enabled "/nodes/$MEDUZA_NODE/openvpn/$name/pull" "$NODE_JSON" && echo pull
+		[ "$enabled_client" = 0 ] || echo route-nopull
+		for key in secret ca cert key tls_auth tls_crypt; do
+			val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$name/$key" "$NODE_JSON"); [ -n "$val" ] || continue
+			opt=$(echo "$key" | tr _ -); echo "$opt $dir/$key.pem"
+		done
+	} >"$stage"
+	commit_stage "$stage" "$config" 600 "$marker"
+}
+
+render_wireguard() {
+	local name=$1 logical=$2 device=$3 config=$4 dir marker key value peer peers opt mtu addr stage addresses
+	dir=${config%/*}
+	marker="$MEDUZA_STATE/changed.$logical"
+	ensure_owned_generated_dir wireguard "$name" "$logical" "$device" "$config" "$marker"
+	peers=$(children "/nodes/$MEDUZA_NODE/wireguard/$name/peer/" "$NODE_JSON") || return 1
+	stage="$MEDUZA_STATE/stage.wireguard.$$"
+	{
+		echo '[Interface]'
+		value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$name/private_key" "$NODE_JSON"); [ -z "$value" ] || echo "PrivateKey = $value"
+		value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$name/listen_port" "$NODE_JSON"); [ -z "$value" ] || echo "ListenPort = $value"
+		for peer in $peers; do
+			echo; echo '[Peer]'
+			for key in public_key preshared_key allowed_ips endpoint persistent_keepalive; do
+				value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$name/peer/$peer/$key" "$NODE_JSON")
+				[ -n "$value" ] || { [ "$key" = allowed_ips ] && value='0.0.0.0/0' || continue; }
+				case "$key" in public_key) opt=PublicKey;; preshared_key) opt=PresharedKey;; allowed_ips) opt=AllowedIPs; value=$(lines "$value" | awk 'BEGIN { separator="" } { printf "%s%s", separator, $0; separator="," } END { print "" }');; endpoint) opt=Endpoint; value=$(lines "$value" | sed -n '1p');; *) opt=PersistentKeepalive;; esac
+				echo "$opt = $value"
+			done
+		done
+	} >"$stage"
+	commit_stage "$stage" "$config" 600 "$marker"
+	mtu=$(jget "/nodes/$MEDUZA_NODE/wireguard/$name/mtu" "$NODE_JSON")
+	addresses=$(jget "/nodes/$MEDUZA_NODE/wireguard/$name/address" "$NODE_JSON")
+	stage="$MEDUZA_STATE/stage.wireguard-settings.$$"
+	{
+		printf 'mtu\t%s\n' "$mtu"
+		lines "$addresses" | while IFS= read -r addr; do printf 'address\t%s\n' "$addr"; done
+	} >"$stage"
+	commit_stage "$stage" "$dir/settings" 600 "$marker"
+}
+
+render_configs() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		case "$kind" in
+			tinc) render_tinc "$instance" "$logical" "$device" "$config" ;;
+			openvpn) render_openvpn "$instance" "$logical" "$device" "$config" ;;
+			wireguard) render_wireguard "$instance" "$logical" "$device" "$config" ;;
+		esac
+	done <"$DESIRED"
+}
+
+wait_link_absent() {
+	local device=$1 count=0
+	while ip link show dev "$device" >/dev/null 2>&1; do
+		count=$((count + 1)); [ "$count" -lt 15 ] || return 1; sleep 1
+	done
+}
+
+wait_link_present() {
+	local device=$1 count=0
+	while ! ip link show dev "$device" >/dev/null 2>&1; do
+		count=$((count + 1)); [ "$count" -lt 15 ] || return 1; sleep 1
+	done
+}
+
+openvpn_process_matches() {
+	local proc=$1 config=$2 dir=$3 base=$4 native=$5 native_owned=$6 exe
+	exe=$(readlink "$proc/exe" 2>/dev/null || true)
+	case "$exe" in */openvpn|*/openvpn\ \(deleted\)) :;; *) return 1;; esac
+	tr '\000' '\n' <"$proc/cmdline" 2>/dev/null | awk \
+		-v path="$config" -v dir="$dir" -v base="$base" \
+		-v native="$native" -v native_owned="$native_owned" '
+		{ arg[NR]=$0 }
+		END {
+			for (i=1; i<=NR; i++) {
+				if ((arg[i] == "--config" && arg[i+1] == path) || arg[i] == "--config=" path)
+					exit 0
+				if (arg[i] == "--cd" && arg[i+1] == dir) cd=1
+				if ((arg[i] == "--config" && arg[i+1] == base) || arg[i] == "--config=" base)
+					short_config=1
+				if (native_owned == 1 && ((arg[i] == "--config" && arg[i+1] == native) || arg[i] == "--config=" native))
+					exit 0
+			}
+			exit !(cd && short_config)
+		}'
+}
+
+native_openvpn_runtime_is_owned() {
+	local instance=$1 logical=$2 device=$3 config=$4 native dir section_type
+	native="/var/run/openvpn.$logical.conf"
+	dir=${config%/*}
+	section_type=$(uci -q get "network.$logical" 2>/dev/null || true)
+	# /var/run/openvpn.<logical>.conf is a shared netifd namespace.  It is
+	# usable as recovery proof only while no replacement UCI section exists,
+	# and only when it references our exact owner-marked generated config.
+	[ -z "$section_type" ] || return 1
+	native_openvpn_runtime_file_is_owned "$instance" "$logical" "$device" "$config"
+}
+
+native_openvpn_runtime_file_is_owned() {
+	local instance=$1 logical=$2 device=$3 config=$4 native dir
+	native="/var/run/openvpn.$logical.conf"
+	dir=${config%/*}
+	manifest_has_device openvpn "$instance" "$device" "$INVENTORY" || return 1
+	generated_dir_is_owned "$dir" || return 1
+	[ -f "$config" ] && [ ! -L "$config" ] || return 1
+	grep -qxF "setenv MEDUZA_OWNER $MEDUZA_OWNER" "$config" 2>/dev/null || return 1
+	grep -qxF "setenv MEDUZA_INSTANCE $instance" "$config" 2>/dev/null || return 1
+	[ -f "$native" ] && [ ! -L "$native" ] || return 1
+	awk -v path="$config" '
+		$1 == "config" {
+			value=$2
+			if ((substr(value,1,1) == "\047" && substr(value,length(value),1) == "\047") ||
+			    (substr(value,1,1) == "\"" && substr(value,length(value),1) == "\""))
+				value=substr(value,2,length(value)-2)
+			if (value == path) found=1
+		}
+		END { exit !found }
+	' "$native"
+}
+
+native_openvpn_namespace_in_use() {
+	local logical=$1 native="/var/run/openvpn.$1.conf" proc exe
+	[ -e "$native" ] || [ -L "$native" ] && return 0
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		exe=$(readlink "$proc/exe" 2>/dev/null || true)
+		case "$exe" in */openvpn|*/openvpn\ \(deleted\)) :;; *) continue;; esac
+		tr '\000' '\n' <"$proc/cmdline" 2>/dev/null | awk -v path="$native" '
+			{ arg[NR]=$0 }
+			END {
+				for (i=1; i<=NR; i++)
+					if ((arg[i] == "--config" && arg[i+1] == path) || arg[i] == "--config=" path)
+						exit 0
+				exit 1
+			}' && return 0
+	done
+	return 1
+}
+
+preflight_openvpn_namespaces() {
+	local kind instance logical device config extra
+	[ -f /lib/netifd/proto/openvpn.sh ] || return 0
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ "$kind" = openvpn ] || continue
+		native_openvpn_namespace_in_use "$logical" || continue
+		native_openvpn_runtime_file_is_owned "$instance" "$logical" "$device" "$config" || {
+			log "native OpenVPN runtime namespace is already user-owned: $logical"
+			return 1
+		}
+	done <"$DESIRED"
+}
+
+owned_openvpn_process_running() {
+	local instance=$1 logical=$2 device=$3 config=$4 proc dir base native native_owned=0
+	dir=${config%/*}
+	base=${config##*/}
+	native="/var/run/openvpn.$logical.conf"
+	if network_entry_is_owned openvpn "$instance" "$logical" "$device" "$config" || \
+		native_openvpn_runtime_is_owned "$instance" "$logical" "$device" "$config"; then
+		native_owned=1
+	fi
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		openvpn_process_matches "$proc" "$config" "$dir" "$base" "$native" "$native_owned" && return 0
+	done
+	return 1
+}
+
+stop_owned_openvpn_processes() {
+	local instance=$1 logical=$2 device=$3 config=$4 signal=${5:-TERM} proc dir base native pid native_owned=0
+	dir=${config%/*}
+	base=${config##*/}
+	native="/var/run/openvpn.$logical.conf"
+	if network_entry_is_owned openvpn "$instance" "$logical" "$device" "$config" || \
+		native_openvpn_runtime_is_owned "$instance" "$logical" "$device" "$config"; then
+		native_owned=1
+	fi
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		if openvpn_process_matches "$proc" "$config" "$dir" "$base" "$native" "$native_owned"; then
+			pid=${proc##*/}; kill -"$signal" "$pid" 2>/dev/null || true
+		fi
+	done
+}
+
+network_identity_is_owned() {
+	local kind=$1 instance=$2 logical=$3 device=$4 type owner legacy value
+	type=$(uci -q get "network.$logical" 2>/dev/null || true)
+	[ "$type" = interface ] || return 1
+	owner=$(uci -q get "network.$logical.meduza_owner" 2>/dev/null || true)
+	legacy=$(uci -q get "network.$logical.meduza" 2>/dev/null || true)
+	if [ "$owner" = "$MEDUZA_OWNER" ]; then
+		"$UCI_HELPER" verify-live "network.$logical" >/dev/null 2>&1 || return 1
+		for value in \
+			"meduza_kind:$kind" "meduza_instance:$instance" \
+			"meduza_device:$device" "meduza_config:$config"; do
+			[ "$(uci -q get "network.$logical.${value%%:*}" 2>/dev/null || true)" = "${value#*:}" ] || return 1
+		done
+	elif [ -z "$owner" ] && [ "$legacy" = 1 ]; then
+		valid_instance_name "$instance" && valid_uci_name "$logical" && valid_device_name "$device" || return 1
+		case "$kind:$logical" in
+			"tinc:tinc_$(uci_instance_name "$instance")"|\
+			"openvpn:ovpn_$(uci_instance_name "$instance")"|\
+			"wireguard:wg_$(uci_instance_name "$instance")") :;;
+			*) return 1;;
+		esac
+		[ "$(uci -q get "network.$logical.device" 2>/dev/null || true)" = "$device" ] || return 1
+	else
+		return 1
+	fi
+}
+
+network_entry_is_owned() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 proto
+	network_identity_is_owned "$kind" "$instance" "$logical" "$device" || return 1
+	proto=$(uci -q get "network.$logical.proto" 2>/dev/null || true)
+	if [ "$kind" = openvpn ] && [ "$proto" = openvpn ]; then
+		[ "$(uci -q get "network.$logical.config" 2>/dev/null || true)" = "$config" ]
+	else
+		[ "$proto" = none ] || return 1
+		[ "$(uci -q get "network.$logical.device" 2>/dev/null || true)" = "$device" ]
+	fi
+}
+
+openvpn_section_is_owned() {
+	local logical=$1 device=$2 config=$3
+	[ -f /etc/config/openvpn ] || return 1
+	[ "$(uci -q get "openvpn.$logical" 2>/dev/null || true)" = openvpn ] || return 1
+	[ "$(uci -q get "openvpn.$logical.meduza_owner" 2>/dev/null || true)" = "$MEDUZA_OWNER" ] || return 1
+	"$UCI_HELPER" verify-live "openvpn.$logical" >/dev/null 2>&1 || return 1
+	[ "$(uci -q get "openvpn.$logical.config" 2>/dev/null || true)" = "$config" ] || return 1
+	[ "$(uci -q get "openvpn.$logical.dev" 2>/dev/null || true)" = "$device" ]
+}
+
+legacy_openvpn_is_owned() {
+	local instance=$1 device=$2 config=$3
+	[ "$config" = "/etc/openvpn/meduza-$instance.conf" ] || return 1
+	[ -f "$config" ] || return 1
+	[ "$(sed -n 's/^dev[[:space:]]\+//p' "$config" | sed -n '1p')" = "$device" ]
+}
+
+openvpn_runtime_stop_authorized() {
+	local instance=$1 logical=$2 device=$3 config=$4 dir
+	dir=${config%/*}
+	case "$config" in
+		"$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf")
+			generated_dir_is_owned "$dir"
+			;;
+		"/etc/openvpn/meduza-$instance.conf")
+			[ ! -L /etc/openvpn ] && [ ! -L "$config" ] || return 1
+			legacy_entry_authorized openvpn "$instance" "$logical" "$device" "$config" &&
+				legacy_authorized_hash_matches openvpn "$instance" "$logical" "$device" "$config" &&
+				legacy_openvpn_is_owned "$instance" "$device" "$config"
+			;;
+		*) return 1;;
+	esac
+}
+
+legacy_config_path() {
+	local kind=$1 instance=$2 config=$3
+	case "$kind:$config" in
+		"tinc:/etc/tinc/$instance/tinc.conf"|\
+		"openvpn:/etc/openvpn/meduza-$instance.conf"|\
+		"wireguard:$MEDUZA_DATA/wireguard/$instance.conf") return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+legacy_config_path_is_safe() {
+	local kind=$1 instance=$2 config=$3
+	legacy_config_path "$kind" "$instance" "$config" || return 1
+	[ -f "$config" ] && [ ! -L "$config" ] && [ ! -L "${config%/*}" ] || return 1
+	case "$kind" in
+		tinc) [ ! -L /etc/tinc ];;
+		openvpn) [ ! -L /etc/openvpn ];;
+		wireguard) [ ! -L "$MEDUZA_DATA" ];;
+	esac
+}
+
+legacy_entry_authorized() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5
+	[ -f "$LEGACY_AUTH" ] || return 1
+	awk -F '\t' -v k="$kind" -v i="$instance" -v l="$logical" -v d="$device" -v c="$config" \
+		'$1 == k && $2 == i && $3 == l && $4 == d && $5 == c && NF == 6 { found=1 } END { exit !found }' "$LEGACY_AUTH"
+}
+
+legacy_config_hash() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ ! -L "${1%/*}" ] || return 1
+	python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+legacy_authorized_hash_matches() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 expected actual
+	expected=$(awk -F '\t' -v k="$kind" -v i="$instance" -v l="$logical" -v d="$device" -v c="$config" \
+		'$1 == k && $2 == i && $3 == l && $4 == d && $5 == c && NF == 6 { print $6; exit }' "$LEGACY_AUTH")
+	[ -n "$expected" ] || return 1
+	legacy_config_path_is_safe "$kind" "$instance" "$config" || return 1
+	actual=$(legacy_config_hash "$config") || return 1
+	[ "$actual" = "$expected" ]
+}
+
+remove_legacy_authorization_entry() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 tmp
+	[ -f "$LEGACY_AUTH" ] || return 0
+	tmp="$MEDUZA_STATE/stage.legacy-auth-remove.$$"
+	awk -F '\t' -v k="$kind" -v i="$instance" -v l="$logical" -v d="$device" -v c="$config" \
+		'!($1 == k && $2 == i && $3 == l && $4 == d && $5 == c)' "$LEGACY_AUTH" >"$tmp" || return 1
+	commit_stage "$tmp" "$LEGACY_AUTH" 600
+}
+
+authorize_legacy_inventory() {
+	local kind instance logical device config extra line raw sorted hash
+	raw="$MEDUZA_STATE/legacy-auth.raw"
+	sorted="$MEDUZA_STATE/legacy-auth.sorted"
+	: >"$raw" || return 1
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		legacy_config_path "$kind" "$instance" "$config" || continue
+		line=$(manifest_line "$kind" "$instance" "$logical" "$device" "$config")
+		if legacy_entry_authorized "$kind" "$instance" "$logical" "$device" "$config"; then
+			awk -F '\t' -v k="$kind" -v i="$instance" -v l="$logical" -v d="$device" -v c="$config" \
+				'$1 == k && $2 == i && $3 == l && $4 == d && $5 == c && NF == 6 { print; exit }' "$LEGACY_AUTH" >>"$raw" || return 1
+			continue
+		fi
+		# Capture legacy deletion authority while the old owner-marked UCI
+		# identity still exists.  The durable authorization survives a crash
+		# after UCI commit without turning a generic meduza=1 option into proof.
+		network_entry_is_owned "$kind" "$instance" "$logical" "$device" "$config" || continue
+		legacy_config_path_is_safe "$kind" "$instance" "$config" || continue
+		case "$kind" in
+			tinc) legacy_tinc_is_owned "$instance" "$device" "$config" || continue ;;
+			openvpn) legacy_openvpn_is_owned "$instance" "$device" "$config" || continue ;;
+			wireguard)
+				[ -f "$config" ] && grep -q '^\[Interface\]' "$config" || continue
+				;;
+		esac
+		hash=$(legacy_config_hash "$config") || return 1
+		printf '%s\t%s\n' "$line" "$hash" >>"$raw" || return 1
+	done <"$INVENTORY"
+	sort -u "$raw" >"$sorted" || return 1
+	atomic_write "$LEGACY_AUTH" 600 <"$sorted" || return 1
+	rm -f "$raw" "$sorted" || return 1
+}
+
+clear_legacy_authorization() {
+	[ -e "$LEGACY_AUTH" ] || return 0
+	rm -f "$LEGACY_AUTH" || return 1
+	fsync "${LEGACY_AUTH%/*}" || return 1
+}
+
+tinc_process_matches() {
+	local proc=$1 instance=$2 config_dir=$3 allow_default=$4 exe
+	exe=$(readlink "$proc/exe" 2>/dev/null || true)
+	case "$exe" in */tincd|*/tincd\ \(deleted\)) :;; *) return 1;; esac
+	tr '\000' '\n' <"$proc/cmdline" 2>/dev/null | awk \
+		-v net="$instance" -v config="$config_dir" -v allow_default="$allow_default" '
+		{ arg[NR]=$0 }
+		END {
+			for (i=1; i<=NR; i++) {
+				if ((arg[i] == "-n" || arg[i] == "--net") && arg[i+1] == net) found_net=1
+				if (arg[i] == "--net=" net || arg[i] == "-n" net) found_net=1
+				if (arg[i] == "-c" || arg[i] == "--config" || arg[i] ~ /^--config=/ || (arg[i] ~ /^-c./ && arg[i] != "-c")) config_specified=1
+				if ((arg[i] == "-c" || arg[i] == "--config") && arg[i+1] == config) found_config=1
+				if (arg[i] == "--config=" config || arg[i] == "-c" config) found_config=1
+			}
+			exit !(found_net && (found_config || (allow_default == 1 && !config_specified)))
+		}'
+}
+
+stop_owned_tinc_processes() {
+	local instance=$1 pidfile=$2 signal=${3:-TERM} pid proc config_dir="$MEDUZA_GENERATED/tinc/$1"
+	pid=$(cat "$pidfile" 2>/dev/null || true)
+	if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] && \
+		tinc_process_matches "/proc/$pid" "$instance" "$config_dir" 0; then
+		kill -"$signal" "$pid" 2>/dev/null || true
+	fi
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		if tinc_process_matches "$proc" "$instance" "$config_dir" 0; then
+			pid=${proc##*/}; kill -"$signal" "$pid" 2>/dev/null || true
+		fi
+	done
+}
+
+owned_tinc_process_running() {
+	local instance=$1 proc config_dir="$MEDUZA_GENERATED/tinc/$1"
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		tinc_process_matches "$proc" "$instance" "$config_dir" 0 && return 0
+	done
+	return 1
+}
+
+stop_authorized_legacy_tinc_processes() {
+	local instance=$1 signal=${2:-TERM} proc pid config_dir="/etc/tinc/$1"
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		if tinc_process_matches "$proc" "$instance" "$config_dir" 1; then
+			pid=${proc##*/}; kill -"$signal" "$pid" 2>/dev/null || true
+		fi
+	done
+}
+
+wait_openvpn_process_absent() {
+	local instance=$1 logical=$2 device=$3 config=$4 count=0
+	while owned_openvpn_process_running "$instance" "$logical" "$device" "$config"; do
+		count=$((count + 1)); [ "$count" -lt 6 ] || return 1; sleep 1
+	done
+}
+
+wait_tinc_process_absent() {
+	local instance=$1 legacy=${2:-0} count=0
+	while { [ "$legacy" = 1 ] && legacy_tinc_process_running "$instance"; } || \
+		{ [ "$legacy" = 0 ] && owned_tinc_process_running "$instance"; }; do
+		count=$((count + 1)); [ "$count" -lt 6 ] || return 1; sleep 1
+	done
+}
+
+legacy_tinc_process_running() {
+	local instance=$1 proc config_dir="/etc/tinc/$1"
+	for proc in /proc/[0-9]*; do
+		[ -r "$proc/cmdline" ] || continue
+		tinc_process_matches "$proc" "$instance" "$config_dir" 1 && return 0
+	done
+	return 1
+}
+
+stop_runtime_entry() {
+	local kind=$1 instance=$2 logical=$3 device=$4 config=$5 pidfile can_delete=0
+	local network_owned=0 process_owned=0 legacy_owned=0 section_type network_proto
+	valid_managed_entry "$kind" "$instance" "$logical" "$device" "$config" || {
+		log "refusing to stop unsafe managed-interface record: $kind/$instance"
+		return 1
+	}
+	if network_entry_is_owned "$kind" "$instance" "$logical" "$device" "$config"; then
+		network_owned=1
+	fi
+	if [ "$network_owned" = 1 ]; then
+		network_proto=$(uci -q get "network.$logical.proto" 2>/dev/null || true)
+		if [ "$kind" = openvpn ] && [ "$network_proto" = openvpn ]; then
+			command -v ifdown >/dev/null 2>&1 || { log 'ifdown is required to stop native OpenVPN'; return 1; }
+			ifdown "$logical" >/dev/null 2>&1 || { log "native OpenVPN teardown failed: $logical"; return 1; }
+		else
+			command -v ifdown >/dev/null 2>&1 && ifdown "$logical" >/dev/null 2>&1 || true
+		fi
+	fi
+	case "$kind" in
+		openvpn)
+			if owned_openvpn_process_running "$instance" "$logical" "$device" "$config"; then
+				openvpn_runtime_stop_authorized "$instance" "$logical" "$device" "$config" || {
+					log "refusing to stop OpenVPN process without current ownership proof: $instance"
+					return 1
+				}
+				process_owned=1
 			fi
-			for key in dev_type proto port ifconfig keepalive verb auth cipher comp_lzo allow_compression remote_cert_tls key_direction; do
-				val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/$key" "$NODE_JSON"); [ -n "$val" ] || continue
-				opt=$(echo "$key" | tr _ -); echo "$opt $val"
-			done
-			for val in $(lines "$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/remote" "$NODE_JSON")" | tr ' ' '@'); do echo "remote $(echo "$val" | tr @ ' ')"; done
-			for key in client tls_client persist_tun; do enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/$key" "$NODE_JSON" && echo "$(echo "$key" | tr _ -)"; done
-			enabled "/nodes/$MEDUZA_NODE/openvpn/$raw/pull" "$NODE_JSON" && { echo pull; echo route-nopull; }
-			for key in secret ca cert key tls_auth tls_crypt; do
-				val=$(jget "/nodes/$MEDUZA_NODE/openvpn/$raw/$key" "$NODE_JSON"); [ -n "$val" ] || continue
-				printf '%s\n' "$val" | atomic_write "/etc/openvpn/meduza-$name.$key" 600
-				echo "$(echo "$key" | tr _ -) /etc/openvpn/meduza-$name.$key"
-			done
-		} | atomic_write "/etc/openvpn/meduza-$name.conf" 600
-	done
-	old=$(cat "$MEDUZA_STATE/openvpn.instances" 2>/dev/null || true)
-	for name in $old; do case " $names " in *" $name "*) :;; *) rm -f "/etc/openvpn/meduza-$name.conf" "/etc/openvpn/meduza-$name."*;; esac; done
-	printf '%s\n' "$names" >"$MEDUZA_STATE/openvpn.instances"
-	reload_or_restart openvpn
+			if [ "$config" = "$MEDUZA_GENERATED/openvpn/$instance/openvpn.conf" ]; then
+				stop_registered_modern_openvpn "$logical" "$config" || return 1
+			fi
+			if legacy_entry_authorized "$kind" "$instance" "$logical" "$device" "$config" && \
+				legacy_authorized_hash_matches "$kind" "$instance" "$logical" "$device" "$config" && \
+				legacy_openvpn_is_owned "$instance" "$device" "$config"; then
+				legacy_owned=1
+				[ ! -x /etc/init.d/openvpn ] || /etc/init.d/openvpn stop "meduza-$instance" >/dev/null 2>&1 || return 1
+			fi
+			[ "$process_owned" = 0 ] || stop_owned_openvpn_processes "$instance" "$logical" "$device" "$config"
+			if [ "$process_owned" = 1 ] && ! wait_openvpn_process_absent "$instance" "$logical" "$device" "$config"; then
+				stop_owned_openvpn_processes "$instance" "$logical" "$device" "$config" KILL
+				wait_openvpn_process_absent "$instance" "$logical" "$device" "$config" || {
+					log "managed OpenVPN process did not stop: $instance"
+					return 1
+				}
+			fi
+			device_is_owned "$kind" "$instance" "$device" && can_delete=1
+			;;
+		wireguard)
+			if device_is_owned "$kind" "$instance" "$device"; then
+				can_delete=1
+			fi
+			[ "$can_delete" = 0 ] || ip link del "$device" >/dev/null 2>&1 || true
+			if ip link show dev "$device" >/dev/null 2>&1; then
+				log "managed WireGuard device did not stop cleanly: $device"
+				return 1
+			fi
+			runtime_device_remove "$kind" "$instance" "$device"
+			return 0
+			;;
+		tinc)
+			pidfile="$MEDUZA_STATE/tinc.$instance.pid"
+			if owned_tinc_process_running "$instance"; then
+				generated_dir_is_owned "$MEDUZA_GENERATED/tinc/$instance" || {
+					log "refusing to stop tinc process without generated-directory ownership: $instance"
+					return 1
+				}
+				process_owned=1
+			fi
+			[ "$process_owned" = 0 ] || stop_owned_tinc_processes "$instance" "$pidfile"
+			if legacy_entry_authorized "$kind" "$instance" "$logical" "$device" "$config" && \
+				legacy_authorized_hash_matches "$kind" "$instance" "$logical" "$device" "$config" && \
+				legacy_tinc_is_owned "$instance" "$device" "$config"; then
+				legacy_owned=1
+				stop_authorized_legacy_tinc_processes "$instance"
+			fi
+			if [ "$process_owned" = 1 ] && ! wait_tinc_process_absent "$instance" 0; then
+				stop_owned_tinc_processes "$instance" "$pidfile" KILL
+				wait_tinc_process_absent "$instance" 0 || { log "managed tinc process did not stop: $instance"; return 1; }
+			fi
+			if [ "$legacy_owned" = 1 ] && ! wait_tinc_process_absent "$instance" 1; then
+				stop_authorized_legacy_tinc_processes "$instance" KILL
+				wait_tinc_process_absent "$instance" 1 || { log "legacy Meduza tinc process did not stop: $instance"; return 1; }
+			fi
+			device_is_owned "$kind" "$instance" "$device" && can_delete=1
+			rm -f "$pidfile"
+			;;
+	esac
+	if ip link show dev "$device" >/dev/null 2>&1; then
+		wait_link_absent "$device" || true
+	fi
+	if ip link show dev "$device" >/dev/null 2>&1 && [ "$can_delete" = 1 ]; then
+		if device_is_owned "$kind" "$instance" "$device"; then
+			ip link del "$device" >/dev/null 2>&1 || true
+		fi
+	fi
+	if ip link show dev "$device" >/dev/null 2>&1; then
+		log "managed $kind device did not stop cleanly: $device"
+		# Do not discard positive ownership after a failed delete; it is needed
+		# to retry safely instead of misclassifying our own busy TUN/TAP as user data.
+		device_is_owned "$kind" "$instance" "$device" || \
+			runtime_device_remove "$kind" "$instance" "$device"
+		return 1
+	fi
+	runtime_device_remove "$kind" "$instance" "$device"
 }
 
-apply_wireguard() {
-	local names='' raw name dev key value peer peers addr mtu old
-	for raw in $(children "/nodes/$MEDUZA_NODE/wireguard/" "$NODE_JSON"); do
-		name=$(safe_name "$raw"); [ -n "$name" ] || continue
-		enabled "/nodes/$MEDUZA_NODE/wireguard/$raw/enable" "$NODE_JSON" || continue
-		names="$names $name"
-		dev=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || dev="wg-$name"
-		{
-			echo '[Interface]'
-			value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/private_key" "$NODE_JSON"); [ -z "$value" ] || echo "PrivateKey = $value"
-			value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/listen_port" "$NODE_JSON"); [ -z "$value" ] || echo "ListenPort = $value"
-			peers=$(children "/nodes/$MEDUZA_NODE/wireguard/$raw/peer/" "$NODE_JSON")
-			for peer in $peers; do
-				echo; echo '[Peer]'
-				for key in public_key preshared_key allowed_ips endpoint persistent_keepalive; do
-					value=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/peer/$peer/$key" "$NODE_JSON")
-					[ -n "$value" ] || { [ "$key" = allowed_ips ] && value='0.0.0.0/0' || continue; }
-					case $key in public_key) opt=PublicKey;; preshared_key) opt=PresharedKey;; allowed_ips) opt=AllowedIPs; value=$(lines "$value" | paste -sd, -);; endpoint) opt=Endpoint; value=$(lines "$value" | head -n1);; *) opt=PersistentKeepalive;; esac
-					echo "$opt = $value"
-				done
-			done
-		} | atomic_write "/etc/meduza/wireguard/$name.conf" 600
-		ip link show "$dev" >/dev/null 2>&1 || ip link add "$dev" type wireguard
-		wg setconf "$dev" "/etc/meduza/wireguard/$name.conf"
-		ip addr flush dev "$dev"
-		lines "$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/address" "$NODE_JSON")" | while read -r addr; do ip addr add "$addr" dev "$dev"; done
-		mtu=$(jget "/nodes/$MEDUZA_NODE/wireguard/$raw/mtu" "$NODE_JSON"); [ -z "$mtu" ] || ip link set mtu "$mtu" dev "$dev"
-		ip link set up dev "$dev"
-		printf '%s\n' "$dev" >"$MEDUZA_STATE/wireguard.$name.dev"
-	done
-	old=$(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true)
-	for name in $old; do case " $names " in *" $name "*) :;; *) dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true); [ -z "$dev" ] || ip link del "$dev" 2>/dev/null || true; rm -f "$MEDUZA_STATE/wireguard.$name.dev";; esac; done
-	printf '%s\n' "$names" >"$MEDUZA_STATE/wireguard.instances"
+remove_generated_config() {
+	local kind=$1 instance=$2 device=$3 config=$4 dir logical
+	dir=${config%/*}
+	case "$kind:$dir" in
+		"tinc:$MEDUZA_GENERATED/tinc/$instance"|"openvpn:$MEDUZA_GENERATED/openvpn/$instance"|"wireguard:$MEDUZA_GENERATED/wireguard/$instance")
+			case "$kind" in
+				tinc) logical="tinc_$(uci_instance_name "$instance")";;
+				openvpn) logical="ovpn_$(uci_instance_name "$instance")";;
+				wireguard) logical="wg_$(uci_instance_name "$instance")";;
+			esac
+			remove_owned_generated_dir "$kind" "$instance" "$logical" "$device" "$config"
+			;;
+		*)
+			case "$kind" in
+				tinc)
+					if [ ! -e "/etc/tinc/$instance" ] && [ ! -L "/etc/tinc/$instance" ]; then
+						fsync /etc/tinc || return 1
+						remove_legacy_authorization_entry "$kind" "$instance" "tinc_$(uci_instance_name "$instance")" "$device" "$config"
+						return
+					fi
+					if [ ! -e "$config" ] && [ ! -L "$config" ]; then
+						fsync "/etc/tinc/$instance" || return 1
+						fsync /etc/tinc || return 1
+						remove_legacy_authorization_entry "$kind" "$instance" "tinc_$(uci_instance_name "$instance")" "$device" "$config"
+						return
+					fi
+					legacy_entry_authorized "$kind" "$instance" "tinc_$(uci_instance_name "$instance")" "$device" "$config" || {
+							log "not deleting unowned legacy tinc path: $config"; return 1;
+						}
+					legacy_authorized_hash_matches "$kind" "$instance" "tinc_$(uci_instance_name "$instance")" "$device" "$config" || {
+						log "legacy tinc config changed after retirement authorization: $config"; return 1;
+					}
+					[ ! -L "/etc/tinc/$instance" ] && [ ! -L "$config" ] || { log "not deleting symlinked legacy tinc path: $config"; return 1; }
+					# r23 did not persist hashes for every host/key sidecar.  Delete only
+					# the exact, authorized primary config; ambiguous administrator files
+					# are deliberately retained instead of recursively removing the tree.
+					rm -f "$config" || return 1
+					fsync "/etc/tinc/$instance" || return 1
+					fsync /etc/tinc || return 1
+					remove_legacy_authorization_entry "$kind" "$instance" "tinc_$(uci_instance_name "$instance")" "$device" "$config" || return 1
+					;;
+				openvpn)
+					if [ ! -e "$config" ]; then
+						fsync /etc/openvpn || return 1
+						remove_legacy_authorization_entry "$kind" "$instance" "ovpn_$(uci_instance_name "$instance")" "$device" "$config"
+						return
+					fi
+					legacy_entry_authorized "$kind" "$instance" "ovpn_$(uci_instance_name "$instance")" "$device" "$config" || {
+							log "not deleting unowned legacy OpenVPN path: $config"; return 1;
+						}
+					legacy_authorized_hash_matches "$kind" "$instance" "ovpn_$(uci_instance_name "$instance")" "$device" "$config" || {
+						log "legacy OpenVPN config changed after retirement authorization: $config"; return 1;
+					}
+					[ ! -L /etc/openvpn ] && [ ! -L "$config" ] || { log "not deleting symlinked legacy OpenVPN path: $config"; return 1; }
+					# Sidecars from r23 have no durable per-file ownership proof.  The
+					# primary .conf is enough to prevent legacy autostart; leave ambiguous
+					# sidecars rather than deleting a same-named administrator file.
+					rm -f "$config" || return 1
+					fsync /etc/openvpn || return 1
+					remove_legacy_authorization_entry "$kind" "$instance" "ovpn_$(uci_instance_name "$instance")" "$device" "$config" || return 1
+					;;
+				wireguard)
+					if [ ! -e "$config" ] && [ ! -L "$config" ]; then
+						[ ! -d "$MEDUZA_DATA/wireguard" ] || fsync "$MEDUZA_DATA/wireguard" || return 1
+						fsync "$MEDUZA_DATA" || return 1
+						remove_legacy_authorization_entry "$kind" "$instance" "wg_$(uci_instance_name "$instance")" "$device" "$config"
+						return
+					fi
+					legacy_entry_authorized "$kind" "$instance" "wg_$(uci_instance_name "$instance")" "$device" "$config" || {
+							log "not deleting unowned legacy WireGuard path: $config"; return 1;
+						}
+					legacy_authorized_hash_matches "$kind" "$instance" "wg_$(uci_instance_name "$instance")" "$device" "$config" || {
+						log "legacy WireGuard config changed after retirement authorization: $config"; return 1;
+					}
+					rm -f "$config" || return 1
+					fsync "$MEDUZA_DATA/wireguard" || return 1
+					rmdir "$MEDUZA_DATA/wireguard" 2>/dev/null || true
+					fsync "$MEDUZA_DATA" || return 1
+					remove_legacy_authorization_entry "$kind" "$instance" "wg_$(uci_instance_name "$instance")" "$device" "$config" || return 1
+					;;
+			esac
+			;;
+	esac
+}
+
+stop_stale_resources() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		entry_is_desired "$kind" "$instance" "$logical" "$device" "$config" && continue
+		stop_runtime_entry "$kind" "$instance" "$logical" "$device" "$config"
+	done <"$INVENTORY"
+}
+
+cleanup_stale_configs() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		entry_is_desired "$kind" "$instance" "$logical" "$device" "$config" && continue
+		desired_uses_config "$kind" "$config" || \
+			remove_generated_config "$kind" "$instance" "$device" "$config"
+	done <"$INVENTORY"
+}
+
+interface_is_up() {
+	local logical=$1
+	command -v ifstatus >/dev/null 2>&1 || return 1
+	ifstatus "$logical" 2>/dev/null | grep -q '"up"[[:space:]]*:[[:space:]]*true'
+}
+
+openvpn_procd_instance_state() {
+	local logical=$1 config=$2 snapshot="$MEDUZA_STATE/openvpn.procd.$$" status dir
+	command -v ubus >/dev/null 2>&1 || return 2
+	ubus call service list '{"name":"openvpn"}' >"$snapshot" 2>/dev/null || return 2
+	python3 -c '
+import json, os, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    instances = value.get("openvpn", {}).get("instances", {})
+    if not isinstance(instances, dict):
+        raise ValueError("invalid procd instance map")
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(2)
+instance = instances.get(sys.argv[2])
+if instance is None:
+    raise SystemExit(1)
+command = instance.get("command") if isinstance(instance, dict) else None
+if not isinstance(command, list) or not command or os.path.basename(str(command[0])) != "openvpn":
+    raise SystemExit(3)
+args = [str(item) for item in command]
+path = sys.argv[3]
+directory, base = os.path.split(path)
+absolute = any((arg == "--config" and index + 1 < len(args) and args[index + 1] == path)
+               or arg == "--config=" + path
+               for index, arg in enumerate(args))
+has_cd = any((arg == "--cd" and index + 1 < len(args) and args[index + 1] == directory)
+             or arg == "--cd=" + directory
+             for index, arg in enumerate(args))
+short = any((arg == "--config" and index + 1 < len(args) and args[index + 1] == base)
+            or arg == "--config=" + base
+            for index, arg in enumerate(args))
+raise SystemExit(0 if absolute or (has_cd and short) else 3)
+' "$snapshot" "$logical" "$config"
+	status=$?
+	rm -f "$snapshot" || return 2
+	if [ "$status" -eq 0 ]; then
+		dir=${config%/*}
+		generated_dir_is_owned "$dir" && [ -f "$config" ] && [ ! -L "$config" ] && \
+			grep -qxF "setenv MEDUZA_OWNER $MEDUZA_OWNER" "$config" 2>/dev/null || return 3
+	fi
+	return "$status"
+}
+
+stop_registered_modern_openvpn() {
+	local logical=$1 config=$2 status
+	[ -x /etc/init.d/openvpn ] || return 0
+	if openvpn_procd_instance_state "$logical" "$config"; then
+		/etc/init.d/openvpn stop "$logical" >/dev/null 2>&1 || return 1
+		return 0
+	fi
+	status=$?
+	[ "$status" -eq 1 ] && return 0
+	[ "$status" -ne 3 ] || log "registered OpenVPN instance is not Meduza-owned: $logical"
+	return 1
+}
+
+apply_tinc_runtime() {
+	local instance=$1 logical=$2 device=$3 config=$4 marker pidfile
+	marker="$MEDUZA_STATE/changed.$logical"
+	pidfile="$MEDUZA_STATE/tinc.$instance.pid"
+	if [ -f "$marker" ] || ! ip link show dev "$device" >/dev/null 2>&1; then
+		stop_runtime_entry tinc "$instance" "$logical" "$device" "$config"
+		# With both -c and -n, tinc uses -c as the actual configuration
+		# directory; -n only supplies the network identity to scripts/logging.
+		tincd -c "${config%/*}" -n "$instance" --pidfile="$pidfile"
+		wait_link_present "$device" || { log "tinc did not create device $device"; return 1; }
+		device_is_owned tinc "$instance" "$device" || {
+			log "could not mark tinc device ownership: $device"
+			stop_owned_tinc_processes "$instance" "$pidfile"
+			return 1
+		}
+		runtime_device_add tinc "$instance" "$device"
+	fi
+	command -v ifup >/dev/null 2>&1 || { log 'ifup is required to activate the tinc OpenWrt interface'; return 1; }
+	ifup "$logical" >/dev/null 2>&1 || { log "could not activate OpenWrt interface: $logical"; return 1; }
+	rm -f "$marker"
+}
+
+apply_openvpn_runtime() {
+	local instance=$1 logical=$2 device=$3 config=$4 marker changed=0 section_type status
+	marker="$MEDUZA_STATE/changed.$logical"
+	[ -f "$marker" ] && changed=1
+	grep -qxF "$logical" "$MEDUZA_STATE/sync.changed.interfaces" 2>/dev/null && changed=1
+	if [ -f /lib/netifd/proto/openvpn.sh ]; then
+		[ "$changed" = 0 ] || {
+			if interface_is_up "$logical" || ip link show dev "$device" >/dev/null 2>&1 || \
+				owned_openvpn_process_running "$instance" "$logical" "$device" "$config"; then
+				command -v ifdown >/dev/null 2>&1 || { log 'ifdown is required to replace the OpenVPN interface'; return 1; }
+				ifdown "$logical" >/dev/null 2>&1 || { log "could not stop changed OpenWrt interface: $logical"; return 1; }
+			fi
+			# Stop a 24.10-style instance during an in-place migration to the
+			# 25.12 netifd protocol handler, if the legacy init script remains.
+			if [ -x /etc/init.d/openvpn ]; then
+				section_type=$(uci -q get "openvpn.$logical" 2>/dev/null || true)
+				if [ -n "$section_type" ] && ! openvpn_section_is_owned "$logical" "$device" "$config"; then
+					log "refusing to unregister replacement OpenVPN instance during native migration: $logical"
+					return 1
+				fi
+				# `running` is false during procd's respawn backoff.  Inspect the
+				# registered instance map instead; an already-absent instance is an
+				# idempotent retry, while query/stop errors remain fatal.
+				stop_registered_modern_openvpn "$logical" "$config" || return 1
+			fi
+		}
+		if [ "$changed" = 1 ] || ! interface_is_up "$logical"; then
+			ifup "$logical" >/dev/null 2>&1 || { log "could not start native OpenVPN interface: $logical"; return 1; }
+		fi
+	elif [ -x /etc/init.d/openvpn ]; then
+		if [ "$changed" = 1 ]; then
+			/etc/init.d/openvpn restart "$logical"
+		elif ! /etc/init.d/openvpn running "$logical" >/dev/null 2>&1; then
+			/etc/init.d/openvpn start "$logical"
+		fi
+		command -v ifup >/dev/null 2>&1 || { log 'ifup is required to activate the OpenVPN interface'; return 1; }
+		ifup "$logical" >/dev/null 2>&1 || { log "could not activate OpenWrt interface: $logical"; return 1; }
+	fi
+	if wait_link_present "$device"; then
+		device_is_owned openvpn "$instance" "$device" || {
+			log "could not mark OpenVPN device ownership: $device"
+			stop_runtime_entry openvpn "$instance" "$logical" "$device" "$config"
+			return 1
+		}
+		runtime_device_add openvpn "$instance" "$device"
+	else
+		if owned_openvpn_process_running "$instance" "$logical" "$device" "$config"; then
+			log "OpenVPN $instance is registered and still connecting"
+		else
+			log "OpenVPN $instance exited before creating device $device"
+			return 1
+		fi
+	fi
+	rm -f "$marker"
+}
+
+apply_wireguard_runtime() {
+	local instance=$1 logical=$2 device=$3 config=$4 marker settings type value mtu=''
+	marker="$MEDUZA_STATE/changed.$logical"
+	settings="${config%/*}/settings"
+	if [ -f "$marker" ] && ip link show dev "$device" >/dev/null 2>&1; then
+		# Recreate changed devices so removed private-key/listen-port/MTU values
+		# cannot leak from the previous kernel object.
+		stop_runtime_entry wireguard "$instance" "$logical" "$device" "$config"
+	fi
+	if [ -f "$marker" ] || ! ip link show dev "$device" >/dev/null 2>&1; then
+		if ! ip link show dev "$device" >/dev/null 2>&1; then
+			ip link add "$device" type wireguard
+			mark_device_owned wireguard "$instance" "$device" || {
+				ip link del "$device" >/dev/null 2>&1 || true
+				log "could not mark WireGuard device ownership: $device"
+				return 1
+			}
+			runtime_device_add wireguard "$instance" "$device" || {
+				ip link del "$device" >/dev/null 2>&1 || true
+				return 1
+			}
+		fi
+		device_is_owned wireguard "$instance" "$device" || {
+			log "refusing to configure unowned WireGuard device: $device"
+			return 1
+		}
+		wg setconf "$device" "$config"
+		ip addr flush dev "$device"
+		while IFS="$TAB" read -r type value; do
+			case "$type" in mtu) mtu=$value;; address) [ -z "$value" ] || ip addr add "$value" dev "$device";; esac
+		done <"$settings"
+		[ -z "$mtu" ] || ip link set mtu "$mtu" dev "$device"
+	fi
+	ip link set up dev "$device"
+	runtime_device_add wireguard "$instance" "$device"
+	command -v ifup >/dev/null 2>&1 || { log 'ifup is required to activate the WireGuard interface'; return 1; }
+	ifup "$logical" >/dev/null 2>&1 || { log "could not activate OpenWrt interface: $logical"; return 1; }
+	rm -f "$marker"
+}
+
+apply_vpn_runtime() {
+	local kind instance logical device config extra
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		case "$kind" in
+			tinc) apply_tinc_runtime "$instance" "$logical" "$device" "$config" ;;
+			openvpn) apply_openvpn_runtime "$instance" "$logical" "$device" "$config" ;;
+			wireguard) apply_wireguard_runtime "$instance" "$logical" "$device" "$config" ;;
+		esac
+	done <"$DESIRED"
 }
 
 apply_frr() {
-	local asn rid ospf area lans private peer peer_asn peer_ip dev raw name internal id behavior
+	local asn rid ospf area lans private peer peer_asn peer_ip dev name internal id behavior marker backup stage takeover takeover_action origin origin_action owned=0 hash expected names openvpn_names wireguard_names node_ids
+	[ -x /etc/init.d/frr ] || { log 'FRR is not installed; skipping FRR'; return 0; }
+	marker=$MEDUZA_STATE/changed.frr
+	backup=$MEDUZA_DATA/managed/frr.conf.backup
+	takeover=$MEDUZA_DATA/managed/frr.takeover.pending
+	origin=$MEDUZA_DATA/managed/frr.origin
+	[ ! -L /etc/frr ] && [ ! -L /etc/frr/frr.conf ] && [ ! -L "$backup" ] && [ ! -L "$takeover" ] && [ ! -L "$origin" ] || {
+		log 'refusing symlinked FRR configuration or journal path'; return 1;
+	}
+	grep -qxF "! meduza-owner: $MEDUZA_OWNER" /etc/frr/frr.conf 2>/dev/null && owned=1
+	origin_action=$(cat "$origin" 2>/dev/null || true)
+	takeover_action=$(cat "$takeover" 2>/dev/null || true)
+	case "$origin_action" in ''|backup|absent|minimal) :;; *) log 'invalid FRR origin journal'; return 1;; esac
+	case "$takeover_action" in ''|backup|pending|absent|present:*) :;; *) log 'invalid FRR takeover journal'; return 1;; esac
+
+	if [ -z "$origin_action" ]; then
+		if [ "$owned" = 1 ]; then
+			# Upgrade an owner-marked configuration created before origin tracking.
+			if [ -f "$backup" ]; then origin_action=backup; else origin_action=minimal; fi
+			atomic_value "$origin" 600 '' "$origin_action" || return 1
+		elif [ -n "$takeover_action" ]; then
+			case "$takeover_action" in
+				present:*)
+					expected=${takeover_action#present:}
+					[ "${#expected}" -eq 64 ] && ! printf '%s' "$expected" | grep -q '[^0-9a-f]' || { log 'invalid FRR takeover hash'; return 1; }
+					hash=$(legacy_config_hash /etc/frr/frr.conf) || return 1
+					[ "$hash" = "$expected" ] || { log 'FRR changed during pending takeover'; return 1; }
+					[ -f "$backup" ] || atomic_write "$backup" 600 </etc/frr/frr.conf || return 1
+					cmp -s "$backup" /etc/frr/frr.conf || { log 'FRR backup no longer matches pending takeover'; return 1; }
+					origin_action=backup
+					;;
+				backup|pending)
+					[ -f "$backup" ] && [ -f /etc/frr/frr.conf ] && cmp -s "$backup" /etc/frr/frr.conf || { log 'FRR changed during legacy pending takeover'; return 1; }
+					origin_action=backup
+					;;
+				absent)
+					[ ! -e /etc/frr/frr.conf ] && [ ! -L /etc/frr/frr.conf ] && [ ! -f "$backup" ] || { log 'FRR appeared during pending absent takeover'; return 1; }
+					origin_action=absent
+					;;
+			esac
+			atomic_value "$origin" 600 '' "$origin_action" || return 1
+		elif [ -f /etc/frr/frr.conf ]; then
+			[ ! -f "$backup" ] || { log 'unowned FRR matches a historical backup without takeover intent'; return 1; }
+			hash=$(legacy_config_hash /etc/frr/frr.conf) || return 1
+			# The durable hash intent precedes the backup.  A crash cannot widen
+			# this window into permission to adopt a later administrator edit.
+			atomic_value "$takeover" 600 '' "present:$hash" || return 1
+			takeover_action="present:$hash"
+			[ "$(legacy_config_hash /etc/frr/frr.conf)" = "$hash" ] || { log 'FRR changed before backup'; return 1; }
+			atomic_write "$backup" 600 </etc/frr/frr.conf || return 1
+			origin_action=backup
+			atomic_value "$origin" 600 '' "$origin_action" || return 1
+		else
+			[ ! -f "$backup" ] || { log 'FRR backup exists but live configuration is absent'; return 1; }
+			atomic_value "$takeover" 600 '' absent || return 1
+			takeover_action=absent
+			origin_action=absent
+			atomic_value "$origin" 600 '' "$origin_action" || return 1
+		fi
+	fi
+
+	case "$origin_action" in
+		backup) [ -f "$backup" ] || { log 'FRR backup origin is missing its backup'; return 1; };;
+		absent|minimal) [ ! -f "$backup" ] || { log 'FRR non-backup origin has an unexpected backup'; return 1; };;
+	esac
+	if [ "$owned" = 0 ]; then
+		[ -n "$takeover_action" ] || { log 'refusing to reclaim unowned FRR without active takeover intent'; return 1; }
+		case "$takeover_action" in
+			present:*|backup|pending)
+				[ "$origin_action" = backup ] && [ -f /etc/frr/frr.conf ] && cmp -s "$backup" /etc/frr/frr.conf || { log 'FRR changed after takeover authorization'; return 1; }
+				;;
+			absent)
+				[ "$origin_action" = absent ] && [ ! -e /etc/frr/frr.conf ] && [ ! -L /etc/frr/frr.conf ] || { log 'FRR appeared after absent takeover authorization'; return 1; }
+				;;
+		esac
+	fi
 	asn=$(jget "/nodes/$MEDUZA_NODE/bgp/asn" "$NODE_JSON")
 	rid=$(jget "/nodes/$MEDUZA_NODE/bgp/router_id" "$NODE_JSON"); [ -n "$rid" ] || rid=$(jget "/nodes/$MEDUZA_NODE/router_id" "$NODE_JSON")
 	ospf=$(jget "/nodes/$MEDUZA_NODE/ospf/enable" "$NODE_JSON")
 	area=$(jget "/nodes/$MEDUZA_NODE/ospf/area" "$NODE_JSON"); [ -n "$area" ] || area=0
 	lans=$(jget "/nodes/$MEDUZA_NODE/lan" "$NODE_JSON"); private=$(jget "/nodes/$MEDUZA_NODE/private_lan" "$NODE_JSON")
 	internal=$(jget /global/internal_routing_system "$GLOBAL_JSON"); [ -n "$internal" ] || internal=ospf
+	if [ -n "$asn" ]; then
+		openvpn_names=$(children "/nodes/$MEDUZA_NODE/openvpn/" "$NODE_JSON") || return 1
+		wireguard_names=$(children "/nodes/$MEDUZA_NODE/wireguard/" "$NODE_JSON") || return 1
+		node_ids=$(children /nodes/ "$ALL_JSON") || return 1
+	fi
+	stage="$MEDUZA_STATE/stage.frr.$$"
 	{
-		echo 'frr defaults traditional'; echo "hostname meduza-$MEDUZA_NODE"; echo 'service integrated-vtysh-config'; echo '!'
+		echo "! meduza-owner: $MEDUZA_OWNER"; echo 'frr defaults traditional'; echo "hostname meduza-$MEDUZA_NODE"; echo 'service integrated-vtysh-config'; echo '!'
 		if [ "$ospf" = true ]; then
 			echo 'router ospf'; [ -z "$rid" ] || echo " ospf router-id $rid"
-			lines "$lans" | while read -r peer; do echo " network $peer area $area"; done
-			lines "$private" | while read -r peer; do echo " network $peer area $area"; done
+			lines "$lans" | while IFS= read -r peer; do echo " network $peer area $area"; done
+			lines "$private" | while IFS= read -r peer; do echo " network $peer area $area"; done
 			echo '!'
 		fi
 		if [ -n "$asn" ]; then
 			echo "router bgp $asn"; [ -z "$rid" ] || echo " bgp router-id $rid"
 			for behavior in openvpn wireguard; do
-				for name in $(children "/nodes/$MEDUZA_NODE/$behavior/" "$NODE_JSON"); do
-					raw="$behavior/$name"
-					peer_ip=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_ip" "$NODE_JSON"); peer_asn=$(jget "/nodes/$MEDUZA_NODE/$raw/bgp/peer_asn" "$NODE_JSON")
-					[ -n "$peer_ip$peer_asn" ] || continue; dev=$(jget "/nodes/$MEDUZA_NODE/$raw/dev" "$NODE_JSON"); [ -n "$dev" ] || { case $raw in wireguard/*) dev="wg-$name";; *) dev="tun-$name";; esac; }
+				case "$behavior" in openvpn) names=$openvpn_names;; wireguard) names=$wireguard_names;; esac
+				for name in $names; do
+					peer_ip=$(jget "/nodes/$MEDUZA_NODE/$behavior/$name/bgp/peer_ip" "$NODE_JSON")
+					peer_asn=$(jget "/nodes/$MEDUZA_NODE/$behavior/$name/bgp/peer_asn" "$NODE_JSON")
+					[ -n "$peer_ip$peer_asn" ] || continue
+					dev=$(manifest_field "$behavior" "$name" 4); [ -n "$dev" ] || continue
 					echo " neighbor $peer_ip remote-as $peer_asn"; echo " neighbor $peer_ip update-source $dev"
 				done
 			done
 			if [ "$internal" = bgp ]; then
-				for id in $(children /nodes/ "$ALL_JSON"); do
-					[ "$id" = "$MEDUZA_NODE" ] && continue; peer_ip=$(jget "/nodes/$id/router_id" "$ALL_JSON"); [ -n "$peer_ip" ] || peer_ip=$(jget "/nodes/$id/bgp/router_id" "$ALL_JSON"); [ -z "$peer_ip" ] || echo " neighbor $peer_ip remote-as internal"
+				for id in $node_ids; do
+					[ "$id" = "$MEDUZA_NODE" ] && continue
+					peer_ip=$(jget "/nodes/$id/router_id" "$ALL_JSON"); [ -n "$peer_ip" ] || peer_ip=$(jget "/nodes/$id/bgp/router_id" "$ALL_JSON")
+					[ -z "$peer_ip" ] || echo " neighbor $peer_ip remote-as internal"
 				done
 			fi
-			echo ' address-family ipv4 unicast'; lines "$lans" | while read -r peer; do echo "  network $peer"; done; [ "$internal" != bgp ] || lines "$private" | while read -r peer; do echo "  network $peer"; done
+			echo ' address-family ipv4 unicast'
+			lines "$lans" | while IFS= read -r peer; do echo "  network $peer"; done
+			[ "$internal" != bgp ] || lines "$private" | while IFS= read -r peer; do echo "  network $peer"; done
 			echo ' exit-address-family'; echo '!'
 		fi
 		echo 'line vty'; echo '!'
-	} | atomic_write /etc/frr/frr.conf 640
-	reload_or_restart frr
+	} >"$stage"
+	# Recheck the exact takeover precondition immediately before replacement;
+	# rendering and JSON traversal above can be slow on small routers.
+	if [ -f "$takeover" ] && ! grep -qxF "! meduza-owner: $MEDUZA_OWNER" /etc/frr/frr.conf 2>/dev/null; then
+		takeover_action=$(cat "$takeover") || return 1
+		case "$takeover_action" in
+			present:*|backup|pending)
+				[ -f "$backup" ] && [ -f /etc/frr/frr.conf ] && \
+					cmp -s "$backup" /etc/frr/frr.conf || {
+					log 'FRR configuration changed before takeover commit'; return 1;
+				}
+				;;
+			absent)
+				[ ! -e /etc/frr/frr.conf ] && [ ! -L /etc/frr/frr.conf ] || {
+					log 'FRR configuration appeared before takeover commit'; return 1;
+				}
+				;;
+			*) log 'invalid FRR takeover journal before commit'; return 1;;
+		esac
+	elif [ ! -f "$takeover" ]; then
+		grep -qxF "! meduza-owner: $MEDUZA_OWNER" /etc/frr/frr.conf 2>/dev/null || {
+			log 'FRR ownership changed before configuration commit'; return 1;
+		}
+	fi
+	[ ! -L /etc/frr ] && [ ! -L /etc/frr/frr.conf ] || { log 'FRR path became symlinked before commit'; return 1; }
+	commit_stage "$stage" /etc/frr/frr.conf 640 "$marker" || return 1
+	if [ -f "$takeover" ]; then
+		rm -f "$takeover" || return 1
+		fsync "$MEDUZA_DATA/managed" || return 1
+	fi
+	if [ -f "$marker" ]; then
+		reload_or_restart frr || return 1
+		rm -f "$marker" || return 1
+	fi
+}
+
+legacy_frr_is_owned() {
+	local node=${MEDUZA_NODE:-}
+	[ -f /etc/frr/frr.conf ] || return 1
+	if [ -z "$node" ]; then config_load meduza; config_get node main NODE_ID; fi
+	valid_node_id "$node" || return 1
+	grep -qxF 'frr defaults traditional' /etc/frr/frr.conf &&
+		grep -qxF "hostname meduza-$node" /etc/frr/frr.conf &&
+		grep -qxF 'service integrated-vtysh-config' /etc/frr/frr.conf &&
+		grep -qxF 'line vty' /etc/frr/frr.conf
+}
+
+publish_runtime_state() {
+	rm -f "$MEDUZA_STATE"/wireguard.*.dev
+	awk -F '\t' '$1 == "openvpn" { values = values separator $2; separator = " " } END { print values }' "$DESIRED" >"$MEDUZA_STATE/openvpn.instances"
+	awk -F '\t' '$1 == "wireguard" { values = values separator $2; separator = " " } END { print values }' "$DESIRED" >"$MEDUZA_STATE/wireguard.instances"
+	awk -F '\t' '$1 == "wireguard" { print $4 > (dir "/wireguard." $2 ".dev") }' dir="$MEDUZA_STATE" "$DESIRED"
+	awk -F '\t' '$1 == "tinc" { print $2; exit }' "$DESIRED" >"$MEDUZA_STATE/tinc.net"
+	awk -F '\t' '$1 == "tinc" { print $4; exit }' "$DESIRED" >"$MEDUZA_STATE/tinc.dev"
 }
 
 reconcile() {
-	if installed tincd; then apply_tinc; else log 'tinc is not installed; skipping tinc'; fi
-	if installed openvpn && [ -x /etc/init.d/openvpn ]; then
-		apply_openvpn
-	else
-		log 'OpenVPN is not installed; skipping OpenVPN'
-	fi
-	if installed wg && installed ip; then
-		apply_wireguard
-	else
-		log 'WireGuard tools are not installed; skipping WireGuard'
-	fi
-	if [ -x /etc/init.d/frr ]; then apply_frr; else log 'FRR is not installed; skipping FRR'; fi
-	/usr/libexec/meduza/meduza-openwrt-sync
+	[ -f "$NODE_JSON" ] && [ -f "$GLOBAL_JSON" ] && [ -f "$ALL_JSON" ] || { log 'runtime JSON configuration is incomplete'; return 1; }
+	cleanup_orphan_temps
+	freeze_uci_migration_inventory
+	collect_inventory
+	build_desired
+	adopt_legacy_tinc_inventory
+	write_journal
+	authorize_legacy_inventory
+	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" validate
+	prepare_legacy_runtime_ownership
+	preflight_existing_devices
+	preflight_openvpn_namespaces
+	render_configs
+	stop_reused_stale_devices
+	validate_existing_devices
+	# Stop/unregister stale procd instances while their exact owner-marked UCI
+	# identity still exists.  In particular, OpenVPN 24.10 would otherwise
+	# respawn an old instance after its section had already been deleted.
+	stop_stale_resources
+	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" apply
+	cleanup_stale_configs
+	apply_vpn_runtime
+	apply_frr
+	atomic_write "$MEDUZA_MANAGED" 600 <"$DESIRED"
+	rm -f "$MEDUZA_PENDING" || return 1
+	fsync "$MEDUZA_DATA/managed" || return 1
+	"$UCI_HELPER" finalize || return 1
+	rm -f "$UCI_MIGRATION" "$UCI_MIGRATION_ZONE" \
+		"$UCI_MIGRATION_ZONE_SEAL" "$UCI_MIGRATION_ZONE_DISABLED" \
+		"$UPGRADE_INTENT" || return 1
+	clear_legacy_authorization
+	fsync "$MEDUZA_DATA/managed" || return 1
+	rm -f "$MEDUZA_STATE/sync.changed.interfaces"
+	rm -f "$MEDUZA_STATE"/changed.*
+	publish_runtime_state
 	date +%s >"$MEDUZA_STATE/last-success"
 	log 'configuration reconciled'
 }
 
-cleanup() {
-	local name net dev
-	net=$(cat "$MEDUZA_STATE/tinc.net" 2>/dev/null || true)
-	[ -z "$net" ] || tincd -n "$net" -k >/dev/null 2>&1 || true
-	sleep 1
-	dev=$(cat "$MEDUZA_STATE/tinc.dev" 2>/dev/null || true)
-	[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
+runtime_stop() {
+	local kind instance logical device config extra status=0
+	freeze_uci_migration_inventory
+	collect_inventory
+	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$INVENTORY" runtime-stop || status=1
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		stop_runtime_entry "$kind" "$instance" "$logical" "$device" "$config" || status=1
+	done <"$INVENTORY"
+	rm -f "$MEDUZA_STATE"/*.json "$MEDUZA_STATE"/openvpn.instances \
+		"$MEDUZA_STATE"/wireguard.instances "$MEDUZA_STATE"/wireguard.*.dev \
+		"$MEDUZA_STATE"/tinc.net "$MEDUZA_STATE"/tinc.dev \
+		"$MEDUZA_STATE"/sync.changed.interfaces
+	restore_frr || status=1
+	log 'managed VPN runtimes stopped; persistent last-known-good state retained'
+	return "$status"
+}
 
-	if installed openvpn; then
-		rm -f /etc/openvpn/meduza-*.conf /etc/openvpn/meduza-*.secret \
-			/etc/openvpn/meduza-*.ca /etc/openvpn/meduza-*.cert \
-			/etc/openvpn/meduza-*.key /etc/openvpn/meduza-*.tls_auth \
-			/etc/openvpn/meduza-*.tls_crypt
-		reload_or_restart openvpn
+restore_frr() {
+	local backup=$MEDUZA_DATA/managed/frr.conf.backup owned=0 action marker stage takeover origin origin_action
+	marker=$MEDUZA_DATA/managed/frr.restore.reload-needed
+	takeover=$MEDUZA_DATA/managed/frr.takeover.pending
+	origin=$MEDUZA_DATA/managed/frr.origin
+	[ ! -L /etc/frr ] && [ ! -L /etc/frr/frr.conf ] && [ ! -L "$backup" ] && \
+		[ ! -L "$marker" ] && [ ! -L "$takeover" ] && [ ! -L "$origin" ] || {
+		log 'refusing symlinked FRR configuration or restore journal'; return 1;
+	}
+	action=$(cat "$marker" 2>/dev/null || true)
+	origin_action=$(cat "$origin" 2>/dev/null || true)
+	case "$action" in ''|backup|minimal|absent) :;; *) log 'invalid FRR restore journal'; return 1;; esac
+	case "$origin_action" in ''|backup|minimal|absent) :;; *) log 'invalid FRR origin journal'; return 1;; esac
+	grep -qxF "! meduza-owner: $MEDUZA_OWNER" /etc/frr/frr.conf 2>/dev/null && owned=1
+
+	# A restore action is the durable activation checkpoint.  Once present it
+	# must be replayed through reload; an old takeover marker must never make us
+	# skip that activation retry.
+	if [ -n "$action" ] && [ -z "$origin_action" ]; then
+		origin_action=$action
+	fi
+	if [ "$action" = backup ] && [ ! -f "$backup" ] && [ "$owned" = 0 ]; then
+		# Backup removal happens only after a successful reload.  Finish a crash
+		# between the final unlink operations.
+		rm -f "$marker" "$takeover" "$origin" || return 1
+		fsync "$MEDUZA_DATA/managed" || return 1
+		return 0
+	fi
+	if [ "$action" = backup ] && [ "$owned" = 0 ] && ! cmp -s "$backup" /etc/frr/frr.conf; then
+		log 'FRR changed after an interrupted restore; preserving administrator configuration'
+		return 1
+	fi
+	if [ "$action" = minimal ] && [ "$owned" = 0 ]; then
+		stage="$MEDUZA_STATE/stage.frr-restore.$$"
+		printf '%s\n' 'frr defaults traditional' 'service integrated-vtysh-config' 'line vty' '!' >"$stage" || return 1
+		[ -f /etc/frr/frr.conf ] && cmp -s "$stage" /etc/frr/frr.conf || {
+			log 'FRR changed after an interrupted minimal restore; preserving administrator configuration'; return 1;
+		}
+	fi
+	if [ "$action" = absent ] && [ "$owned" = 0 ] && \
+		{ [ -e /etc/frr/frr.conf ] || [ -L /etc/frr/frr.conf ]; }; then
+		log 'FRR appeared after an interrupted absent restore; preserving administrator configuration'
+		return 1
 	fi
 
-	for name in $(cat "$MEDUZA_STATE/wireguard.instances" 2>/dev/null || true); do
-		dev=$(cat "$MEDUZA_STATE/wireguard.$name.dev" 2>/dev/null || true)
-		[ -z "$dev" ] || ip link del "$dev" >/dev/null 2>&1 || true
-	done
-
-	if [ -x /etc/init.d/frr ]; then
-		printf '%s\n' 'frr defaults traditional' 'service integrated-vtysh-config' \
-			'line vty' '!' | atomic_write /etc/frr/frr.conf 640
-		reload_or_restart frr
+	if [ -z "$action" ]; then
+		if [ -z "$origin_action" ]; then
+			# Upgrade old owner-marked state.  Without a backup the historical
+			# implementation can only restore its documented minimal baseline.
+			if [ "$owned" = 1 ] && [ -f "$backup" ]; then
+				origin_action=backup
+			elif [ "$owned" = 1 ]; then
+				origin_action=minimal
+			elif [ -f "$backup" ]; then
+				# No active action and no owner means restore/takeover already ended
+				# or an administrator reclaimed FRR.  Preserve live state and retire
+				# only our stale backup evidence.
+				rm -f "$backup" "$takeover" || return 1
+				fsync "$MEDUZA_DATA/managed" || return 1
+				return 0
+			else
+				rm -f "$takeover" 2>/dev/null || return 1
+				fsync "$MEDUZA_DATA/managed" || return 1
+				return 0
+			fi
+			atomic_value "$origin" 600 '' "$origin_action" || return 1
+		elif [ "$owned" = 0 ]; then
+			# Origin without an action cannot precede a write (apply writes origin
+			# first, but keeps takeover until owner commit).  If the owner is gone,
+			# preserve the administrator's current state and retire our journals.
+			[ "$origin_action" != backup ] || rm -f "$backup" || return 1
+			rm -f "$takeover" "$origin" || return 1
+			fsync "$MEDUZA_DATA/managed" || return 1
+			return 0
+		fi
+		action=$origin_action
+		atomic_value "$marker" 600 '' "$action" || return 1
 	fi
+	mkdir -p /etc/frr || return 1
+	case "$action" in
+		backup)
+			[ -f "$backup" ] || { log 'FRR restore journal references a missing backup'; return 1; }
+			atomic_write /etc/frr/frr.conf 640 <"$backup" || return 1
+		;;
+		minimal)
+			stage=${stage:-$MEDUZA_STATE/stage.frr-restore.$$}
+			[ -f "$stage" ] || printf '%s\n' 'frr defaults traditional' 'service integrated-vtysh-config' 'line vty' '!' >"$stage" || return 1
+			commit_stage "$stage" /etc/frr/frr.conf 640 || return 1
+		;;
+		absent)
+			rm -f /etc/frr/frr.conf || return 1
+			fsync /etc/frr || return 1
+		;;
+		*) log 'invalid FRR restore journal'; return 1;;
+	esac
+	reload_or_restart frr || return 1
+	[ "$action" != backup ] || rm -f "$backup" || return 1
+	rm -f "$marker" "$takeover" "$origin" || return 1
+	fsync "$MEDUZA_DATA/managed" || return 1
+}
 
-	rm -f "$MEDUZA_STATE/tinc.net" "$MEDUZA_STATE/tinc.dev" \
-		"$MEDUZA_STATE/openvpn.instances" "$MEDUZA_STATE/wireguard.instances" \
-		"$MEDUZA_STATE"/wireguard.*.dev
-	/usr/libexec/meduza/meduza-openwrt-sync
-	log 'managed components stopped and cleaned up'
+purge() {
+	local kind instance logical device config extra status=0
+	cleanup_orphan_temps
+	freeze_uci_migration_inventory
+	collect_inventory
+	: >"$DESIRED"
+	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" preflight || return 1
+	atomic_write "$MEDUZA_PENDING" 600 <"$INVENTORY" || return 1
+	authorize_legacy_inventory || return 1
+	prepare_legacy_runtime_ownership || return 1
+	# Unregister supervised VPNs while their exact owner-marked UCI identity is
+	# still present.  Deleting the section first lets OpenVPN 24.10 procd
+	# respawn an orphaned old command after cleanup.
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		stop_runtime_entry "$kind" "$instance" "$logical" "$device" "$config" || status=1
+	done <"$INVENTORY"
+	[ "$status" -eq 0 ] || { log 'purge runtime stop incomplete; ownership journal retained'; return 1; }
+	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" apply || return 1
+	while IFS="$TAB" read -r kind instance logical device config extra; do
+		[ -n "$kind$instance$logical$device$config" ] || continue
+		remove_generated_config "$kind" "$instance" "$device" "$config" || status=1
+	done <"$INVENTORY"
+	restore_frr || status=1
+	if [ "$status" -ne 0 ]; then
+		log 'purge incomplete; ownership manifest, cache and retry journal retained'
+		return 1
+	fi
+	"$UCI_HELPER" finalize-purge || return 1
+	if [ -e "$MEDUZA_DATA/managed/upgrade.rc-link" ] || \
+		[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ]; then
+		[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ] || return 1
+		case "$(readlink "$MEDUZA_DATA/managed/upgrade.rc-link")" in
+			../init.d/meduza|/etc/init.d/meduza) :;;
+			*) return 1;;
+		esac
+		rm -f "$MEDUZA_DATA/managed/upgrade.rc-link" || return 1
+	fi
+	if [ -e "$MEDUZA_DATA/managed/upgrade.rc-disabled" ]; then
+		[ -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
+			[ ! -L "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
+			[ "$(cat "$MEDUZA_DATA/managed/upgrade.rc-disabled")" = disabled ] || return 1
+		rm -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" || return 1
+	fi
+	fsync "$MEDUZA_DATA/managed" || return 1
+	rm -f "$MEDUZA_MANAGED" "$MEDUZA_PENDING" "$LEGACY_AUTH" \
+		"$UCI_MIGRATION" "$UCI_MIGRATION_ZONE" \
+		"$UCI_MIGRATION_ZONE_SEAL" "$UCI_MIGRATION_ZONE_DISABLED" \
+		"$UPGRADE_STATE" "$UPGRADE_INTENT" \
+		"$MEDUZA_DATA/managed/upgrade.first-install" \
+		"$MEDUZA_DATA/managed/uci-ownership.json" "$MEDUZA_DATA/managed"/uci-ownership.json.tmp.* \
+		"$MEDUZA_DATA/managed/reported.json" "$MEDUZA_DATA/managed"/reported.json.tmp.* \
+		"$MEDUZA_DATA/cache.json" "$MEDUZA_DATA/cache.pending.json" \
+		"$MEDUZA_DATA"/cache.json.tmp.* "$MEDUZA_DATA"/cache.pending.json.tmp.* || return 1
+	fsync "$MEDUZA_DATA/managed" || return 1
+	fsync "$MEDUZA_DATA" || return 1
+	rm -f "$MEDUZA_STATE"/*.json "$MEDUZA_STATE"/*.instances "$MEDUZA_STATE"/*.dev || return 1
+	rm -f "$MEDUZA_STATE"/sync.* || return 1
+	log 'all owner-marked Meduza interfaces and generated files purged'
+	return 0
 }
 
 main() {
 	case "${1:-}" in
-		--apply) load_settings; reconcile;;
-		--stop) mkdir -p "$MEDUZA_STATE"; cleanup;;
-		*) log 'generator must be invoked with --apply or --stop'; return 2;;
+		--apply)
+			payload_allows_apply
+			upgrade_allows_apply
+			load_settings
+			acquire_generator_lock
+			reconcile
+			;;
+		--runtime-stop)
+			umask 077; mkdir -p "$MEDUZA_STATE" || return 1
+			durable_mkdir "$MEDUZA_DATA" 700 || return 1
+			durable_mkdir "$MEDUZA_DATA/managed" 700 || return 1
+			acquire_generator_lock
+			runtime_stop
+			;;
+		--purge)
+			umask 077; mkdir -p "$MEDUZA_STATE" || return 1
+			durable_mkdir "$MEDUZA_DATA" 700 || return 1
+			durable_mkdir "$MEDUZA_DATA/managed" 700 || return 1
+			acquire_generator_lock
+			purge
+			;;
+		*) log 'generator must be invoked with --apply, --runtime-stop or --purge'; return 2;;
 	esac
 }
 

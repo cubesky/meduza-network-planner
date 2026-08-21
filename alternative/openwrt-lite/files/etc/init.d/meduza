@@ -4,24 +4,130 @@ START=95
 STOP=10
 USE_PROCD=1
 
+extra_command "purge" "Stop Meduza and remove all owner-marked generated resources"
+
+payload_completion_valid() {
+	local build_file=/usr/share/meduza/openwrt-lite-build
+	local complete=/etc/meduza/managed/install-complete
+	local build line old_ifs version transaction
+	[ -f "$build_file" ] && [ ! -L "$build_file" ] || return 1
+	[ -f "$complete" ] && [ ! -L "$complete" ] || return 1
+	build=$(cat "$build_file" 2>/dev/null) || return 1
+	case "$build" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
+	line=$(cat "$complete" 2>/dev/null) || return 1
+	old_ifs=$IFS
+	IFS=$(printf '\t')
+	set -- $line
+	IFS=$old_ifs
+	[ "$#" -eq 3 ] && [ "$1" = v1 ] && [ "$2" = "$build" ] || return 1
+	version=$2
+	transaction=$3
+	case "$transaction" in ''|*[!0-9a-f]*) return 1;; esac
+	[ "${#transaction}" -eq 32 ] || return 1
+	MEDUZA_PAYLOAD_BUILD=$version
+	MEDUZA_PAYLOAD_TX=$transaction
+}
+
 start_service() {
-	config_load meduza
 	local enable
+	MEDUZA_START_STATUS=0
+	MEDUZA_EXPECT_AGENT=0
+	MEDUZA_PURGE_REQUESTED=0
+	MEDUZA_FORWARD_CHANGED_THIS_START=0
+	MEDUZA_UPGRADE_READY=0
+	# OpenWrt's default package postinst invokes start before our custom postinst.
+	# The build+transaction seal is published only after every payload and
+	# recovery file is durable, so an early/mixed-version start fails closed and
+	# cannot purge, change forwarding or mutate UCI.
+	payload_completion_valid || {
+		logger -t meduza 'package installation is incomplete; refusing to start'
+		MEDUZA_START_STATUS=1
+		return 0
+	}
+	if [ ! -e /etc/meduza/managed/upgrade.state ] && \
+		{ [ -e /etc/meduza/managed/upgrade.rc-link ] || \
+		  [ -L /etc/meduza/managed/upgrade.rc-link ] || \
+		  [ -e /etc/meduza/managed/upgrade.rc-disabled ]; }; then
+		finish_upgrade_rc_state || {
+			logger -t meduza 'could not finish a previous rc.d handoff'
+			MEDUZA_START_STATUS=1
+			return 0
+		}
+	fi
+	if [ -e /etc/meduza/managed/upgrade.state ]; then
+		local upgrade_state old_ifs state_phase state_tx state_build
+		if [ -L /etc/meduza/managed/upgrade.state ] || \
+			[ ! -f /etc/meduza/managed/upgrade.state ]; then
+			logger -t meduza 'unsafe package-upgrade state; refusing to start'
+			MEDUZA_START_STATUS=1
+			return 0
+		fi
+		upgrade_state=$(cat /etc/meduza/managed/upgrade.state 2>/dev/null) || {
+			MEDUZA_START_STATUS=1
+			return 0
+		}
+		old_ifs=$IFS
+		IFS=:
+		set -- $upgrade_state
+		IFS=$old_ifs
+		[ "$#" -eq 3 ] || {
+			logger -t meduza 'invalid package-upgrade state; refusing to start'
+			MEDUZA_START_STATUS=1
+			return 0
+		}
+		state_phase=$1
+		state_tx=$2
+		state_build=$3
+		case "$state_tx" in ''|*[!0-9a-f]*) state_phase=invalid;; esac
+		[ "${#state_tx}" -eq 32 ] || state_phase=invalid
+		[ "$state_tx" = "$MEDUZA_PAYLOAD_TX" ] && \
+			[ "$state_build" = "$MEDUZA_PAYLOAD_BUILD" ] || state_phase=invalid
+		case "$state_phase" in
+			ready) MEDUZA_UPGRADE_READY=1;;
+			blocked)
+				logger -t meduza 'previous package upgrade did not quiesce safely; refusing to start'
+				MEDUZA_START_STATUS=1
+				return 0
+				;;
+			*)
+				logger -t meduza 'invalid package-upgrade state; refusing to start'
+				MEDUZA_START_STATUS=1
+				return 0
+				;;
+			esac
+	fi
+	config_load meduza
 	config_get_bool enable main enable 0
-	[ "$enable" = 1 ] || return 0
+	if [ "$enable" != 1 ]; then
+		# procd_close_service first replaces any old instance with an empty
+		# service.  service_started waits for that agent to quiesce before purge,
+		# so a direct `start` after enable=0 cannot race an old reconciler.
+		MEDUZA_PURGE_REQUESTED=1
+		return 0
+	fi
 
 	local missing=""
-	for command in python3 ip uci; do
+	for command in python3 ip uci ubus fsync; do
 		command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
 	done
 	if [ -n "$missing" ]; then
 		logger -t meduza "cannot start; missing required commands:$missing"
-		return 1
+		MEDUZA_START_STATUS=1
+		return 0
 	fi
 
 	# Routed side-gateway only: never change WAN, DHCP, DNS, NAT or firewall.
-	# Forwarding is required for traffic explicitly routed through this node.
-	sysctl -qw net.ipv4.ip_forward=1
+	# Restore forwarding on stop only when this service changed it from zero.
+	if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = 0 ]; then
+		mkdir -p /var/run/meduza
+		: >/var/run/meduza/ip-forward.changed
+		sysctl -qw net.ipv4.ip_forward=1 || {
+			rm -f /var/run/meduza/ip-forward.changed
+			MEDUZA_START_STATUS=1
+			return 0
+		}
+		MEDUZA_FORWARD_CHANGED_THIS_START=1
+	fi
 
 	procd_open_instance agent
 	procd_set_param command /usr/bin/python3 /usr/libexec/meduza/meduza-agent.py
@@ -29,6 +135,121 @@ start_service() {
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
+	MEDUZA_EXPECT_AGENT=1
+}
+
+service_started() {
+	local status=${MEDUZA_START_STATUS:-0} registered=0
+	if [ "$status" -eq 0 ] && [ "${MEDUZA_EXPECT_AGENT:-0}" = 1 ]; then
+		if agent_procd_registered; then
+			:
+		else
+			registered=$?
+			logger -t meduza 'procd did not register the Meduza agent'
+			status=1
+		fi
+	fi
+	if [ "$status" -eq 0 ] && [ "${MEDUZA_UPGRADE_READY:-0}" = 1 ]; then
+		restore_upgrade_rc_state && clear_upgrade_ready && \
+			finish_upgrade_rc_state || {
+			logger -t meduza 'could not durably finish package-upgrade handoff'
+			status=1
+		}
+	fi
+	if [ "$status" -ne 0 ]; then
+		# A failed/indeterminate registration may still have created a supervised
+		# instance.  Unregister it and prove the complete process tree is gone
+		# before restoring forwarding; otherwise the surviving agent would
+		# reconcile with routing disabled.
+		procd_kill meduza agent >/dev/null 2>&1 || true
+		wait_meduza_quiescent 1 || return 1
+		if [ -f /var/run/meduza/ip-forward.changed ]; then
+			sysctl -qw net.ipv4.ip_forward=0 && \
+				rm -f /var/run/meduza/ip-forward.changed || return 1
+		fi
+		return 1
+	fi
+	if [ "${MEDUZA_PURGE_REQUESTED:-0}" = 1 ]; then
+		local cleanup_status=0
+		procd_kill meduza agent >/dev/null 2>&1 || true
+		wait_meduza_quiescent 1 || return 1
+		# Global forwarding must be restored even when a later ownership/UCI
+		# conflict makes purge fail.  No controller remains after the quiesce.
+		if [ -f /var/run/meduza/ip-forward.changed ]; then
+			sysctl -qw net.ipv4.ip_forward=0 && \
+				rm -f /var/run/meduza/ip-forward.changed || cleanup_status=1
+		fi
+		if [ -x /usr/libexec/meduza/meduza-generator ] && \
+			! /usr/libexec/meduza/meduza-generator --purge; then
+			logger -t meduza 'disabled-resource cleanup failed'
+			cleanup_status=1
+		fi
+		if [ "$cleanup_status" -eq 0 ] && [ -x /usr/libexec/meduza/meduza-recover ] && \
+			! /usr/libexec/meduza/meduza-recover --remove-bundle; then
+			logger -t meduza 'recovery-bundle cleanup failed'
+			cleanup_status=1
+		fi
+		return "$cleanup_status"
+	fi
+	return 0
+}
+
+clear_upgrade_ready() {
+	local path=/etc/meduza/managed/upgrade.state value expected
+	[ -f "$path" ] && [ ! -L "$path" ] || return 1
+	value=$(cat "$path" 2>/dev/null) || return 1
+	expected="ready:${MEDUZA_PAYLOAD_TX:-}:${MEDUZA_PAYLOAD_BUILD:-}"
+	[ "$value" = "$expected" ] || return 1
+	rm -f "$path" || return 1
+	fsync /etc/meduza/managed || return 1
+}
+
+restore_upgrade_rc_state() {
+	local live=/etc/rc.d/S95meduza saved=/etc/meduza/managed/upgrade.rc-link
+	local disabled=/etc/meduza/managed/upgrade.rc-disabled target
+	[ -d /etc/rc.d ] && [ ! -L /etc/rc.d ] || return 1
+	if [ -e "$saved" ] || [ -L "$saved" ]; then
+		[ -L "$saved" ] || return 1
+		target=$(readlink "$saved") || return 1
+		case "$target" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
+		if [ -e "$live" ] || [ -L "$live" ]; then
+			[ -L "$live" ] && [ "$(readlink "$live")" = "$target" ] || return 1
+		else
+			ln -s "$target" "$live" || return 1
+		fi
+		fsync /etc/rc.d || return 1
+		fsync /etc/meduza/managed || return 1
+		[ ! -e "$disabled" ] && [ ! -L "$disabled" ] || return 1
+		return 0
+	fi
+	[ -f "$disabled" ] && [ ! -L "$disabled" ] && \
+		[ "$(cat "$disabled" 2>/dev/null)" = disabled ] || return 1
+	if [ -e "$live" ] || [ -L "$live" ]; then
+		[ -L "$live" ] || return 1
+		case "$(readlink "$live")" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
+		rm -f "$live" || return 1
+		fsync /etc/rc.d || return 1
+	fi
+	fsync /etc/meduza/managed || return 1
+}
+
+finish_upgrade_rc_state() {
+	local saved=/etc/meduza/managed/upgrade.rc-link
+	local disabled=/etc/meduza/managed/upgrade.rc-disabled target
+	[ ! -e /etc/meduza/managed/upgrade.state ] && \
+		[ ! -L /etc/meduza/managed/upgrade.state ] || return 1
+	if [ -e "$saved" ] || [ -L "$saved" ]; then
+		[ -L "$saved" ] || return 1
+		target=$(readlink "$saved") || return 1
+		case "$target" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
+		[ ! -e "$disabled" ] && [ ! -L "$disabled" ] || return 1
+		rm -f "$saved" || return 1
+	elif [ -e "$disabled" ]; then
+		[ -f "$disabled" ] && [ ! -L "$disabled" ] && \
+			[ "$(cat "$disabled" 2>/dev/null)" = disabled ] || return 1
+		rm -f "$disabled" || return 1
+	fi
+	fsync /etc/meduza/managed || return 1
 }
 
 service_triggers() {
@@ -36,12 +257,132 @@ service_triggers() {
 }
 
 reload_service() {
-	stop
+	stop || return 1
 	start
 }
 
+restart() {
+	trap '' TERM
+	stop "$@" || { trap - TERM; return 1; }
+	trap - TERM
+	start "$@"
+}
+
 stop_service() {
-	[ -x /usr/libexec/meduza/meduza-generator ] || return 0
-	/usr/libexec/meduza/meduza-generator --stop || \
-		logger -t meduza 'managed component cleanup failed'
+	# rc.common calls this before procd terminates the agent. Cleanup here races
+	# an in-flight reconcile, so the actual runtime stop belongs in
+	# service_stopped(), which runs after procd_kill.
+	return 0
+}
+
+agent_procd_registered() {
+	local snapshot=/var/run/meduza/procd-agent.json status
+	command -v ubus >/dev/null 2>&1 || return 2
+	mkdir -p /var/run/meduza || return 2
+	ubus call service list '{"name":"meduza"}' >"$snapshot" 2>/dev/null || return 2
+	python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    instance = value.get("meduza", {}).get("instances", {}).get("agent")
+    command = instance.get("command") if isinstance(instance, dict) else None
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(2)
+expected = ["/usr/bin/python3", "/usr/libexec/meduza/meduza-agent.py"]
+raise SystemExit(0 if isinstance(command, list) and command[:2] == expected else 1)
+' "$snapshot"
+	status=$?
+	rm -f "$snapshot"
+	return "$status"
+}
+
+wait_meduza_quiescent() {
+	local strict=${1:-0} status=0 count=0 stable=0 required=2 registered process_status
+	# rc.common does not propagate procd_kill's status.  Refuse to race cleanup
+	# against a still-live/respawning controller even if procd returned early.
+	while :; do
+		status=0
+		if agent_procd_registered; then
+			status=1
+		else
+			registered=$?
+			# If ubus is already unavailable during shutdown, require an
+			# absence longer than procd's five-second respawn delay instead.
+			if [ "$registered" -ne 1 ]; then
+				[ "$strict" = 0 ] || status=1
+				required=7
+			fi
+		fi
+		if meduza_controller_live; then
+			status=1
+		else
+			process_status=$?
+			[ "$process_status" -eq 1 ] || return 1
+		fi
+		if [ "$status" -eq 0 ]; then
+			stable=$((stable + 1))
+			[ "$stable" -ge "$required" ] && break
+		else
+			stable=0
+		fi
+		count=$((count + 1))
+		[ "$count" -lt 10 ] || {
+			logger -t meduza 'agent did not quiesce after procd stop; refusing concurrent cleanup'
+			return 1
+		}
+		sleep 1
+	done
+	return 0
+}
+
+meduza_controller_live() {
+	python3 -c 'import os
+roots = ("/usr/libexec/meduza", "/etc/meduza/recovery")
+scripts = {}
+for root in roots:
+    scripts[root + "/meduza-agent.py"] = "python"
+    scripts[root + "/meduza-uci-session.py"] = "python"
+    scripts[root + "/meduza-generator"] = "shell"
+    scripts[root + "/meduza-openwrt-sync"] = "shell"
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    try:
+        argv = open("/proc/" + name + "/cmdline", "rb").read().rstrip(b"\0").split(b"\0")
+        argv = [item.decode(errors="surrogateescape") for item in argv]
+    except OSError:
+        continue
+    if len(argv) < 2 or argv[1] not in scripts:
+        continue
+    executable = os.path.basename(argv[0])
+    kind = scripts[argv[1]]
+    if (kind == "python" and executable.startswith("python3")) or (
+        kind == "shell" and executable in ("sh", "ash")
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)'
+}
+
+service_stopped() {
+	local status=0
+	wait_meduza_quiescent 0 || return 1
+	if [ -x /usr/libexec/meduza/meduza-generator ]; then
+		/usr/libexec/meduza/meduza-generator --runtime-stop || {
+			logger -t meduza 'managed VPN runtime stop failed'
+			status=1
+		}
+	fi
+	if [ -f /var/run/meduza/ip-forward.changed ]; then
+		sysctl -qw net.ipv4.ip_forward=0 && rm -f /var/run/meduza/ip-forward.changed || status=1
+	fi
+	return "$status"
+}
+
+purge() {
+	stop || return 1
+	if [ -x /usr/libexec/meduza/meduza-generator ]; then
+		/usr/libexec/meduza/meduza-generator --purge || return 1
+	fi
+	[ ! -x /usr/libexec/meduza/meduza-recover ] || \
+		/usr/libexec/meduza/meduza-recover --remove-bundle
 }

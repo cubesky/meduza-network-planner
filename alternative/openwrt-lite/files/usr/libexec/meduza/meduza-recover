@@ -1,0 +1,327 @@
+#!/bin/sh
+set -e
+
+# apk-tools records package-script failures but may still remove the payload.
+# Keep an owner-marked copy of the purge implementation so cleanup can be
+# retried after a package-script failure while its Python/UCI runtime
+# dependencies remain installed.  The README documents the reinstall-first
+# recovery path when apk also removes those dependencies.
+SOURCE_DIR=${MEDUZA_LIBEXEC:-/usr/libexec/meduza}
+DATA=${MEDUZA_DATA:-/etc/meduza}
+MANAGED=$DATA/managed
+BUNDLE=$DATA/recovery
+RECORD=$MANAGED/recovery.bundle
+OWNER=meduza-openwrt-lite-recovery-v1
+FILES='meduza-generator meduza-lib.sh meduza-json.py meduza-uci-session.py meduza-openwrt-sync meduza-recover'
+
+atomic_value() {
+	local target=$1 value=$2 tmp=${1}.meduza.$$
+	[ ! -L "$target" ] || return 1
+	rm -f "$tmp" || return 1
+	printf '%s\n' "$value" >"$tmp" || return 1
+	chmod 600 "$tmp" || return 1
+	fsync "$tmp" || return 1
+	mv -f "$tmp" "$target" || return 1
+	fsync "${target%/*}" || return 1
+}
+
+bundle_record_owned() {
+	[ -f "$RECORD" ] && [ ! -L "$RECORD" ] && \
+		[ "$(cat "$RECORD" 2>/dev/null || true)" = "$OWNER" ]
+}
+
+bundle_dir_owned() {
+	local file expected actual seen=0 seen_files=
+	[ -d "$BUNDLE" ] && [ ! -L "$BUNDLE" ] && \
+		[ -f "$BUNDLE/.meduza-owner" ] && [ ! -L "$BUNDLE/.meduza-owner" ] && \
+		[ "$(cat "$BUNDLE/.meduza-owner" 2>/dev/null || true)" = "$OWNER" ] && \
+		[ -f "$BUNDLE/.meduza-ready" ] && [ ! -L "$BUNDLE/.meduza-ready" ] || return 1
+	while IFS="$(printf '\t')" read -r expected file extra; do
+		[ -z "$extra" ] && [ -n "$expected" ] && [ -n "$file" ] || return 1
+		case "$file" in meduza-generator|meduza-lib.sh|meduza-json.py|meduza-uci-session.py|meduza-openwrt-sync|meduza-recover) :;; *) return 1;; esac
+		case " $seen_files " in *" $file "*) return 1;; esac
+		seen_files="$seen_files $file"
+		case "$expected" in *[!0-9a-f]*|'') return 1;; esac
+		[ "${#expected}" -eq 64 ] || return 1
+		[ -f "$BUNDLE/$file" ] && [ ! -L "$BUNDLE/$file" ] || return 1
+		actual=$(sha256sum "$BUNDLE/$file") || return 1
+		actual=${actual%% *}
+		[ "$actual" = "$expected" ] || return 1
+		seen=$((seen + 1))
+	done <"$BUNDLE/.meduza-ready"
+	[ "$seen" -eq 6 ] || return 1
+	for file in $FILES; do
+		case " $seen_files " in *" $file "*) :;; *) return 1;; esac
+	done
+}
+
+cleanup_owned_temps() {
+	local temporary file
+	bundle_record_owned || return 1
+	[ -f "$BUNDLE/.meduza-owner" ] && [ ! -L "$BUNDLE/.meduza-owner" ] && \
+		[ "$(cat "$BUNDLE/.meduza-owner" 2>/dev/null || true)" = "$OWNER" ] || return 1
+	for temporary in "$RECORD.meduza."[0-9]* \
+		"$BUNDLE/.meduza-owner.meduza."[0-9]* \
+		"$BUNDLE/.meduza-ready.meduza."[0-9]*; do
+		[ -e "$temporary" ] || continue
+		[ -f "$temporary" ] && [ ! -L "$temporary" ] || return 1
+		rm -f "$temporary" || return 1
+	done
+	for file in $FILES; do
+		for temporary in "$BUNDLE/$file.meduza."[0-9]*; do
+			[ -e "$temporary" ] || continue
+			[ -f "$temporary" ] && [ ! -L "$temporary" ] || return 1
+			rm -f "$temporary" || return 1
+		done
+	done
+	fsync "$BUNDLE" || return 1
+	fsync "$MANAGED" || return 1
+}
+
+bundle_entries_known() {
+	local entry base file allowed
+	for entry in "$BUNDLE"/* "$BUNDLE"/.[!.]* "$BUNDLE"/..?*; do
+		[ -e "$entry" ] || continue
+		base=${entry##*/}
+		allowed=0
+		case "$base" in .meduza-owner|.meduza-ready) allowed=1;; esac
+		for file in $FILES; do [ "$base" = "$file" ] && allowed=1; done
+		[ "$allowed" -eq 1 ] || return 1
+		[ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+	done
+}
+
+install_bundle() {
+	local file source temporary entries hash ready
+	umask 077
+	[ ! -L "$DATA" ] && [ ! -L "$MANAGED" ] || return 1
+	mkdir -p "$MANAGED" || return 1
+	chmod 700 "$DATA" "$MANAGED" || return 1
+	fsync "$DATA" || return 1
+	fsync "$MANAGED" || return 1
+	if [ -e "$RECORD" ]; then
+		bundle_record_owned || return 1
+	else
+		atomic_value "$RECORD" "$OWNER" || return 1
+	fi
+	if [ -e "$BUNDLE" ]; then
+		if ! bundle_dir_owned; then
+			# A crash after the external intent but before the internal marker is
+			# recoverable only when no unrelated content could be adopted.
+			[ -d "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || return 1
+			[ -f "$BUNDLE/.meduza-owner" ] && [ ! -L "$BUNDLE/.meduza-owner" ] && \
+				[ "$(cat "$BUNDLE/.meduza-owner" 2>/dev/null || true)" = "$OWNER" ] || return 1
+		fi
+	else
+		mkdir "$BUNDLE" || return 1
+		chmod 700 "$BUNDLE" || return 1
+		fsync "$DATA" || return 1
+		atomic_value "$BUNDLE/.meduza-owner" "$OWNER" || return 1
+	fi
+	cleanup_owned_temps || return 1
+	bundle_entries_known || return 1
+	rm -f "$BUNDLE/.meduza-ready" || return 1
+	fsync "$BUNDLE" || return 1
+	for file in $FILES; do
+		source=$SOURCE_DIR/$file
+		[ -f "$source" ] && [ ! -L "$source" ] || return 1
+		temporary=$BUNDLE/$file.meduza.$$
+		rm -f "$temporary" || return 1
+		cp "$source" "$temporary" || return 1
+		chmod 700 "$temporary" || return 1
+		fsync "$temporary" || return 1
+		mv -f "$temporary" "$BUNDLE/$file" || return 1
+		fsync "$BUNDLE" || return 1
+	done
+	ready=$BUNDLE/.meduza-ready.meduza.$$
+	: >"$ready" || return 1
+	for file in $FILES; do
+		hash=$(sha256sum "$BUNDLE/$file") || return 1
+		hash=${hash%% *}
+		printf '%s\t%s\n' "$hash" "$file" >>"$ready" || return 1
+	done
+	chmod 600 "$ready" || return 1
+	fsync "$ready" || return 1
+	mv -f "$ready" "$BUNDLE/.meduza-ready" || return 1
+	fsync "$BUNDLE" || return 1
+	bundle_entries_known || return 1
+}
+
+remove_install_completion() {
+	local complete=$MANAGED/install-complete temporary
+	[ ! -L "$complete" ] || return 1
+	rm -f "$complete" || return 1
+	for temporary in "$complete.meduza."[0-9]*; do
+		[ -e "$temporary" ] || continue
+		[ -f "$temporary" ] && [ ! -L "$temporary" ] || return 1
+		rm -f "$temporary" || return 1
+	done
+	fsync "$MANAGED" || return 1
+}
+
+remove_bundle() {
+	local file entry base allowed
+	[ ! -e "$RECORD" ] && [ ! -e "$BUNDLE" ] && return 0
+	bundle_record_owned || return 1
+	if [ ! -e "$BUNDLE" ]; then
+		rm -f "$RECORD" || return 1
+		fsync "$MANAGED" || return 1
+		return 0
+	fi
+	[ -d "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || return 1
+	if ! bundle_dir_owned; then
+		entry=$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || return 1
+		[ -z "$entry" ] || return 1
+		rmdir "$BUNDLE" || return 1
+		fsync "$DATA" || return 1
+		rm -f "$RECORD" || return 1
+		fsync "$MANAGED" || return 1
+		return 0
+	fi
+	# Refuse unknown files before deleting any part of the proof-bearing tree.
+	for entry in "$BUNDLE"/* "$BUNDLE"/.[!.]* "$BUNDLE"/..?*; do
+		[ -e "$entry" ] || continue
+		base=${entry##*/}
+		allowed=0
+		case "$base" in .meduza-owner|.meduza-ready) allowed=1;; esac
+		for file in $FILES; do [ "$base" = "$file" ] && allowed=1; done
+		[ "$allowed" -eq 1 ] || return 1
+		[ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+	done
+	for file in $FILES; do rm -f "$BUNDLE/$file" || return 1; done
+	rm -f "$BUNDLE/.meduza-ready" || return 1
+	fsync "$BUNDLE" || return 1
+	rm -f "$BUNDLE/.meduza-owner" || return 1
+	fsync "$BUNDLE" || return 1
+	rmdir "$BUNDLE" || return 1
+	fsync "$DATA" || return 1
+	rm -f "$RECORD" || return 1
+	fsync "$MANAGED" || return 1
+}
+
+agent_registration_owned() {
+	local snapshot=/var/run/meduza/recovery-procd.$$ status
+	mkdir -p /var/run/meduza || return 2
+	ubus -S call service list '{"name":"meduza"}' >"$snapshot" 2>/dev/null || return 2
+	python3 -c 'import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    service = value.get("meduza")
+    instances = service.get("instances", {}) if isinstance(service, dict) else {}
+    agent = instances.get("agent") if isinstance(instances, dict) else None
+    command = agent.get("command") if isinstance(agent, dict) else None
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(2)
+expected = ["/usr/bin/python3", "/usr/libexec/meduza/meduza-agent.py"]
+if command == expected:
+    raise SystemExit(0)
+if not instances:
+    raise SystemExit(1)
+raise SystemExit(2)' "$snapshot"
+	status=$?
+	rm -f "$snapshot" || return 2
+	return "$status"
+}
+
+signal_owned_processes() {
+	python3 -c 'import os, signal, sys
+roots = ("/usr/libexec/meduza", "/etc/meduza/recovery")
+scripts = {}
+for root in roots:
+    scripts[root + "/meduza-agent.py"] = "python"
+    scripts[root + "/meduza-uci-session.py"] = "python"
+    scripts[root + "/meduza-generator"] = "shell"
+    scripts[root + "/meduza-openwrt-sync"] = "shell"
+sig = getattr(signal, "SIG" + sys.argv[1])
+for name in os.listdir("/proc"):
+    if not name.isdigit() or int(name) == os.getppid():
+        continue
+    try:
+        argv = open("/proc/" + name + "/cmdline", "rb").read().rstrip(b"\0").split(b"\0")
+        argv = [item.decode(errors="surrogateescape") for item in argv]
+    except OSError:
+        continue
+    if len(argv) < 2 or argv[1] not in scripts:
+        continue
+    executable = os.path.basename(argv[0])
+    kind = scripts[argv[1]]
+    if not ((kind == "python" and executable.startswith("python3")) or (
+        kind == "shell" and executable in ("sh", "ash")
+    )):
+        continue
+    try:
+        os.kill(int(name), sig)
+    except (ProcessLookupError, PermissionError):
+        pass' "$1"
+}
+
+controller_live() {
+	python3 -c 'import os
+roots = ("/usr/libexec/meduza", "/etc/meduza/recovery")
+scripts = {}
+for root in roots:
+    scripts[root + "/meduza-agent.py"] = "python"
+    scripts[root + "/meduza-uci-session.py"] = "python"
+    scripts[root + "/meduza-generator"] = "shell"
+    scripts[root + "/meduza-openwrt-sync"] = "shell"
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    try:
+        argv = open("/proc/" + name + "/cmdline", "rb").read().rstrip(b"\0").split(b"\0")
+        argv = [item.decode(errors="surrogateescape") for item in argv]
+    except OSError:
+        continue
+    if len(argv) < 2 or argv[1] not in scripts:
+        continue
+    executable = os.path.basename(argv[0])
+    kind = scripts[argv[1]]
+    if (kind == "python" and executable.startswith("python3")) or (
+        kind == "shell" and executable in ("sh", "ash")
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)'
+}
+
+quiesce() {
+	local status attempt=0 quiet=0
+	[ ! -x /etc/init.d/meduza ] || /etc/init.d/meduza stop >/dev/null 2>&1 || true
+	if agent_registration_owned; then
+		ubus -S call service delete '{"name":"meduza","instance":"agent"}' >/dev/null 2>&1 || return 1
+	else
+		status=$?
+		[ "$status" -eq 1 ] || return 1
+	fi
+	signal_owned_processes TERM
+	while [ "$attempt" -lt 15 ]; do
+		if agent_registration_owned; then
+			quiet=0
+		else
+			status=$?
+			[ "$status" -eq 1 ] || return 1
+			if controller_live; then quiet=0; else quiet=$((quiet + 1)); fi
+		fi
+		[ "$quiet" -ge 2 ] && return 0
+		attempt=$((attempt + 1))
+		[ "$attempt" -ne 8 ] || signal_owned_processes KILL
+		sleep 1
+	done
+	return 1
+}
+
+retry_purge() {
+	bundle_record_owned && bundle_dir_owned || return 1
+	quiesce || return 1
+	MEDUZA_LIBEXEC=$BUNDLE
+	export MEDUZA_LIBEXEC
+	"$BUNDLE/meduza-generator" --purge || return 1
+	remove_install_completion || return 1
+	remove_bundle
+}
+
+case "${1:-}" in
+	--install-bundle) install_bundle;;
+	--remove-bundle) remove_bundle;;
+	--purge) retry_purge;;
+	*) echo 'usage: meduza-recover --install-bundle|--remove-bundle|--purge' >&2; exit 2;;
+esac

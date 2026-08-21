@@ -65,11 +65,35 @@ jobs:
             echo "OpenWrt build skipped: no OpenWrt package files changed."
           fi
 
+  test:
+    name: OpenWrt Lite lifecycle tests
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: ${{ needs.changes.outputs.affected == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check shell and Python syntax
+        shell: bash
+        run: |
+          sh -n alternative/openwrt-lite/files/etc/init.d/meduza
+          sh -n alternative/openwrt-lite/files/usr/libexec/meduza/meduza-lib.sh
+          sh -n alternative/openwrt-lite/files/usr/libexec/meduza/meduza-generator
+          sh -n alternative/openwrt-lite/files/usr/libexec/meduza/meduza-recover
+          sh -n alternative/openwrt-lite/files/usr/libexec/meduza/meduza-openwrt-sync
+          python3 -m py_compile \
+            alternative/openwrt-lite/files/usr/libexec/meduza/meduza-agent.py \
+            alternative/openwrt-lite/files/usr/libexec/meduza/meduza-json.py \
+            alternative/openwrt-lite/files/usr/libexec/meduza/meduza-uci-session.py
+
+      - name: Test ownership, recovery and OpenClash-safe UCI sync
+        run: sh alternative/openwrt-lite/tests/run.sh
+
   build:
     name: OpenWrt ${{ matrix.release }} ${{ matrix.package_format }} ${{ matrix.package_arch }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    needs: changes
+    needs: [changes, test]
     if: ${{ needs.changes.outputs.affected == 'true' }}
     strategy:
       fail-fast: false
@@ -281,12 +305,12 @@ jobs:
             MEDUZA_PKGARCH="${PACKAGE_METADATA_ARCH}" \
             -j"$(nproc)" V=s 2>&1 | tee build-artifact/build.log
 
-      - name: Collect packages and indexes
+      - name: Collect packages
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build-artifact/packages build-artifact/indexes
+          mkdir -p build-artifact/packages
 
           package_names=(meduza-openwrt-lite python3-etcd3 python3-grpcio \
             python3-protobuf python3-six python3-tenacity python3-typing-extensions)
@@ -324,11 +348,6 @@ jobs:
             package_files+=("${package_filename}")
           done
 
-          find openwrt-sdk/bin -type f \
-            \( -name 'Packages' -o -name 'Packages.gz' -o -name 'Packages.manifest' \
-               -o -name 'Packages.sig' -o -name 'packages.adb' \) \
-            -exec cp --parents {} build-artifact/indexes/ \;
-
           printf '%s\n' \
             "OpenWrt release: ${OPENWRT_RELEASE}" \
             "Target: ${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}" \
@@ -339,7 +358,7 @@ jobs:
             "SDK: ${{ steps.sdk.outputs.sdk_name }}" \
             "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
           cd build-artifact
-          find packages indexes -type f -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
+          find packages -type f -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
 
       - name: Upload OpenWrt package artifact
         if: success()

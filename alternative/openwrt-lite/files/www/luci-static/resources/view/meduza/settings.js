@@ -10,7 +10,7 @@ return view.extend({
 
 	render: function() {
 		var m = new form.Map('meduza', _('Meduza'),
-			_('Etcd-managed VPN side gateway. All Meduza OpenVPN and WireGuard interfaces use the firewall zone selected here.'));
+			_('Etcd-managed routed side gateway. Every tinc, OpenVPN and WireGuard interface owned by Meduza uses the firewall zone selected here.'));
 		var s = m.section(form.NamedSection, 'main', 'meduza', _('Settings'));
 		s.addremove = false;
 
@@ -43,7 +43,7 @@ return view.extend({
 			if (z.name)
 				o.value(z.name, z.name);
 		});
-		o.description = _('Applied automatically to every ovpn_* and wg_* interface managed by Meduza.');
+		o.description = _('Applied automatically to every tinc_*, ovpn_* and wg_* interface managed by Meduza. Existing OpenClash interfaces and rules are not changed.');
 
 		return m.render();
 	}

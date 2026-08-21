@@ -23,7 +23,8 @@ to it. The package enables IPv4 forwarding, but does not modify:
 
 - WAN interfaces or the system default gateway;
 - DHCP or DNS;
-- firewall zones and forwarding rules;
+- firewall zone policies or forwarding rules (it only manages membership in
+  the zone selected by `VPN_FIREWALL_ZONE`);
 - NAT/masquerading;
 - policy routing for clients.
 
@@ -48,8 +49,10 @@ opkg install ./*-arm64.ipk
 ```
 
 The `build-openwrt-lite` GitHub Actions workflow builds the package with the
-official OpenWrt SDK and uploads the package, repository indexes, checksums and
-build log as an artifact. The build matrix produces OpenWrt 24.10 `.ipk` and
+official OpenWrt SDK and uploads the packages, checksums and build log as an
+artifact. Before downloading an SDK it runs shell/Python syntax
+checks plus the ownership, power-recovery and OpenClash-safe UCI lifecycle test
+suite. The build matrix produces OpenWrt 24.10 `.ipk` and
 OpenWrt 25.12 `.apk` packages for ARM64 and x86-64. A manual run accepts
 `ipk_release` and `apk_release` inputs. The Python `etcd3`, `protobuf`, `six`,
 `tenacity`, `typing-extensions` and native `grpcio` runtime are built as separate
@@ -63,6 +66,7 @@ dependency scanner and runtime linker resolve the normal libc package.
 After both formats succeed, non-PR runs create or update a GitHub Release whose
 name is `<UTC YYYYMMDD>-<7-character commit hash>`. The release contains both
 packages, `SHA256SUMS` and release metadata. Pull requests build both formats
+without creating a release.
 
 Published package files use the same date/hash identity and expose their CPU
 family, for example
@@ -96,9 +100,45 @@ For legacy OpenVPN static-key configurations, Meduza detects OpenVPN 2.7's
 compatibility option and adds `allow-deprecated-insecure-static-crypto`
 automatically. TLS-based configurations are not changed.
 
-Stopping the Meduza service also stops its tinc instance, removes its tinc and
-WireGuard devices, removes generated OpenVPN files, clears its FRR configuration,
-and deletes the OpenWrt interfaces and firewall-zone memberships it manages.
+Stopping the Meduza service stops every tinc, OpenVPN and WireGuard runtime it
+owns. Persistent UCI interfaces, generated configuration and the last-known-good
+etcd cache are retained so a normal reboot and an unexpected power loss recover
+the same state even while etcd is temporarily unavailable. To remove all
+owner-marked UCI sections, zone memberships, devices, generated secrets and the
+cache, use:
+
+```sh
+/etc/init.d/meduza purge
+```
+
+Setting `meduza.main.enable=0` and restarting, or uninstalling the package,
+performs the same purge. Package upgrades stop only runtime processes and retain
+the persistent state for the upgraded service. Before an in-place upgrade, the
+package writes a durable transaction-nonce-bound `blocked` handoff record,
+unregisters the old procd agent, proves every old generator/helper process has
+exited, seals the one-time legacy firewall migration state, and only then writes
+`ready`. The custom post-install step publishes a matching build/transaction
+completion seal last. The new init script and generator refuse every mutation
+until both seals match, including when an APK implementation invokes its default
+start action before the custom post-install step or continues unpacking after a
+failed pre-upgrade script.
+
+Some APK implementations also continue deleting package payload files after a
+pre-deinstall script reports an error. Meduza therefore keeps an untracked,
+owner-marked purge bundle at `/etc/meduza/recovery` while installed. A successful
+purge/uninstall removes it. The bundle deliberately does not duplicate Python,
+rpcd/UCI or native VPN dependencies. If APK removed only the main package while
+those dependencies remain, fix the reported ownership/UCI conflict and run:
+
+```sh
+/etc/meduza/recovery/meduza-recover --purge
+```
+
+If `python3`, `ubus`, `uci` or a required helper dependency was also removed,
+first reinstall the same Meduza release and its matching `python3-*` package set
+with the service disabled, then run `meduza-recover --purge`. Package-script
+return codes alone cannot make every vendor APK implementation retain orphaned
+dependencies after a failed uninstall.
 
 `kmod-wireguard` is intentionally not a package dependency. OpenWrt kernel
 modules are tied to the exact firmware kernel ABI, so a package built by a
@@ -131,10 +171,25 @@ The package does not create or alter the selected zone's policies.
 
 Firewall integration is backend-neutral. Meduza only updates the selected
 zone's `network` membership through UCI and calls OpenWrt's standard firewall
-init script. OpenWrt therefore selects fw3/iptables or fw4/nftables itself.
+init script when that membership actually changed. OpenWrt therefore selects
+fw3/iptables or fw4/nftables itself.
 Meduza does not invoke `iptables`, `nft`, `fw3` or `fw4` directly. Zone
 input/output/forward and masquerading policies remain entirely under the
 administrator's existing firewall configuration.
+
+The sync uses an isolated rpcd UCI session, so it neither reads nor commits
+another LuCI/CLI client's `/tmp/.uci` changes. Network/OpenVPN sections carry
+a random generation nonce backed by an external, durable before/after
+fingerprint record; an inline `meduza_owner` option is never sufficient by
+itself to authorize replacement or deletion. Firewall membership uses genuine
+per-token UCI `LIST_ADD`/`LIST_DEL` deltas and owns only the `(zone, logical
+interface)` edge it added—it never deletes and reconstructs a complete zone
+list. The helper validates its byte and semantic baseline before each official
+rpcd commit and retries conflicts from live state. An unchanged reconciliation
+performs no network or firewall reload. This is important on systems running
+OpenClash: Meduza never
+touches `utun`, OpenClash's UCI, policy-routing tables, fwmarks, or nftables /
+iptables chains, and preserves `utun` when editing a zone membership list.
 
 Leave `ETCD_CA`, `ETCD_CERT` and `ETCD_KEY` empty when mutual TLS is not used.
 `ETCD_ENDPOINTS` accepts a comma-separated value for compatibility with the
@@ -150,24 +205,43 @@ For a one-shot diagnostic reconciliation run:
 logread -e meduza
 ```
 
-Generated files are under `/etc/tinc`, `/etc/openvpn`, `/etc/frr` and
-`/etc/meduza/wireguard`. WireGuard is applied with `wg setconf` and `ip`, so it
-does not create routes; FRR remains responsible for routing, matching the main
-project's behavior.
+Generated VPN files are isolated under `/etc/meduza/generated`. The persistent
+ownership manifest is `/etc/meduza/managed/interfaces`; an interrupted apply is
+journaled in `interfaces.pending`, and each generated directory has a separate
+external create/owned/delete phase record under `/etc/meduza/managed`. The
+delete phase first renames the directory to a nonce-bearing private tombstone,
+making a power loss during recursive removal safely replayable.
+`uci-ownership.json` separately records every managed UCI section generation
+and firewall membership edge, so a copied/stale inline owner option cannot
+authorize deletion.
+`/etc/meduza/cache.json` stores the last successfully applied etcd snapshot;
+`cache.pending.json` closes the first-apply crash window. These files are mode
+`0600` and the parent directories are mode `0700`. WireGuard is applied with
+`wg setconf` and `ip`, so it does not create routes; FRR remains responsible for
+routing, matching the main project's behavior.
 
 
-For every enabled VPN instance, reconciliation also maintains an unmanaged
+For every enabled VPN instance, reconciliation maintains an owner-marked
 OpenWrt network interface:
 
+- tinc network `mesh` becomes `tinc_mesh`, bound to its configured TAP device;
 - OpenVPN instance `office` becomes `ovpn_office`, bound to its configured
-  tunnel device;
+  tunnel device. OpenWrt 25.12 and newer use the native netifd `openvpn` proto;
+  older releases use an instance with the same name in `/etc/config/openvpn`,
+  so hotplug, firewall and PBR consumers all see `ovpn_office`;
 - WireGuard instance `office` becomes `wg_office`, bound to its WireGuard
   device. UCI identifiers use `_` because OpenWrt forbids `-` in section names;
   the underlying Linux VPN device keeps the exact name configured in etcd.
 
-All such interfaces are automatically moved to `VPN_FIREWALL_ZONE`. Stale
-Meduza interfaces and their old zone memberships are removed when instances
-are disabled or renamed. Interfaces not marked as Meduza-managed are untouched.
+When no OpenVPN or WireGuard device is configured, the lite package creates an
+`ovpn-<instance>` or `wg-<instance>` device name. Names longer than Linux's
+15-byte limit receive a deterministic suffix instead of being ambiguously
+truncated. All three interface types are automatically moved to
+`VPN_FIREWALL_ZONE`. Stale Meduza interfaces, generated files and old zone
+memberships are removed when instances are disabled or renamed. A UCI section
+or Linux device that already exists without Meduza's matching external
+ownership record and runtime marker causes reconciliation to fail safely rather
+than being adopted or overwritten.
 ## Compatibility and status semantics
 
 The implementation consumes the same tinc, OpenVPN, WireGuard, OSPF, BGP,
@@ -194,7 +268,15 @@ when the interface exists without a recent handshake, and `down` when absent.
 
 - The agent connects directly to etcd's native v3 gRPC service; the HTTP/JSON
   gateway does not need to be enabled.
-- Instance and interface names are restricted to letters, digits, `_` and `-`.
-- Configuration is written atomically before native services are restarted.
+- Instance names are restricted to letters, digits, `_` and `-`; Linux device
+  names are additionally limited to 15 bytes. `lo` and OpenClash's `utun` are
+  reserved and rejected.
+- Configuration and ownership phase journals are written and directory-fsynced
+  before native services are changed. Reconcile and cleanup share one lock;
+  generated-directory creation and deletion are replayable after power loss.
+- Removing `/var/run/meduza` does not lose ownership: the persistent manifest,
+  external UCI generation records and device markers remain authoritative, and
+  startup reconstructs runtime state from the last-known-good cache before
+  polling etcd.
 - Give the etcd account read access to `/commit`, `/global/`, `/nodes/` and
   write access to `/updated/<NODE_ID>/`.

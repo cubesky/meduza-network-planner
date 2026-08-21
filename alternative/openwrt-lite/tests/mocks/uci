@@ -1,0 +1,159 @@
+#!/bin/sh
+# Minimal UCI CLI used by test_sync_integration.py.  Each package is a flat
+# key=value file in MEDUZA_TEST_UCI_STORE; -t provides an isolated staging dir.
+set -eu
+
+savedir=''
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-q) shift ;;
+		-t) savedir=$2; shift 2 ;;
+		-c) savedir=$2; shift 2 ;;
+		-C) shift 2 ;;
+		*) break ;;
+	esac
+done
+
+command=${1:-}
+[ "$#" -eq 0 ] || shift
+argument=${1:-}
+store=${MEDUZA_TEST_UCI_STORE:?}
+
+log_write() {
+	[ -z "${MEDUZA_TEST_UCI_WRITE_LOG:-}" ] || \
+		printf '%s\t%s\n' "$command" "$argument" >>"$MEDUZA_TEST_UCI_WRITE_LOG"
+}
+
+package_of() { printf '%s' "${1%%.*}"; }
+local_key() { printf '%s' "${1#*.}"; }
+committed_file() { printf '%s/%s' "$store" "$1"; }
+staged_file() { printf '%s/%s' "$savedir" "$1"; }
+
+read_file() {
+	local package=$1 staged
+	if [ -n "$savedir" ]; then
+		staged=$(staged_file "$package")
+		if [ -f "$staged" ]; then printf '%s' "$staged"; return; fi
+	fi
+	committed_file "$package"
+}
+
+ensure_stage() {
+	local package=$1 target base
+	[ -n "$savedir" ] || { echo 'mock uci: writes require isolated config dir' >&2; return 2; }
+	mkdir -p "$savedir" "$store"
+	target=$(staged_file "$package")
+	[ -f "$target" ] && return 0
+	base=$(committed_file "$package")
+	if [ -f "$base" ]; then cp "$base" "$target"; else : >"$target"; fi
+}
+
+lookup() {
+	local file=$1 key=$2
+	[ -f "$file" ] || return 1
+	awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; found=1; exit } END { if (!found) exit 3 }' "$file"
+}
+
+set_value() {
+	local file=$1 key=$2 value=$3 temporary
+	temporary="${file}.tmp.$$"
+	awk -F= -v wanted="$key" '$1 != wanted { print }' "$file" >"$temporary"
+	printf '%s=%s\n' "$key" "$value" >>"$temporary"
+	mv "$temporary" "$file"
+}
+
+case "$command" in
+	get)
+		package=$(package_of "$argument")
+		key=$(local_key "$argument")
+		lookup "$(read_file "$package")" "$key"
+		;;
+	show)
+		package=$argument
+		file=$(read_file "$package")
+		[ -f "$file" ] || exit 1
+		while IFS='=' read -r key value; do
+			[ -n "$key" ] || continue
+			case "$key" in
+				*.*) printf "%s.%s='%s'\n" "$package" "$key" "$value" ;;
+				*) printf '%s.%s=%s\n' "$package" "$key" "$value" ;;
+			esac
+		done <"$file"
+		;;
+	set)
+		log_write
+		left=${argument%%=*}
+		value=${argument#*=}
+		package=$(package_of "$left")
+		key=$(local_key "$left")
+		ensure_stage "$package"
+		set_value "$(staged_file "$package")" "$key" "$value"
+		;;
+	delete)
+		log_write
+		package=$(package_of "$argument")
+		key=$(local_key "$argument")
+		ensure_stage "$package"
+		file=$(staged_file "$package")
+		temporary="${file}.tmp.$$"
+		awk -F= -v wanted="$key" '$1 != wanted && index($1, wanted ".") != 1 { print }' "$file" >"$temporary"
+		mv "$temporary" "$file"
+		;;
+	add_list)
+		log_write
+		left=${argument%%=*}
+		value=${argument#*=}
+		package=$(package_of "$left")
+		key=$(local_key "$left")
+		ensure_stage "$package"
+		file=$(staged_file "$package")
+		current=$(lookup "$file" "$key" 2>/dev/null || true)
+		case " $current " in
+			*" $value "*) : ;;
+			*) current="${current:+$current }$value" ;;
+		esac
+		set_value "$file" "$key" "$current"
+		;;
+	del_list)
+		log_write
+		left=${argument%%=*}
+		value=${argument#*=}
+		package=$(package_of "$left")
+		key=$(local_key "$left")
+		ensure_stage "$package"
+		file=$(staged_file "$package")
+		current=$(lookup "$file" "$key" 2>/dev/null || true)
+		next=''
+		for token in $current; do
+			[ "$token" = "$value" ] || next="${next:+$next }$token"
+		done
+		set_value "$file" "$key" "$next"
+		;;
+	changes)
+		package=$argument
+		if [ -z "$savedir" ]; then
+			pending=${MEDUZA_TEST_UCI_DEFAULT_PENDING:-}
+			[ -n "$pending" ] && [ -f "$pending/$package" ] && cat "$pending/$package"
+			exit 0
+		fi
+		staged=$(staged_file "$package")
+		[ -f "$staged" ] || exit 0
+		base=$(committed_file "$package")
+		if [ ! -f "$base" ] || ! cmp -s "$staged" "$base"; then
+			printf '%s\n' "$package changed"
+		fi
+		;;
+	commit)
+		log_write
+		package=$argument
+		[ -n "$savedir" ] || exit 2
+		staged=$(staged_file "$package")
+		[ -f "$staged" ] || exit 0
+		mkdir -p "$store"
+		cp "$staged" "$(committed_file "$package")"
+		;;
+	*)
+		echo "mock uci: unsupported command: $command" >&2
+		exit 2
+		;;
+esac
