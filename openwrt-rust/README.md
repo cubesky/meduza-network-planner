@@ -213,6 +213,13 @@ downloads the matching OpenWrt SDK and should be used for release artifacts.
 Do not interpret the commands above as evidence that a particular checkout has
 already cross-compiled successfully.
 
+After the two static executables have been verified, CI assembles the APK/IPK
+payload directly with `package/build-direct.sh`. It does not update feeds,
+install feed sources, run `defconfig`, or compile LuCI and runtime dependencies.
+The matching SDK is retained only for its official `ipkg-build` or `apk mkpkg`
+tool, while dependency names are recorded as package metadata for the router's
+package manager to resolve at installation time.
+
 Release CI should verify each output rather than relying on its filename:
 
 ```sh

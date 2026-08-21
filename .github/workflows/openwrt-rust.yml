@@ -36,8 +36,9 @@ concurrency:
 
 env:
   RUST_VERSION: "1.90.0"
-  # The static ELF is independent of OpenWrt user-space libraries.  The newer
-  # SDK is used solely as a known musl cross toolchain for the two Rust builds.
+  # The static ELF is independent of OpenWrt user-space libraries. The SDK
+  # supplies the musl cross toolchain and the native IPK/APK packagers only;
+  # the package job never resolves or compiles feeds.
   BINARY_SDK_RELEASE: "25.12.2"
   DOWNLOAD_DIR: ${{ github.workspace }}/.openwrt-downloads
 
@@ -70,6 +71,7 @@ jobs:
       - name: Check OpenWrt package scripts
         run: |
           sh -n openwrt-rust/package/files/etc/init.d/meduza
+          sh -n openwrt-rust/package/build-direct.sh
           python3 -m json.tool \
             openwrt-rust/package/files/usr/share/luci/menu.d/meduza.json \
             >/dev/null
@@ -259,21 +261,25 @@ jobs:
             openwrt_target: mediatek
             openwrt_subtarget: filogic
             asset_arch: aarch64
+            package_arch: aarch64_cortex-a53
           - format: ipk
             release: ${{ inputs.ipk_release || '24.10.0' }}
             openwrt_target: x86
             openwrt_subtarget: "64"
             asset_arch: x86_64
+            package_arch: x86_64
           - format: apk
             release: ${{ inputs.apk_release || '25.12.2' }}
             openwrt_target: mediatek
             openwrt_subtarget: filogic
             asset_arch: aarch64
+            package_arch: aarch64_cortex-a53
           - format: apk
             release: ${{ inputs.apk_release || '25.12.2' }}
             openwrt_target: x86
             openwrt_subtarget: "64"
             asset_arch: x86_64
+            package_arch: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -284,18 +290,17 @@ jobs:
           name: meduza-openwrt-rust-bin-${{ matrix.asset_arch }}
           path: binary
 
-      - name: Install SDK host dependencies
+      - name: Install SDK archive dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            build-essential curl file gawk gettext git libncurses-dev make \
-            rsync unzip xz-utils zlib1g-dev zstd
+            curl xz-utils zstd
 
-      - name: Cache OpenWrt SDK archive and downloads
+      - name: Cache OpenWrt SDK archive
         uses: actions/cache@v4
         with:
           path: .openwrt-downloads
-          key: package-openwrt-${{ matrix.release }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}
+          key: direct-package-openwrt-${{ matrix.release }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}
 
       - name: Download and verify OpenWrt SDK
         shell: bash
@@ -331,61 +336,63 @@ jobs:
           mkdir -p openwrt-sdk
           tar --extract --file "${sdk_archive}" --directory openwrt-sdk --strip-components=1
 
-      - name: Install and compile the package definition
+      - name: Assemble the package from the verified static executable
         shell: bash
         env:
           ASSET_ARCH: ${{ matrix.asset_arch }}
-        run: |
-          set -euo pipefail
-          (
-            cd openwrt-sdk
-            ./scripts/feeds update -a
-            ./scripts/feeds install ca-bundle ip-full rpcd ubus uci luci-base
-          )
-          package_dir=openwrt-sdk/package/meduza-openwrt-rust
-          cp -a openwrt-rust/package "${package_dir}"
-          mkdir -p "${package_dir}/prebuilt"
-          cp "binary/meduza-openwrt-linux-${ASSET_ARCH}" \
-            "${package_dir}/prebuilt/meduza-openwrt"
-          chmod 755 "${package_dir}/prebuilt/meduza-openwrt"
-          export MEDUZA_PKG_RELEASE="${GITHUB_RUN_NUMBER}"
-          printf '%s\n' 'CONFIG_PACKAGE_meduza-openwrt-rust=m' >openwrt-sdk/.config
-          make -C openwrt-sdk defconfig
-          set -o pipefail
-          mkdir -p build-artifact
-          make -C openwrt-sdk package/meduza-openwrt-rust/compile \
-            -j"$(nproc)" V=s 2>&1 | tee build-artifact/build.log
-          if grep -Eq -- '--info[[:space:]]+"?arch:noarch"?' build-artifact/build.log; then
-            echo 'native Rust package was incorrectly tagged noarch' >&2
-            exit 1
-          fi
-
-      - name: Collect the architecture-specific package
-        shell: bash
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
+          PACKAGE_ARCH: ${{ matrix.package_arch }}
           PACKAGE_FORMAT: ${{ matrix.format }}
           OPENWRT_RELEASE: ${{ matrix.release }}
         run: |
           set -euo pipefail
-          case "${PACKAGE_FORMAT}" in
-            ipk) pattern='meduza-openwrt-rust_*.ipk' ;;
-            apk) pattern='meduza-openwrt-rust-*.apk' ;;
-            *) exit 1 ;;
-          esac
-          mapfile -t found < <(find openwrt-sdk/bin -type f -name "${pattern}" -print)
-          test "${#found[@]}" -eq 1
+          mkdir -p build-artifact
           release_date="$(date -u +%Y%m%d)"
           short_hash="${GITHUB_SHA:0:7}"
           output="build-artifact/meduza-openwrt-rust-${release_date}-${short_hash}-${ASSET_ARCH}.${PACKAGE_FORMAT}"
-          cp "${found[0]}" "${output}"
-          sha256sum "${output}" >"${output}.sha256"
+          package_version="0.1.0-r${GITHUB_RUN_NUMBER}"
+          if ! sh openwrt-rust/package/build-direct.sh \
+            "${PACKAGE_FORMAT}" \
+            "${PACKAGE_ARCH}" \
+            "${package_version}" \
+            "binary/meduza-openwrt-linux-${ASSET_ARCH}" \
+            openwrt-sdk \
+            "${output}" 2>&1 | tee build-artifact/build.log; then
+            tail -n 200 build-artifact/build.log >&2
+            exit 1
+          fi
+
           printf '%s\n' \
             "OpenWrt release: ${OPENWRT_RELEASE}" \
             "Package format: ${PACKAGE_FORMAT}" \
-            "CPU architecture: ${ASSET_ARCH}" \
-            "Package release: ${GITHUB_RUN_NUMBER}" \
+            "ELF architecture: ${ASSET_ARCH}" \
+            "Package architecture: ${PACKAGE_ARCH}" \
+            "Package version: ${package_version}" \
             "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
+
+      - name: Upload package diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-rust-diagnostics-${{ matrix.format }}-${{ matrix.asset_arch }}
+          path: build-artifact/build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Collect the architecture-specific package
+        shell: bash
+        env:
+          PACKAGE_FORMAT: ${{ matrix.format }}
+        run: |
+          set -euo pipefail
+          case "${PACKAGE_FORMAT}" in
+            ipk) pattern='meduza-openwrt-rust-*.ipk' ;;
+            apk) pattern='meduza-openwrt-rust-*.apk' ;;
+            *) exit 1 ;;
+          esac
+          mapfile -t found < <(find build-artifact -maxdepth 1 -type f -name "${pattern}" -print)
+          test "${#found[@]}" -eq 1
+          test -s "${found[0]}"
+          test -s "${found[0]}.sha256"
 
       - name: Upload OpenWrt package
         uses: actions/upload-artifact@v4
