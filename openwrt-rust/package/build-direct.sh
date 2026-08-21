@@ -100,11 +100,11 @@ EOF
 chmod 0755 "$scripts/preinst" "$scripts/prerm-pkg"
 
 build_ipk() {
-	fakeroot=$sdk/staging_dir/host/bin/fakeroot
-	bash=$sdk/staging_dir/host/bin/bash
+	fakeroot=$(command -v fakeroot || true)
+	bash=$(command -v bash || true)
 	ipkg_build=$sdk/scripts/ipkg-build
 	[ -x "$fakeroot" ] && [ -x "$bash" ] && [ -f "$ipkg_build" ] || {
-		echo 'SDK IPK packaging tools are missing' >&2
+		echo 'IPK packaging tools are missing' >&2
 		exit 1
 	}
 
@@ -156,10 +156,10 @@ EOF
 }
 
 build_apk() {
-	fakeroot=$sdk/staging_dir/host/bin/fakeroot
+	fakeroot=$(command -v fakeroot || true)
 	apk=$sdk/staging_dir/host/bin/apk
 	[ -x "$fakeroot" ] && [ -x "$apk" ] || {
-		echo 'SDK APK packaging tools are missing' >&2
+		echo 'APK packaging tools are missing' >&2
 		exit 1
 	}
 
