@@ -28,6 +28,93 @@ payload_completion_valid() {
 	MEDUZA_PAYLOAD_TX=$transaction
 }
 
+# rc.common's defaults use `ln -sf` and can therefore replace an unrelated
+# S95meduza/K10meduza path while APK is still running default_postinst.  Keep
+# both names as one validated pair and never force either namespace entry.
+meduza_rc_link_owned() {
+	local path="$1" target
+	[ -L "$path" ] || return 1
+	target=$(readlink "$path") || return 1
+	case "$target" in
+		../init.d/meduza|/etc/init.d/meduza) return 0;;
+	esac
+	return 1
+}
+
+meduza_rc_path_available() {
+	local path="$1"
+	if [ -e "$path" ] || [ -L "$path" ]; then
+		meduza_rc_link_owned "$path"
+		return $?
+	fi
+	return 0
+}
+
+meduza_rc_handoff_active() {
+	local root="${IPKG_INSTROOT:-}" managed path
+	managed="${root}/etc/meduza/managed"
+	for path in "$managed/upgrade.state" "$managed/upgrade.rc-link" \
+		"$managed/upgrade.rc-disabled"; do
+		[ ! -e "$path" ] && [ ! -L "$path" ] || return 0
+	done
+	return 1
+}
+
+# These definitions deliberately override rc.common after it sources this
+# script.  During a package handoff enable is a successful no-op: the custom
+# postinst owns restoration and publishes the completion seal last.
+enable() {
+	local root="${IPKG_INSTROOT:-}" rc_dir start_link stop_link link
+	[ -z "$root" ] || return 0
+	if meduza_rc_handoff_active; then
+		return 0
+	fi
+	payload_completion_valid || return 1
+	command -v fsync >/dev/null 2>&1 || return 1
+	rc_dir="${root}/etc/rc.d"
+	start_link="$rc_dir/S95meduza"
+	stop_link="$rc_dir/K10meduza"
+	[ -d "$rc_dir" ] && [ ! -L "$rc_dir" ] || return 1
+	# Validate the complete pair before creating either entry.
+	for link in "$start_link" "$stop_link"; do
+		meduza_rc_path_available "$link" || return 1
+	done
+	for link in "$start_link" "$stop_link"; do
+		[ -e "$link" ] || [ -L "$link" ] || \
+			ln -s ../init.d/meduza "$link" || return 1
+	done
+	fsync "$rc_dir"
+}
+
+disable() {
+	local root="${IPKG_INSTROOT:-}" rc_dir start_link stop_link link
+	[ -z "$root" ] || return 0
+	rc_dir="${root}/etc/rc.d"
+	start_link="$rc_dir/S95meduza"
+	stop_link="$rc_dir/K10meduza"
+	if [ ! -e "$rc_dir" ] && [ ! -L "$rc_dir" ]; then
+		return 0
+	fi
+	[ -d "$rc_dir" ] && [ ! -L "$rc_dir" ] || return 1
+	command -v fsync >/dev/null 2>&1 || return 1
+	# Validate the complete pair before removing either entry.
+	for link in "$start_link" "$stop_link"; do
+		meduza_rc_path_available "$link" || return 1
+	done
+	for link in "$start_link" "$stop_link"; do
+		[ ! -e "$link" ] && [ ! -L "$link" ] || rm -f "$link" || return 1
+	done
+	fsync "$rc_dir"
+}
+
+enabled() {
+	local root="${IPKG_INSTROOT:-}" rc_dir
+	rc_dir="${root}/etc/rc.d"
+	[ -d "$rc_dir" ] && [ ! -L "$rc_dir" ] || return 1
+	meduza_rc_link_owned "$rc_dir/S95meduza" && \
+		meduza_rc_link_owned "$rc_dir/K10meduza"
+}
+
 start_service() {
 	local enable
 	MEDUZA_START_STATUS=0
@@ -149,13 +236,6 @@ service_started() {
 			status=1
 		fi
 	fi
-	if [ "$status" -eq 0 ] && [ "${MEDUZA_UPGRADE_READY:-0}" = 1 ]; then
-		restore_upgrade_rc_state && clear_upgrade_ready && \
-			finish_upgrade_rc_state || {
-			logger -t meduza 'could not durably finish package-upgrade handoff'
-			status=1
-		}
-	fi
 	if [ "$status" -ne 0 ]; then
 		# A failed/indeterminate registration may still have created a supervised
 		# instance.  Unregister it and prove the complete process tree is gone
@@ -173,6 +253,14 @@ service_started() {
 		local cleanup_status=0
 		procd_kill meduza agent >/dev/null 2>&1 || true
 		wait_meduza_quiescent 1 || return 1
+		# Keep the ready transaction journal until disabled-resource cleanup has
+		# actually succeeded.  Clearing it first made a failed purge impossible to
+		# distinguish from a completed package handoff on the next start.
+		if [ "${MEDUZA_UPGRADE_READY:-0}" = 1 ] && \
+			! restore_upgrade_rc_state; then
+			logger -t meduza 'could not restore disabled rc.d state'
+			cleanup_status=1
+		fi
 		# Global forwarding must be restored even when a later ownership/UCI
 		# conflict makes purge fail.  No controller remains after the quiesce.
 		if [ -f /var/run/meduza/ip-forward.changed ]; then
@@ -180,7 +268,8 @@ service_started() {
 				rm -f /var/run/meduza/ip-forward.changed || cleanup_status=1
 		fi
 		if [ -x /usr/libexec/meduza/meduza-generator ] && \
-			! /usr/libexec/meduza/meduza-generator --purge; then
+			! MEDUZA_PRESERVE_PACKAGE_STATE=1 \
+				/usr/libexec/meduza/meduza-generator --purge; then
 			logger -t meduza 'disabled-resource cleanup failed'
 			cleanup_status=1
 		fi
@@ -189,7 +278,20 @@ service_started() {
 			logger -t meduza 'recovery-bundle cleanup failed'
 			cleanup_status=1
 		fi
+		if [ "$cleanup_status" -eq 0 ] && \
+			[ "${MEDUZA_UPGRADE_READY:-0}" = 1 ] && \
+			! { clear_upgrade_ready && finish_upgrade_rc_state; }; then
+			logger -t meduza 'could not durably finish disabled package handoff'
+			cleanup_status=1
+		fi
 		return "$cleanup_status"
+	fi
+	if [ "${MEDUZA_UPGRADE_READY:-0}" = 1 ]; then
+		restore_upgrade_rc_state && clear_upgrade_ready && \
+			finish_upgrade_rc_state || {
+			logger -t meduza 'could not durably finish package-upgrade handoff'
+			return 1
+		}
 	fi
 	return 0
 }
@@ -206,17 +308,23 @@ clear_upgrade_ready() {
 
 restore_upgrade_rc_state() {
 	local live=/etc/rc.d/S95meduza saved=/etc/meduza/managed/upgrade.rc-link
-	local disabled=/etc/meduza/managed/upgrade.rc-disabled target
+	local stop=/etc/rc.d/K10meduza
+	local disabled=/etc/meduza/managed/upgrade.rc-disabled target link
 	[ -d /etc/rc.d ] && [ ! -L /etc/rc.d ] || return 1
 	if [ -e "$saved" ] || [ -L "$saved" ]; then
 		[ -L "$saved" ] || return 1
 		target=$(readlink "$saved") || return 1
 		case "$target" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
-		if [ -e "$live" ] || [ -L "$live" ]; then
-			[ -L "$live" ] && [ "$(readlink "$live")" = "$target" ] || return 1
-		else
-			ln -s "$target" "$live" || return 1
-		fi
+		# Validate both paths before creating either one.
+		for link in "$live" "$stop"; do
+			if [ -e "$link" ] || [ -L "$link" ]; then
+				[ -L "$link" ] || return 1
+				case "$(readlink "$link")" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
+			fi
+		done
+		for link in "$live" "$stop"; do
+			[ -e "$link" ] || [ -L "$link" ] || ln -s "$target" "$link" || return 1
+		done
 		fsync /etc/rc.d || return 1
 		fsync /etc/meduza/managed || return 1
 		[ ! -e "$disabled" ] && [ ! -L "$disabled" ] || return 1
@@ -224,12 +332,16 @@ restore_upgrade_rc_state() {
 	fi
 	[ -f "$disabled" ] && [ ! -L "$disabled" ] && \
 		[ "$(cat "$disabled" 2>/dev/null)" = disabled ] || return 1
-	if [ -e "$live" ] || [ -L "$live" ]; then
-		[ -L "$live" ] || return 1
-		case "$(readlink "$live")" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
-		rm -f "$live" || return 1
-		fsync /etc/rc.d || return 1
-	fi
+	for link in "$live" "$stop"; do
+		if [ -e "$link" ] || [ -L "$link" ]; then
+			[ -L "$link" ] || return 1
+			case "$(readlink "$link")" in ../init.d/meduza|/etc/init.d/meduza) :;; *) return 1;; esac
+		fi
+	done
+	for link in "$live" "$stop"; do
+		[ ! -e "$link" ] && [ ! -L "$link" ] || rm -f "$link" || return 1
+	done
+	fsync /etc/rc.d || return 1
 	fsync /etc/meduza/managed || return 1
 }
 

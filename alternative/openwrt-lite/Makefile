@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=meduza-openwrt-lite
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=27
+PKG_RELEASE:=28
 MEDUZA_BUILD_ID:=$(PKG_VERSION)-r$(PKG_RELEASE)
 
 MEDUZA_PKGARCH?=$(ARCH_PACKAGES)
@@ -112,6 +112,20 @@ endef
 define Package/meduza-openwrt-lite/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT:-}" ] && exit 0
+MEDUZA_POSTINST_STAGE=build-identity
+meduza_postinst_exit() {
+	local status="$$1" message
+	trap - 0 INT TERM
+	if [ "$${status}" -ne 0 ]; then
+		message="package post-install failed: stage=$${MEDUZA_POSTINST_STAGE} status=$${status}"
+		logger -t meduza "$${message}" 2>/dev/null || true
+		printf '%s\n' "meduza: $${message}" >&2 || true
+	fi
+	exit "$${status}"
+}
+trap 'meduza_postinst_exit "$$?"' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
 [ -f /usr/share/meduza/openwrt-lite-build ] && \
 	[ ! -L /usr/share/meduza/openwrt-lite-build ] || exit 1
 build_id=$$(cat /usr/share/meduza/openwrt-lite-build 2>/dev/null) || exit 1
@@ -120,6 +134,7 @@ case "$${build_id}" in *[!A-Za-z0-9_.-]*|'') exit 1;; esac
 state=/etc/meduza/managed/upgrade.state
 complete=/etc/meduza/managed/install-complete
 first_install=/etc/meduza/managed/upgrade.first-install
+MEDUZA_POSTINST_STAGE=transaction-state
 if [ ! -e "$${state}" ] && [ ! -L "$${state}" ]; then
 	# A repeated configure after the successful handoff is idempotent.  It may
 	# never recreate authority from an incomplete or mismatched completion seal.
@@ -139,6 +154,7 @@ if [ ! -e "$${state}" ] && [ ! -L "$${state}" ]; then
 		rm -f "$${first_install}" || exit 1
 		fsync /etc/meduza/managed || exit 1
 	fi
+	MEDUZA_POSTINST_STAGE=complete
 	exit 0
 fi
 [ -f "$${state}" ] && [ ! -L "$${state}" ] || exit 1
@@ -148,35 +164,66 @@ old_ifs=$${IFS}; IFS=:; set -- $${state_line}; IFS=$${old_ifs}
 transaction=$$2
 case "$${transaction}" in *[!0-9a-f]*|'') exit 1;; esac
 [ "$${#transaction}" -eq 32 ] || exit 1
+MEDUZA_POSTINST_STAGE=recovery-bundle
 [ ! -x /usr/libexec/meduza/meduza-recover ] || \
-	/usr/libexec/meduza/meduza-recover --install-bundle >/dev/null 2>&1 || exit 1
+	/usr/libexec/meduza/meduza-recover --install-bundle || exit 1
 # Restore the original boot entry before publishing the completion seal.  If
 # power fails between these two durable steps the new init is reachable but its
 # seal gate still refuses all mutation; after the seal lands, boot can finish
 # the handoff even when this postinst never reaches the explicit start below.
 rc_link=/etc/rc.d/S95meduza
+rc_stop=/etc/rc.d/K10meduza
 saved_rc=/etc/meduza/managed/upgrade.rc-link
 rc_disabled=/etc/meduza/managed/upgrade.rc-disabled
+MEDUZA_POSTINST_STAGE=rc-handoff
 [ -d /etc/rc.d ] && [ ! -L /etc/rc.d ] || exit 1
 if [ -e "$${saved_rc}" ] || [ -L "$${saved_rc}" ]; then
 	[ -L "$${saved_rc}" ] || exit 1
 	target=$$(readlink "$${saved_rc}") || exit 1
 	case "$${target}" in ../init.d/meduza|/etc/init.d/meduza) :;; *) exit 1;; esac
 	[ ! -e "$${rc_disabled}" ] && [ ! -L "$${rc_disabled}" ] || exit 1
-	if [ -e "$${rc_link}" ] || [ -L "$${rc_link}" ]; then
-		[ -L "$${rc_link}" ] && [ "$$(readlink "$${rc_link}")" = "$${target}" ] || exit 1
-	else
-		ln -s "$${target}" "$${rc_link}" || exit 1
-	fi
+	# Validate the complete pair before creating either link, so a conflicting
+	# K link cannot leave a newly-created S link behind on failure.
+	for generated_rc in "$${rc_link}" "$${rc_stop}"; do
+		if [ -e "$${generated_rc}" ] || [ -L "$${generated_rc}" ]; then
+			[ -L "$${generated_rc}" ] || exit 1
+			case "$$(readlink "$${generated_rc}")" in
+				../init.d/meduza|/etc/init.d/meduza) :;;
+				*) exit 1;;
+			esac
+		fi
+	done
+	for generated_rc in "$${rc_link}" "$${rc_stop}"; do
+		[ -e "$${generated_rc}" ] || [ -L "$${generated_rc}" ] || \
+			ln -s "$${target}" "$${generated_rc}" || exit 1
+	done
 	fsync /etc/rc.d || exit 1
 elif [ -e "$${rc_disabled}" ]; then
 	[ -f "$${rc_disabled}" ] && [ ! -L "$${rc_disabled}" ] && \
 		[ "$$(cat "$${rc_disabled}" 2>/dev/null)" = disabled ] || exit 1
-	[ ! -e "$${rc_link}" ] && [ ! -L "$${rc_link}" ] || exit 1
+	# APK's default post-install runs `enable` before this custom hook even when
+	# preinst preserved a disabled service.  Remove only the two exact rc.common
+	# links it is allowed to have created; any conflicting path still fails
+	# closed.  This also cleans a stale K link from an earlier failed install.
+	for generated_rc in "$${rc_link}" "$${rc_stop}"; do
+		if [ -e "$${generated_rc}" ] || [ -L "$${generated_rc}" ]; then
+			[ -L "$${generated_rc}" ] || exit 1
+			case "$$(readlink "$${generated_rc}")" in
+				../init.d/meduza|/etc/init.d/meduza) :;;
+				*) exit 1;;
+			esac
+		fi
+	done
+	for generated_rc in "$${rc_link}" "$${rc_stop}"; do
+		[ ! -e "$${generated_rc}" ] && [ ! -L "$${generated_rc}" ] || \
+			rm -f "$${generated_rc}" || exit 1
+	done
+	fsync /etc/rc.d || exit 1
 else
 	exit 1
 fi
 fsync /etc/meduza/managed || exit 1
+MEDUZA_POSTINST_STAGE=completion-seal
 for temporary in "$${complete}.meduza."[0-9]*; do
 	[ -e "$${temporary}" ] || continue
 	[ -f "$${temporary}" ] && [ ! -L "$${temporary}" ] || exit 1
@@ -189,12 +236,22 @@ fsync "$${tmp}" || exit 1
 mv -f "$${tmp}" "$${complete}" || exit 1
 fsync /etc/meduza/managed || exit 1
 if [ -e "$${first_install}" ]; then
+	MEDUZA_POSTINST_STAGE=first-install-finalize
 	[ -f "$${first_install}" ] && [ ! -L "$${first_install}" ] && \
 		[ "$$(cat "$${first_install}" 2>/dev/null)" = "v1:$${transaction}:$${build_id}" ] || exit 1
 	rm -f "$${first_install}" || exit 1
 	fsync /etc/meduza/managed || exit 1
 fi
-/etc/init.d/meduza start || exit 1
+MEDUZA_POSTINST_STAGE=service-start
+if ! /etc/init.d/meduza start; then
+	# Payload, recovery bundle, rc state and completion seal are already durable.
+	# Runtime activation is deliberately retryable and must not leave APK stuck
+	# in broken-scripts state; the ready journal remains when handoff was not
+	# completed, and a later explicit start will resume it.
+	logger -t meduza 'package installed, but Meduza service activation is pending; run /etc/init.d/meduza start to retry' 2>/dev/null || true
+	printf '%s\n' 'meduza: package installed, but service activation is pending; run /etc/init.d/meduza start to retry' >&2
+fi
+MEDUZA_POSTINST_STAGE=complete
 exit 0
 endef
 

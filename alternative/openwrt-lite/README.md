@@ -123,6 +123,12 @@ until both seals match, including when an APK implementation invokes its default
 start action before the custom post-install step or continues unpacking after a
 failed pre-upgrade script.
 
+Package hook failures use fixed, non-sensitive stages such as
+`package post-install failed: stage=rc-handoff status=1`. Once APK has recorded
+an installed version with a script error, adding that exact version again may be
+a no-op; install a newer fixed release or explicitly use the platform's package
+repair/reinstall operation so its pre/post hooks run again.
+
 Some APK implementations also continue deleting package payload files after a
 pre-deinstall script reports an error. Meduza therefore keeps an untracked,
 owner-marked purge bundle at `/etc/meduza/recovery` while installed. A successful

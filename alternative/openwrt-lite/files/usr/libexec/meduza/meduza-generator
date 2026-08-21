@@ -2586,31 +2586,35 @@ purge() {
 		return 1
 	fi
 	"$UCI_HELPER" finalize-purge || return 1
-	if [ -e "$MEDUZA_DATA/managed/upgrade.rc-link" ] || \
-		[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ]; then
-		[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ] || return 1
-		case "$(readlink "$MEDUZA_DATA/managed/upgrade.rc-link")" in
-			../init.d/meduza|/etc/init.d/meduza) :;;
-			*) return 1;;
-		esac
-		rm -f "$MEDUZA_DATA/managed/upgrade.rc-link" || return 1
-	fi
-	if [ -e "$MEDUZA_DATA/managed/upgrade.rc-disabled" ]; then
-		[ -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
-			[ ! -L "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
-			[ "$(cat "$MEDUZA_DATA/managed/upgrade.rc-disabled")" = disabled ] || return 1
-		rm -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" || return 1
+	if [ "${MEDUZA_PRESERVE_PACKAGE_STATE:-0}" != 1 ]; then
+		if [ -e "$MEDUZA_DATA/managed/upgrade.rc-link" ] || \
+			[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ]; then
+			[ -L "$MEDUZA_DATA/managed/upgrade.rc-link" ] || return 1
+			case "$(readlink "$MEDUZA_DATA/managed/upgrade.rc-link")" in
+				../init.d/meduza|/etc/init.d/meduza) :;;
+				*) return 1;;
+			esac
+			rm -f "$MEDUZA_DATA/managed/upgrade.rc-link" || return 1
+		fi
+		if [ -e "$MEDUZA_DATA/managed/upgrade.rc-disabled" ]; then
+			[ -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
+				[ ! -L "$MEDUZA_DATA/managed/upgrade.rc-disabled" ] && \
+				[ "$(cat "$MEDUZA_DATA/managed/upgrade.rc-disabled")" = disabled ] || return 1
+			rm -f "$MEDUZA_DATA/managed/upgrade.rc-disabled" || return 1
+		fi
 	fi
 	fsync "$MEDUZA_DATA/managed" || return 1
 	rm -f "$MEDUZA_MANAGED" "$MEDUZA_PENDING" "$LEGACY_AUTH" \
 		"$UCI_MIGRATION" "$UCI_MIGRATION_ZONE" \
 		"$UCI_MIGRATION_ZONE_SEAL" "$UCI_MIGRATION_ZONE_DISABLED" \
-		"$UPGRADE_STATE" "$UPGRADE_INTENT" \
-		"$MEDUZA_DATA/managed/upgrade.first-install" \
+		"$UPGRADE_INTENT" \
 		"$MEDUZA_DATA/managed/uci-ownership.json" "$MEDUZA_DATA/managed"/uci-ownership.json.tmp.* \
 		"$MEDUZA_DATA/managed/reported.json" "$MEDUZA_DATA/managed"/reported.json.tmp.* \
 		"$MEDUZA_DATA/cache.json" "$MEDUZA_DATA/cache.pending.json" \
 		"$MEDUZA_DATA"/cache.json.tmp.* "$MEDUZA_DATA"/cache.pending.json.tmp.* || return 1
+	if [ "${MEDUZA_PRESERVE_PACKAGE_STATE:-0}" != 1 ]; then
+		rm -f "$UPGRADE_STATE" "$MEDUZA_DATA/managed/upgrade.first-install" || return 1
+	fi
 	fsync "$MEDUZA_DATA/managed" || return 1
 	fsync "$MEDUZA_DATA" || return 1
 	rm -f "$MEDUZA_STATE"/*.json "$MEDUZA_STATE"/*.instances "$MEDUZA_STATE"/*.dev || return 1

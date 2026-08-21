@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+meduza-postinst-*/
+meduza-recovery-*/
+meduza-init-rc-*/
+meduza-rc-override-*/
+sync-*/
