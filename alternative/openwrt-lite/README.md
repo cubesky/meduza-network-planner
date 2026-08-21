@@ -198,12 +198,17 @@ endpoints, refreshes expired authentication tokens, and retries failures with
 bounded exponential backoff. It polls `/commit` rather than watching individual
 configuration keys. A changed commit triggers a complete, idempotent reconciliation.
 
-For a one-shot diagnostic reconciliation run:
+To inspect reconciliation diagnostics:
 
 ```sh
-/usr/bin/python3 /usr/libexec/meduza/meduza-agent.py
 logread -e meduza
 ```
+
+An apply failure now includes a fixed, non-sensitive stage, for example
+`generator apply failed: stage=uci-apply status=1`. The stage identifies
+whether the failure occurred in the package seal, UCI transaction, generated
+configuration, VPN activation, FRR activation, or final ownership publish
+without printing etcd values, credentials, or VPN keys.
 
 Generated VPN files are isolated under `/etc/meduza/generated`. The persistent
 ownership manifest is `/etc/meduza/managed/interfaces`; an interrupted apply is

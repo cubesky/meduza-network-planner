@@ -42,6 +42,16 @@ class StopRequested(Exception):
     """Raised after a requested shutdown has quiesced the active child."""
 
 
+class ManagedCommandError(RuntimeError):
+    """A child failed without retaining or displaying its sensitive argv."""
+
+    def __init__(self, returncode):
+        self.returncode = returncode
+        super().__init__(
+            "managed helper exited with status {}".format(returncode)
+        )
+
+
 def log(message):
     print("meduza: " + message, file=sys.stderr, flush=True)
 
@@ -149,8 +159,12 @@ def run(*args, check=True, capture=False):
     if _stop_requested:
         raise StopRequested()
     if check and result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, args,
-                                            output=stdout, stderr=stderr)
+        # CalledProcessError.__str__ includes the complete argv.  Generator
+        # arguments are currently harmless, but run() is also the boundary for
+        # future helpers and must not turn a credential-bearing argument into
+        # a syslog message.  The child's stderr remains attached to procd, so
+        # meduza-generator's fixed, non-sensitive stage diagnostic is retained.
+        raise ManagedCommandError(result.returncode)
     return result
 
 
@@ -518,6 +532,7 @@ class Agent:
         self.cache_retry_at = 0
         self.cache_retry_delay = 1
         self.cache_stop_done = False
+        self.pending_last_ack = None
 
     def write_runtime(self, node, global_config, all_nodes):
         atomic_json(os.path.join(STATE, "node.json"), node)
@@ -563,6 +578,9 @@ class Agent:
                        for value in (node, global_config, all_nodes)):
                 raise ValueError("cached etcd values are invalid")
             self.write_runtime(node, global_config, all_nodes)
+            # A retry may recreate or replace runtime state before failing, so
+            # a previous successful safety stop cannot cover this new attempt.
+            self.cache_stop_done = False
             run("/usr/libexec/meduza/meduza-generator", "--apply")
             if source == CACHE_PENDING:
                 promote_json(CACHE_PENDING, CACHE)
@@ -570,18 +588,25 @@ class Agent:
                 durable_unlink(CACHE_PENDING)
             self.commit = cached.get("commit", "")
             self.initialized = True
+            applied_at = cached.get("applied_at")
+            self.pending_last_ack = (applied_at if isinstance(applied_at, str)
+                                     and applied_at else timestamp())
             self.cache_retry_delay = 1
             log("restored persistent last-known-good configuration")
             return True
+        except StopRequested:
+            raise
         except Exception as error:
             log("persistent configuration cache was not restored: {}".format(error))
-            run("/usr/libexec/meduza/meduza-generator", "--runtime-stop",
-                check=False)
+            stopped = run("/usr/libexec/meduza/meduza-generator",
+                          "--runtime-stop", check=False)
+            self.cache_stop_done = stopped.returncode == 0
             self.cache_retry_at = time.monotonic() + self.cache_retry_delay
             self.cache_retry_delay = min(self.cache_retry_delay * 2, 60)
             return False
 
     def reconcile(self, commit):
+        applied_at = timestamp()
         node = self.etcd.get_prefix("/nodes/{}/".format(self.node))
         global_config = self.etcd.get_prefix("/global/")
         all_nodes = self.etcd.get_prefix("/nodes/")
@@ -589,6 +614,7 @@ class Agent:
             "version": 1,
             "node_id": self.node,
             "commit": commit,
+            "applied_at": applied_at,
             "node": node,
             "global": global_config,
             "all_nodes": all_nodes,
@@ -600,8 +626,29 @@ class Agent:
         self.write_runtime(node, global_config, all_nodes)
         run("/usr/libexec/meduza/meduza-generator", "--apply")
         promote_json(CACHE_PENDING, CACHE)
-        self.etcd.put("/updated/{}/last".format(self.node), timestamp())
+        # At this point the local transaction and its LKG are durable.  A
+        # transient etcd acknowledgement failure must not mark that successful
+        # local commit uninitialized and trigger a destructive cache rollback.
+        self.commit = commit
+        self.initialized = True
+        self.cache_stop_done = False
+        self.pending_last_ack = applied_at
+
         log("configuration reconciled")
+
+    def flush_last_ack(self):
+        """Best-effort, idempotent acknowledgement of a durable local apply."""
+        if self.pending_last_ack is None:
+            return True
+        try:
+            self.etcd.put("/updated/{}/last".format(self.node),
+                          self.pending_last_ack)
+        except Exception as error:
+            log("configuration is active locally; etcd acknowledgement failed "
+                "and will be retried: {}".format(error))
+            return False
+        self.pending_last_ack = None
+        return True
 
     def report(self):
         cleanup_atomic_json_temps(REPORTED)
@@ -662,6 +709,7 @@ class Agent:
                         raise
                     self.commit = commit
                     self.initialized = True
+                self.flush_last_ack()
                 if time.monotonic() >= self.next_report:
                     self.report()
                     self.next_report = time.monotonic() + 15
@@ -677,6 +725,9 @@ class Agent:
 
 def main():
     os.umask(0o077)
+    # Every managed shell helper inherits the procd-captured stderr stream.
+    # Tell it not to submit a duplicate copy through logger(1).
+    os.environ["MEDUZA_LOG_ONCE"] = "1"
     try:
         payload_allows_agent()
     except (OSError, RuntimeError, UnicodeError) as error:

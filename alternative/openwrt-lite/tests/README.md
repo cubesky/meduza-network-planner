@@ -9,6 +9,10 @@ OpenWrt Lite package.  They cover:
 - rejection of OpenClash's `utun`, user devices and user UCI sections;
 - runtime stop of Meduza-owned processes/links while preserving restart data;
 - purge-time removal of only Meduza-owned UCI sections and generated files.
+- non-sensitive generator stage diagnostics for otherwise silent `set -e`
+  failures;
+- cache recovery safety, preservation of a locally committed LKG when the
+  etcd acknowledgement fails, and acknowledgement retry without re-applying.
 
 The persistent ownership contract is
 `/etc/meduza/managed/interfaces` with five tab-separated columns

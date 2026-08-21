@@ -24,6 +24,58 @@ UPGRADE_INTENT=$MEDUZA_DATA/managed/upgrade.intent
 BUILD_ID_FILE=${MEDUZA_BUILD_ID_FILE:-/usr/share/meduza/openwrt-lite-build}
 INSTALL_COMPLETE=${MEDUZA_INSTALL_COMPLETE:-$MEDUZA_DATA/managed/install-complete}
 
+# `set -e` is deliberately used throughout this script so a failed write or
+# service transition cannot be hidden by a later successful command.  BusyBox
+# ash has no reliable ERR trap, but its POSIX exit trap preserves the status
+# that caused `set -e` to terminate the script.  Keep the stage values below
+# source-controlled and free of configuration data: this diagnostic must never
+# print JSON, command arguments, credentials, or generated VPN material.
+MEDUZA_APPLY_REPORTING=0
+MEDUZA_APPLY_STAGE=entry
+
+apply_stage() {
+	MEDUZA_APPLY_STAGE=$1
+}
+
+apply_exit_report() {
+	local status=$1 stage=$MEDUZA_APPLY_STAGE message
+	# Prevent recursion if logger(1) itself is unavailable or the final exit is
+	# observed by an ash implementation that runs the exit trap again.
+	trap - 0 INT TERM
+	# acquire_generator_lock() installs its own cleanup trap.  The apply
+	# diagnostic is re-armed after that call, so it must preserve the same lock
+	# release guarantee before reporting the original failure.
+	command -v release_generator_lock >/dev/null 2>&1 && release_generator_lock
+	if [ "$MEDUZA_APPLY_REPORTING" = 1 ] && [ "$status" -ne 0 ]; then
+		message="generator apply failed: stage=$stage status=$status"
+		# Below the procd agent, prefer one syslog record and fall back to captured
+		# stderr.  A direct diagnostic invocation emits both.  Neither path may
+		# replace the original failure status.
+		if [ "${MEDUZA_LOG_ONCE:-0}" = 1 ]; then
+			logger -t meduza "$message" 2>/dev/null || \
+				printf '%s\n' "meduza: $message" >&2 || true
+		else
+			logger -t meduza "$message" 2>/dev/null || true
+			printf '%s\n' "meduza: $message" >&2 || true
+		fi
+	fi
+	exit "$status"
+}
+
+arm_apply_reporting_traps() {
+	trap 'apply_exit_report "$?"' 0
+	# A requested service stop is not a reconciliation failure.  EXIT still
+	# releases the generator lock, while the reporting flag suppresses noise.
+	trap 'MEDUZA_APPLY_REPORTING=0; exit 130' INT
+	trap 'MEDUZA_APPLY_REPORTING=0; exit 143' TERM
+}
+
+begin_apply_reporting() {
+	MEDUZA_APPLY_REPORTING=1
+	MEDUZA_APPLY_STAGE=package-seal
+	arm_apply_reporting_traps
+}
+
 jget() { "$MEDUZA_LIBEXEC/meduza-json.py" get "$2" "$1"; }
 children() { "$MEDUZA_LIBEXEC/meduza-json.py" children "$2" "$1"; }
 enabled() {
@@ -104,18 +156,40 @@ payload_allows_apply() {
 		log 'package installation is incomplete; refusing reconciliation'
 		return 1
 	}
-	build=$(cat "$BUILD_ID_FILE") || return 1
-	case "$build" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
-	line=$(cat "$INSTALL_COMPLETE") || return 1
+	build=$(cat "$BUILD_ID_FILE") || {
+		log 'could not read package build identity; refusing reconciliation'
+		return 1
+	}
+	case "$build" in
+		''|*[!A-Za-z0-9_.-]*)
+			log 'invalid package build identity; refusing reconciliation'
+			return 1
+			;;
+	esac
+	line=$(cat "$INSTALL_COMPLETE") || {
+		log 'could not read package installation completion seal; refusing reconciliation'
+		return 1
+	}
 	old_ifs=$IFS
 	IFS=$TAB
 	set -- $line
 	IFS=$old_ifs
-	[ "$#" -eq 3 ] && [ "$1" = v1 ] && [ "$2" = "$build" ] || return 1
+	[ "$#" -eq 3 ] && [ "$1" = v1 ] && [ "$2" = "$build" ] || {
+		log 'package installation completion seal does not match this build; refusing reconciliation'
+		return 1
+	}
 	version=$2
 	transaction=$3
-	case "$transaction" in ''|*[!0-9a-f]*) return 1;; esac
-	[ "${#transaction}" -eq 32 ] || return 1
+	case "$transaction" in
+		''|*[!0-9a-f]*)
+			log 'invalid package installation transaction seal; refusing reconciliation'
+			return 1
+			;;
+	esac
+	[ "${#transaction}" -eq 32 ] || {
+		log 'invalid package installation transaction seal; refusing reconciliation'
+		return 1
+	}
 	PAYLOAD_BUILD=$version
 	PAYLOAD_TX=$transaction
 }
@@ -127,7 +201,10 @@ upgrade_allows_apply() {
 		log 'unsafe package-upgrade state; refusing reconciliation'
 		return 1
 	}
-	value=$(cat "$UPGRADE_STATE") || return 1
+	value=$(cat "$UPGRADE_STATE") || {
+		log 'could not read package-upgrade state; refusing reconciliation'
+		return 1
+	}
 	old_ifs=$IFS
 	IFS=:
 	set -- $value
@@ -2293,42 +2370,71 @@ publish_runtime_state() {
 }
 
 reconcile() {
+	apply_stage runtime-input
 	[ -f "$NODE_JSON" ] && [ -f "$GLOBAL_JSON" ] && [ -f "$ALL_JSON" ] || { log 'runtime JSON configuration is incomplete'; return 1; }
+	apply_stage temporary-state-cleanup
 	cleanup_orphan_temps
+	apply_stage migration-snapshot
 	freeze_uci_migration_inventory
+	apply_stage ownership-inventory
 	collect_inventory
+	apply_stage desired-state
 	build_desired
+	apply_stage legacy-inventory-adoption
 	adopt_legacy_tinc_inventory
+	apply_stage ownership-journal
 	write_journal
+	apply_stage legacy-authorization
 	authorize_legacy_inventory
+	apply_stage uci-validation
 	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" validate
+	apply_stage legacy-runtime-ownership
 	prepare_legacy_runtime_ownership
+	apply_stage device-preflight
 	preflight_existing_devices
+	apply_stage openvpn-preflight
 	preflight_openvpn_namespaces
+	apply_stage configuration-render
 	render_configs
+	apply_stage reused-device-cleanup
 	stop_reused_stale_devices
+	apply_stage device-validation
 	validate_existing_devices
 	# Stop/unregister stale procd instances while their exact owner-marked UCI
 	# identity still exists.  In particular, OpenVPN 24.10 would otherwise
 	# respawn an old instance after its section had already been deleted.
+	apply_stage stale-runtime-stop
 	stop_stale_resources
+	apply_stage uci-apply
 	"$MEDUZA_LIBEXEC/meduza-openwrt-sync" "$DESIRED" apply
+	apply_stage stale-configuration-cleanup
 	cleanup_stale_configs
+	apply_stage vpn-runtime-activation
 	apply_vpn_runtime
+	apply_stage frr-activation
 	apply_frr
+	apply_stage manifest-publish
 	atomic_write "$MEDUZA_MANAGED" 600 <"$DESIRED"
+	apply_stage pending-journal-removal
 	rm -f "$MEDUZA_PENDING" || return 1
 	fsync "$MEDUZA_DATA/managed" || return 1
+	apply_stage uci-finalize
 	"$UCI_HELPER" finalize || return 1
+	apply_stage migration-journal-removal
 	rm -f "$UCI_MIGRATION" "$UCI_MIGRATION_ZONE" \
 		"$UCI_MIGRATION_ZONE_SEAL" "$UCI_MIGRATION_ZONE_DISABLED" \
 		"$UPGRADE_INTENT" || return 1
+	apply_stage legacy-authorization-removal
 	clear_legacy_authorization
 	fsync "$MEDUZA_DATA/managed" || return 1
+	apply_stage runtime-marker-cleanup
 	rm -f "$MEDUZA_STATE/sync.changed.interfaces"
 	rm -f "$MEDUZA_STATE"/changed.*
+	apply_stage runtime-state-publish
 	publish_runtime_state
+	apply_stage success-timestamp
 	date +%s >"$MEDUZA_STATE/last-success"
+	apply_stage complete
 	log 'configuration reconciled'
 }
 
@@ -2516,10 +2622,19 @@ purge() {
 main() {
 	case "${1:-}" in
 		--apply)
+			begin_apply_reporting
+			apply_stage package-seal
 			payload_allows_apply
+			apply_stage upgrade-gate
 			upgrade_allows_apply
+			apply_stage settings-load
 			load_settings
+			apply_stage generator-lock
 			acquire_generator_lock
+			# The lock helper installs its own EXIT/INT/TERM handlers.  Replace them
+			# with the reporting wrapper, which also releases the exact lock token.
+			arm_apply_reporting_traps
+			apply_stage runtime-input
 			reconcile
 			;;
 		--runtime-stop)

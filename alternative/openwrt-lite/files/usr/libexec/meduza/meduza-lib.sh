@@ -9,7 +9,17 @@ MEDUZA_PENDING=${MEDUZA_PENDING:-$MEDUZA_DATA/managed/interfaces.pending}
 MEDUZA_LEGACY_AUTH=${MEDUZA_LEGACY_AUTH:-$MEDUZA_DATA/managed/legacy.interfaces}
 MEDUZA_OWNER=meduza-openwrt-lite
 
-log() { logger -t meduza "$*"; echo "meduza: $*" >&2; }
+log() {
+	# procd also copies an agent child's stderr into syslog.  Prefer logger when
+	# running below the agent and use stderr only as its fallback, avoiding two
+	# records for every event while retaining a diagnostic if syslog is down.
+	if [ "${MEDUZA_LOG_ONCE:-0}" = 1 ]; then
+		logger -t meduza "$*" 2>/dev/null || echo "meduza: $*" >&2
+	else
+		logger -t meduza "$*"
+		echo "meduza: $*" >&2
+	fi
+}
 
 durable_mkdir() {
 	local path=$1 mode=${2:-700} parent
