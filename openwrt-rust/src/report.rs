@@ -7,7 +7,7 @@ use std::fs;
 use crate::atomic;
 use crate::command::Runner;
 use crate::runtime::Runtime;
-use crate::state::{InterfaceKind, ManifestEntry, Paths, read_manifest};
+use crate::state::{InterfaceKind, ManifestEntry, Paths, read_manifest, regular_file_exists};
 
 const MAX_REPORTED_FILE_BYTES: usize = 1024 * 1024;
 const MAX_DAEMON_STATUS_BYTES: usize = 64 * 1024;
@@ -63,8 +63,18 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
     let runtime = Runtime::new(paths.clone(), runner.clone());
     let mut interfaces = BTreeMap::new();
     let mut interface_details = Vec::new();
-    for entry in read_manifest(&paths.manifest)? {
-        let state = interface_state(&runtime, runner, &entry)?;
+    for entry in status_inventory(paths)? {
+        let state = match interface_state(&runtime, runner, &entry) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    kind = entry.kind.as_str(),
+                    instance = %entry.instance,
+                    "could not inspect managed interface status: {error:#}"
+                );
+                "unavailable".into()
+            }
+        };
         let name = if entry.kind == InterfaceKind::Tinc {
             "tinc/default".to_owned()
         } else {
@@ -102,6 +112,18 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
         interface_details,
         frr: frr.into(),
     })
+}
+
+/// A pending manifest is the best status view during reconciliation. It is
+/// durably published before runtime mutation and remains available when an
+/// apply fails, while the stable manifest is published only at the commit
+/// point.
+fn status_inventory(paths: &Paths) -> Result<Vec<ManifestEntry>> {
+    if regular_file_exists(&paths.pending_manifest)? {
+        read_manifest(&paths.pending_manifest)
+    } else {
+        read_manifest(&paths.manifest)
+    }
 }
 
 pub fn persist_etcd_status(paths: &Paths, value: &EtcdStatus) -> Result<()> {
@@ -270,6 +292,17 @@ pub fn validate_status_value(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::write_manifest;
+
+    fn manifest_entry(instance: &str) -> ManifestEntry {
+        ManifestEntry {
+            kind: InterfaceKind::Openvpn,
+            instance: instance.into(),
+            logical: format!("ovpn_{instance}"),
+            device: format!("ovpn-{instance}"),
+            config: format!("/var/run/meduza/generated/openvpn/{instance}/openvpn.conf").into(),
+        }
+    }
 
     #[test]
     fn daemon_status_round_trips_without_using_persistent_storage() {
@@ -302,6 +335,21 @@ mod tests {
         .unwrap();
 
         assert!(read_etcd_status(&paths).is_err());
+    }
+
+    #[test]
+    fn pending_manifest_is_visible_before_apply_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        paths.prepare().unwrap();
+        let stable = manifest_entry("stable");
+        let pending = manifest_entry("pending");
+        write_manifest(&paths.manifest, std::slice::from_ref(&stable)).unwrap();
+        write_manifest(&paths.pending_manifest, std::slice::from_ref(&pending)).unwrap();
+
+        assert_eq!(status_inventory(&paths).unwrap(), vec![pending]);
+        atomic::durable_remove(&paths.pending_manifest).unwrap();
+        assert_eq!(status_inventory(&paths).unwrap(), vec![stable]);
     }
 
     #[test]

@@ -46,7 +46,13 @@ impl<R: Runner> Reconciler<R> {
     /// a clean installation and is therefore safe for read-only/status and
     /// purge entry points.
     pub fn migrate_layout(&self) -> Result<bool> {
-        let _lock = ApplyLock::acquire(&self.paths)?;
+        // Status must remain observable while the daemon owns the mutation
+        // lock. If another transaction is active, that transaction has
+        // already prepared (or is preparing) the layout; atomically published
+        // status files can be read without blocking it.
+        let Some(_lock) = ApplyLock::try_acquire(&self.paths)? else {
+            return Ok(false);
+        };
         // Status is observational: it may relocate the small persistent state
         // journal, but must never retire a generated tree while a previous
         // runtime could still be using it. Daemon/apply preparation performs
@@ -1151,8 +1157,12 @@ struct ApplyLock {
 }
 
 impl ApplyLock {
+    fn acquire(paths: &Paths) -> Result<Self> {
+        Self::try_acquire(paths)?.context("another Meduza transaction is already active")
+    }
+
     #[cfg(unix)]
-    fn acquire(_paths: &Paths) -> Result<Self> {
+    fn try_acquire(_paths: &Paths) -> Result<Option<Self>> {
         use std::mem::{offset_of, zeroed};
         use std::os::fd::FromRawFd;
 
@@ -1185,18 +1195,18 @@ impl ApplyLock {
             let error = std::io::Error::last_os_error();
             unsafe { libc::close(raw) };
             if error.raw_os_error() == Some(libc::EADDRINUSE) {
-                bail!("another Meduza transaction is already active");
+                return Ok(None);
             }
             return Err(error).context("could not bind apply lock");
         }
         // SAFETY: `raw` is a unique live descriptor returned by socket(), and
         // ownership is transferred exactly once to OwnedFd.
         let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        Ok(Self { _socket: socket })
+        Ok(Some(Self { _socket: socket }))
     }
 
     #[cfg(not(unix))]
-    fn acquire(paths: &Paths) -> Result<Self> {
+    fn try_acquire(paths: &Paths) -> Result<Option<Self>> {
         use std::fs::OpenOptions;
 
         let parent = paths.lock.parent().context("lock has no parent")?;
@@ -1208,13 +1218,25 @@ impl ApplyLock {
             .create(true)
             .truncate(false)
             .open(&paths.lock)?;
-        Ok(Self { _file: file })
+        Ok(Some(Self { _file: file }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_lock_can_be_probed_without_failing_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        let active = ApplyLock::acquire(&paths).unwrap();
+
+        assert!(ApplyLock::try_acquire(&paths).unwrap().is_none());
+        drop(active);
+        assert!(ApplyLock::try_acquire(&paths).unwrap().is_some());
+    }
 
     #[test]
     fn inventory_union_is_sorted_and_deduplicated() {

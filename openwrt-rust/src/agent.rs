@@ -134,6 +134,38 @@ impl<R: Runner> Agent<R> {
             *etcd = Some(Etcd::connect(&self.settings).await?);
         }
         let client = etcd.as_mut().expect("connected above");
+        let operation = self.reconcile_generation(client).await;
+
+        // Reporting describes reachability and the currently observed local
+        // runtime, not whether the newest desired generation was accepted.
+        // Keep it independent from snapshot validation/apply so a broken
+        // generation still exposes the node as online and its VPNs as
+        // down/connecting/unavailable in etcd.
+        self.flush_last_ack(client).await;
+        let report = if Instant::now() >= *next_report {
+            match self.publish_report(client).await {
+                Ok(()) => {
+                    *next_report = Instant::now() + Duration::from_secs(15);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+
+        match (operation, report) {
+            (Err(operation), Err(report)) => {
+                tracing::warn!("status report also failed: {report:#}");
+                Err(operation)
+            }
+            (Err(operation), Ok(())) => Err(operation),
+            (Ok(()), Err(report)) => Err(report),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    async fn reconcile_generation(&mut self, client: &mut Etcd) -> Result<()> {
         let (commit, revision) = client.get_with_revision("/commit").await?;
         crate::state::validate_commit(&commit)?;
         self.persist_etcd_state_with_commit("connected", Some(commit.clone()));
@@ -152,12 +184,6 @@ impl<R: Runner> Agent<R> {
             }
             self.commit = Some(commit);
             self.pending_last_ack = Some(snapshot.applied_at);
-        }
-
-        self.flush_last_ack(client).await;
-        if Instant::now() >= *next_report {
-            self.publish_report(client).await?;
-            *next_report = Instant::now() + Duration::from_secs(15);
         }
         Ok(())
     }
@@ -253,7 +279,9 @@ impl<R: Runner> Agent<R> {
     }
 
     async fn publish_report(&self, client: &mut Etcd) -> Result<()> {
-        let status = report::collect(&self.paths, &self.runner)?;
+        // Reachability must not depend on a readable local manifest or on
+        // individual VPN probes. Publish the lease first, then enrich the
+        // report with local runtime state.
         client
             .put_with_lease(
                 &format!("/updated/{}/online", self.settings.node_id),
@@ -261,6 +289,7 @@ impl<R: Runner> Agent<R> {
                 60,
             )
             .await?;
+        let status = report::collect(&self.paths, &self.runner)?;
         let mut current = Vec::new();
         for (path, state) in &status.interfaces {
             let Some((kind, name)) = path.split_once('/') else {
