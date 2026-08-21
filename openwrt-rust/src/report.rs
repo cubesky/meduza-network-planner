@@ -183,7 +183,10 @@ fn collect_frr_command<R: Runner>(
     let output = match runner.output("vtysh", ["-c", command]) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            tracing::warn!(command, status = %output.status, "FRR status command failed");
+            // A running zebra/watchfrr does not imply bgpd and ospfd are both
+            // enabled. vtysh returns status 1 for an unavailable protocol;
+            // that is an empty peer set, not a controller fault.
+            tracing::debug!(command, status = %output.status, "FRR protocol status is unavailable");
             return;
         }
         Err(error) => {
