@@ -40,6 +40,7 @@ impl<R: Runner> Agent<R> {
             return Ok(());
         }
         Reconciler::new(self.paths.clone(), self.runner.clone()).prepare()?;
+        self.persist_etcd_state("waiting");
 
         let mut delay = 1u64;
         let mut next_report = Instant::now();
@@ -58,6 +59,7 @@ impl<R: Runner> Agent<R> {
             )
             .await
             else {
+                self.persist_etcd_state("stopped");
                 tracing::info!("shutdown requested");
                 return Ok(());
             };
@@ -67,6 +69,7 @@ impl<R: Runner> Agent<R> {
                     5
                 }
                 Err(error) => {
+                    self.persist_etcd_state("error");
                     tracing::error!(retry_seconds = delay, "operation failed: {error:#}");
                     etcd = None;
                     let wait = delay;
@@ -78,6 +81,7 @@ impl<R: Runner> Agent<R> {
                 .await
                 .is_none()
             {
+                self.persist_etcd_state("stopped");
                 tracing::info!("shutdown requested");
                 return Ok(());
             }
@@ -160,12 +164,20 @@ impl<R: Runner> Agent<R> {
         if self.restore_lkg()? {
             return Ok(());
         }
+        // Once a generation is locally committed, supervise its native
+        // runtimes before touching etcd. This keeps VPN and FRR recovery
+        // working while the server or management path is unavailable.
+        if self.commit.is_some() {
+            Reconciler::new(self.paths.clone(), self.runner.clone()).ensure_runtime()?;
+        }
         if etcd.is_none() {
+            self.persist_etcd_state("connecting");
             *etcd = Some(Etcd::connect(&self.settings).await?);
         }
         let client = etcd.as_mut().expect("connected above");
         let (commit, revision) = client.get_with_revision("/commit").await?;
         crate::state::validate_commit(&commit)?;
+        self.persist_etcd_state_with_commit("connected", Some(commit.clone()));
         if self.commit.as_deref() != Some(commit.as_str()) {
             let snapshot = self
                 .fetch_snapshot(client, commit.clone(), revision)
@@ -189,6 +201,17 @@ impl<R: Runner> Agent<R> {
             *next_report = Instant::now() + Duration::from_secs(15);
         }
         Ok(())
+    }
+
+    fn persist_etcd_state(&self, state: &str) {
+        self.persist_etcd_state_with_commit(state, self.commit.clone());
+    }
+
+    fn persist_etcd_state_with_commit(&self, state: &str, commit: Option<String>) {
+        let value = report::EtcdStatus::new(state, &self.settings.node_id, commit);
+        if let Err(error) = report::persist_etcd_status(&self.paths, &value) {
+            tracing::warn!("could not persist local etcd status: {error:#}");
+        }
     }
 
     async fn fetch_snapshot(
@@ -388,7 +411,6 @@ mod tests {
             key: None,
             user: None,
             password: None,
-            firewall_zone: None,
         }
     }
 

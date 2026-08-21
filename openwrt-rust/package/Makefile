@@ -26,8 +26,8 @@ define Package/meduza-openwrt-rust
 endef
 
 define Package/meduza-openwrt-rust/description
- A statically linked Rust controller which reconciles Meduza's etcd state with
- native OpenWrt tinc, OpenVPN, WireGuard, FRR, netifd and firewall facilities.
+ A statically linked Rust controller which directly owns Meduza's tinc,
+ OpenVPN, WireGuard interfaces and FRR configuration without VPN UCI sections.
 endef
 
 define Package/meduza-openwrt-rust/conffiles

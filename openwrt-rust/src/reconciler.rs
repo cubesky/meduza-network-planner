@@ -16,7 +16,6 @@ use crate::runtime::Runtime;
 use crate::state::{
     ManifestEntry, Paths, Snapshot, read_manifest, regular_file_exists, write_manifest,
 };
-use crate::uci::{Uci, finalize_ownership};
 
 const MAX_FRR_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SMALL_MARKER_BYTES: usize = 4096;
@@ -85,12 +84,9 @@ impl<R: Runner> Reconciler<R> {
         }
         inventory = merge_inventory(&inventory, &[]);
         let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
-        let uci = Uci::new(self.paths.clone(), self.runner.clone());
-
-        // All collision checks precede persistent UCI/file/runtime mutation.
+        // All collision checks precede persistent file/runtime mutation.
         runtime.validate_dependencies(&desired_entries)?;
         runtime.preflight(&desired_entries, &inventory)?;
-        uci.validate(&desired_entries, settings.firewall_zone.as_deref())?;
 
         let static_compat = self
             .runner
@@ -155,37 +151,8 @@ impl<R: Runner> Reconciler<R> {
             }
         }
 
-        // When upgrading from the 24.10 OpenVPN init integration to the
-        // 25.12 netifd proto, unregister the strongly-owned procd instance
-        // while its auxiliary UCI section still exists. Deleting that section
-        // first would lose the authority needed to stop a respawn-backoff
-        // instance safely.
-        if self.paths.openvpn_proto.is_file() {
-            for entry in desired_entries
-                .iter()
-                .filter(|entry| entry.kind == crate::state::InterfaceKind::Openvpn)
-            {
-                if crate::uci::live_section_owned(
-                    &self.paths,
-                    self.runner.clone(),
-                    "openvpn",
-                    &entry.logical,
-                )? {
-                    runtime.stop(entry)?;
-                    changed.insert(entry.logical.clone());
-                }
-            }
-        }
-
-        let sync = uci.sync(
-            &desired_entries,
-            &inventory,
-            settings.firewall_zone.as_deref(),
-        )?;
-        changed.extend(sync.changed_interfaces);
-
-        // UCI reconciliation advances section/edge ownership generations.
-        // Never save the pre-UCI in-memory copy over those durable records.
+        // Runtime resources are owned directly by the daemon. UCI is used
+        // only for the Meduza settings section and is never mutated here.
         ownership = OwnershipDb::load(&self.paths)?;
         let desired_generated: BTreeSet<_> = desired_entries
             .iter()
@@ -201,7 +168,6 @@ impl<R: Runner> Reconciler<R> {
         self.apply_frr(&frr_file, &flat)?;
 
         write_manifest(&self.paths.manifest, &desired_entries)?;
-        finalize_ownership(&self.paths, self.runner.clone(), false)?;
         if self.paths.pending_manifest.exists() {
             atomic::durable_remove(&self.paths.pending_manifest)?;
         } else {
@@ -233,6 +199,25 @@ impl<R: Runner> Reconciler<R> {
         self.apply(settings, &snapshot)
     }
 
+    /// Reassert already-committed runtime state without fetching etcd or
+    /// rewriting generated configuration. This is the daemon-side supervisor
+    /// for directly managed VPN processes and links, replacing netifd/procd
+    /// supervision of the individual tunnel instances.
+    pub fn ensure_runtime(&self) -> Result<()> {
+        let _lock = ApplyLock::acquire(&self.paths)?;
+        self.paths.migrate_legacy_rust_state()?;
+        let pending = read_manifest(&self.paths.pending_manifest)?;
+        if !pending.is_empty() {
+            bail!("an interrupted apply must be recovered before runtime supervision");
+        }
+        let entries = read_manifest(&self.paths.manifest)?;
+        let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
+        runtime.validate_dependencies(&entries)?;
+        runtime.preflight(&entries, &[])?;
+        runtime.activate(&entries, &BTreeSet::new())?;
+        self.ensure_frr_running()
+    }
+
     pub fn runtime_stop(&self) -> Result<()> {
         let _lock = ApplyLock::acquire(&self.paths)?;
         self.paths.migrate_legacy_rust_state()?;
@@ -246,11 +231,6 @@ impl<R: Runner> Reconciler<R> {
         );
         let entries = inventory_with_generated(&self.paths, entries)?;
         let mut errors = Vec::new();
-        if let Err(error) =
-            Uci::new(self.paths.clone(), self.runner.clone()).disable_legacy_openvpn(&entries)
-        {
-            errors.push(format!("OpenVPN disable failed: {error:#}"));
-        }
         if let Err(error) = Runtime::new(self.paths.clone(), self.runner.clone()).stop_all(&entries)
         {
             errors.push(format!("VPN runtime stop failed: {error:#}"));
@@ -284,12 +264,6 @@ impl<R: Runner> Reconciler<R> {
             &read_manifest(&self.paths.pending_manifest)?,
         );
         let entries = inventory_with_generated(&self.paths, entries)?;
-        let initial_ownership = OwnershipDb::load(&self.paths)?;
-        let reload_intent = self.paths.managed.join("uci-reload.pending");
-        let uci_state_exists = !entries.is_empty()
-            || !initial_ownership.sections.is_empty()
-            || !initial_ownership.edges.is_empty()
-            || object_exists(&reload_intent)?;
         let mut errors = Vec::new();
         let runtime_stopped =
             match Runtime::new(self.paths.clone(), self.runner.clone()).stop_all(&entries) {
@@ -299,18 +273,7 @@ impl<R: Runner> Reconciler<R> {
                     false
                 }
             };
-        let uci_purged = if runtime_stopped && uci_state_exists {
-            match Uci::new(self.paths.clone(), self.runner.clone()).purge(&entries) {
-                Ok(_) => true,
-                Err(error) => {
-                    errors.push(format!("UCI purge failed: {error:#}"));
-                    false
-                }
-            }
-        } else {
-            runtime_stopped
-        };
-        if uci_purged {
+        if runtime_stopped {
             let mut ownership = OwnershipDb::load(&self.paths)?;
             for entry in &entries {
                 if let Err(error) = ownership.remove_generated(&self.paths, entry) {
@@ -330,17 +293,8 @@ impl<R: Runner> Reconciler<R> {
         if !errors.is_empty() {
             bail!("{}", errors.join("; "));
         }
-        let ownership = OwnershipDb::load(&self.paths)?;
-        if !ownership.sections.is_empty() || !ownership.edges.is_empty() {
-            finalize_ownership(&self.paths, self.runner.clone(), true)?;
-        }
         let db = OwnershipDb::load(&self.paths)?;
-        if !db.generated.is_empty()
-            || !db.wireguard_stages.is_empty()
-            || !db.sections.is_empty()
-            || !db.edges.is_empty()
-            || db.frr.is_some()
-        {
+        if !db.generated.is_empty() || !db.wireguard_stages.is_empty() || db.frr.is_some() {
             bail!("purge left active ownership records; state retained for retry");
         }
 
@@ -355,23 +309,26 @@ impl<R: Runner> Reconciler<R> {
             self.paths.manifest.clone(),
             self.paths.pending_manifest.clone(),
             self.paths.runtime.join("last-success"),
+            self.paths.daemon_status.clone(),
             self.paths.managed.join("frr.conf.backup"),
             self.paths.managed.join("frr.pending.conf"),
             self.paths.managed.join("frr.reload.pending"),
-            reload_intent,
+            self.paths.managed.join("uci-reload.pending"),
             self.paths.ip_forward_marker.clone(),
         ];
         for path in &cleanup_files {
             remove_known_file(path)?;
         }
         for entry in &entries {
-            if entry.kind == crate::state::InterfaceKind::Tinc {
-                remove_known_file(
-                    &self
-                        .paths
-                        .runtime
-                        .join(format!("tinc.{}.pid", entry.instance)),
-                )?;
+            let pidfile = match entry.kind {
+                crate::state::InterfaceKind::Tinc => Some(format!("tinc.{}.pid", entry.instance)),
+                crate::state::InterfaceKind::Openvpn => {
+                    Some(format!("openvpn.{}.pid", entry.instance))
+                }
+                crate::state::InterfaceKind::Wireguard => None,
+            };
+            if let Some(pidfile) = pidfile {
+                remove_known_file(&self.paths.runtime.join(pidfile))?;
             }
         }
         // The ownership database is the final retry authority and is therefore
@@ -702,6 +659,33 @@ impl<R: Runner> Reconciler<R> {
                 .or_else(|_| self.runner.status("/etc/init.d/frr", ["restart"]))?;
         }
         Ok(())
+    }
+
+    fn ensure_frr_running(&self) -> Result<()> {
+        let ownership = OwnershipDb::load(&self.paths)?;
+        let Some(record) = ownership.frr else {
+            return Ok(());
+        };
+        if record.phase != Phase::Owned {
+            bail!("FRR ownership transition must be recovered before supervision");
+        }
+        let current = read_frr_file(&self.paths.frr_config)?
+            .context("owned FRR configuration disappeared")?;
+        if !frr_has_owner(&current.bytes)
+            || record.active_sha256.as_deref() != Some(current.sha256.as_str())
+        {
+            bail!("FRR configuration ownership changed");
+        }
+        let running = self
+            .runner
+            .output("/etc/init.d/frr", ["running"])
+            .is_ok_and(|output| output.status.success());
+        if running {
+            Ok(())
+        } else {
+            tracing::warn!("managed FRR service is not running; attempting recovery");
+            self.reload_frr()
+        }
     }
 }
 
@@ -1048,7 +1032,7 @@ pub fn doctor<R: Runner>(paths: &Paths, runner: &R) -> Result<()> {
     let _lock = ApplyLock::acquire(paths)?;
     paths.prepare()?;
     let mut missing = Vec::new();
-    for command in ["uci", "ubus", "ip", "ifup", "ifdown"] {
+    for command in ["uci", "ip"] {
         if !command_exists(command) {
             missing.push(command);
         }

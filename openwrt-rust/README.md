@@ -11,6 +11,13 @@ These are two independent ELF files. A single ELF cannot execute on both x86-64
 and AArch64. "Single-file" means that an individual router needs only the one
 application executable matching its CPU; it does not mean one universal binary.
 
+The raw AArch64 ELF uses a generic static instruction baseline. OpenWrt package
+metadata is necessarily target-specific: release APK/IPK files for Cudy's
+MediaTek Filogic devices are built with the `mediatek/filogic` SDK and therefore
+carry the `aarch64_cortex-a53` architecture tag. An `aarch64_generic` APK from
+the `armsr/armv8` SDK is not installable on those systems even though the ELF
+inside is otherwise executable.
+
 The OpenWrt APK/IPK may additionally contain a small procd init script, the UCI
 conffile, and a native LuCI JavaScript settings page. The page reuses
 `luci-base` and does not bundle a separate web framework. Those integration
@@ -32,15 +39,15 @@ routed OpenWrt side gateway:
 - read `/commit`, `/global/` and `/nodes/<NODE_ID>/`;
 - create and operate Meduza-owned tinc, OpenVPN and WireGuard instances;
 - generate and activate FRR OSPF/BGP configuration;
-- manage only its own OpenWrt network interfaces and firewall-zone membership;
+- directly create, configure and remove only its own Linux VPN interfaces;
 - publish node, service and tunnel status under `/updated/<NODE_ID>/`;
 - retain a durable last-known-good state and recover interrupted work after a
   reboot or power loss.
 
-It must not take ownership of an administrator's UCI section, Linux interface,
-VPN process, firewall member, configuration file, or OpenClash's `utun` device.
-Unchanged desired state must not cause an unconditional network or firewall
-reload.
+Only `/etc/config/meduza` is read through UCI. Reconciliation never creates or
+changes `network`, `openvpn` or `firewall` UCI sections and never calls
+`ifup`/`ifdown`. It must not take ownership of an administrator's Linux
+interface, VPN process, configuration file, or OpenClash's `utun` device.
 
 ## Runtime layout
 
@@ -57,7 +64,7 @@ The target layout is:
 | `/etc/meduza-state/cache.json` | Last-known-good desired-state cache | persistent |
 | `/etc/meduza-state/cache.pending.json` | Interrupted cache transaction | persistent journal |
 | `/etc/meduza-state/managed/` | Ownership records and replayable transaction journals | persistent |
-| `/var/run/meduza/` | PIDs and other reconstructable runtime data | volatile |
+| `/var/run/meduza/` | PIDs, live status JSON and other reconstructable runtime data | volatile |
 | Linux abstract socket `meduza-openwrt-transaction-v1` | Cross-command reconciliation lock | kernel-only; disappears on exit/crash |
 
 `/etc/meduza` is deliberately limited to operator configuration/PKI and
@@ -101,8 +108,8 @@ These commands are lifecycle boundaries, not permission to trust an inline
 corresponding durable external ownership generation.
 
 Offline roots are intentionally not exposed by the production CLI: applying
-an offline journal while commands still target the live kernel/UCI namespace
-would be unsafe. Tests use an internal path prefix without executing host
+an offline journal while commands still target the live process and network
+namespaces would be unsafe. Tests use an internal path prefix without executing host
 mutations.
 
 ## UCI configuration
@@ -120,14 +127,12 @@ administrator does not have to re-enter connection settings:
 | `ETCD_KEY` | Optional client private-key path |
 | `ETCD_USER` | Optional etcd username |
 | `ETCD_PASS` | Optional etcd password |
-| `VPN_FIREWALL_ZONE` | Existing OpenWrt zone whose membership may be updated |
 
 When the package is installed with LuCI, open **Services → Meduza** to edit
 these values. The page masks `ETCD_PASS`, but UCI still stores the value in the
-root-readable `/etc/config/meduza` file. Firewall zones are offered as choices
-when the `firewall` UCI package is available. A missing firewall package does
-not prevent the page from loading; leave `VPN_FIREWALL_ZONE` blank in that
-case. Saving the page does not create or take ownership of a firewall zone.
+root-readable `/etc/config/meduza` file. The first tab shows etcd,
+OpenVPN/WireGuard and filtered Meduza logs; the second shows Tinc and FRR; the
+third contains these settings and certificate paths.
 
 Example configuration:
 
@@ -138,7 +143,6 @@ uci set meduza.main.ETCD_ENDPOINTS='https://etcd.example.net:2379'
 uci set meduza.main.ETCD_CA='/etc/meduza/pki/ca.crt'
 uci set meduza.main.ETCD_CERT='/etc/meduza/pki/client.crt'
 uci set meduza.main.ETCD_KEY='/etc/meduza/pki/client.key'
-uci set meduza.main.VPN_FIREWALL_ZONE='lan'
 uci commit meduza
 ```
 
@@ -150,18 +154,21 @@ may adopt the old implementation's ownership records or generated files. See
 ## Native OpenWrt dependencies
 
 The Rust executable replaces the Python agent and shell controller, not the VPN
-daemons, routing daemon, netifd, or the kernel. Install the native packages for
+daemons, routing daemon, or the kernel. Install the native packages for
 the enabled features from the router firmware's own feed. Package names vary by
 vendor, but commonly include:
 
-- core integration: `uci`, `ubus`, `rpcd`, `luci-base`, procd, netifd and a
-  usable `ip`;
+- core integration: `uci`, `ubus`, `rpcd`, `luci-base`, procd and a usable
+  `ip` (`ubus`/`rpcd`/`luci-base` serve the web UI, not VPN reconciliation);
 - tinc: `tinc` providing `tincd`;
 - OpenVPN: `openvpn-openssl` or a compatible vendor OpenVPN build;
 - WireGuard: `wireguard-tools` providing `wg`;
-- routing: `frr` providing `vtysh` and the required OSPF/BGP daemons;
-- firewall service appropriate for the firmware (`firewall4` on current
-  OpenWrt, or the vendor equivalent).
+- routing: `frr` providing `vtysh` and the required OSPF/BGP daemons.
+
+Firewall policy is deliberately outside daemon ownership. If the router's
+policy blocks traffic on dynamically created interfaces, add rules using the
+stable device names from the status page; Meduza does not rewrite a firewall
+zone behind the administrator or OpenClash.
 
 WireGuard kernel support must come from the running firmware. If a separate
 `kmod-wireguard` package is required, it must match that firmware's exact kernel
@@ -236,12 +243,12 @@ currently green:
 | Cross-build | musl target | musl target | successful release link from `Cargo.lock` |
 | Single executable | native inspection | native inspection | correct ELF machine, no interpreter and no shared-library dependency |
 | CLI smoke | native | native runner or QEMU | help/`--version` plus failure-safe configuration validation |
-| Reconcile integration | mock OpenWrt | shared logic plus target smoke | tinc/OpenVPN/WG, UCI, ubus, ip and FRR command/state assertions |
-| Idempotency/concurrency | required | shared logic | unchanged apply performs no reload; UCI conflict causes no partial write |
-| Ownership safety | required | shared logic | preserve `utun`, foreign devices, sections, files and firewall members |
-| Power-loss recovery | fault injection | shared logic | kill before/after each journal, fsync, rename, UCI and FRR transition |
+| Reconcile integration | mock OpenWrt | shared logic plus target smoke | direct tinc/OpenVPN/WG, ip and FRR command/state assertions |
+| Idempotency/concurrency | required | shared logic | unchanged apply does not restart or reconfigure healthy runtimes |
+| Ownership safety | required | shared logic | preserve `utun`, foreign devices, UCI sections, files and firewall members |
+| Power-loss recovery | fault injection | shared logic | kill before/after each journal, fsync, rename, runtime and FRR transition |
 | etcd behavior | integration etcd | target smoke | TLS, endpoint failover, `/commit`, lease and ack/apply separation |
-| Real OpenWrt | QEMU/device | QEMU/device | netifd/firewall/VPN/FRR activation, reboot, purge and rollback |
+| Real OpenWrt | QEMU/device | QEMU/device | direct VPN/FRR activation, LuCI status/logs, reboot, purge and rollback |
 | Release | artifact check | artifact check | two correctly named executables, hashes and build metadata |
 
 At every injected crash point, restart must converge to either the complete old

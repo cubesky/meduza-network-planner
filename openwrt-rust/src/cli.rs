@@ -19,7 +19,7 @@ pub enum Command {
     Recover,
     /// Stop only Meduza-owned VPN runtimes and restore FRR.
     RuntimeStop,
-    /// Remove all strongly-owned runtime, UCI and persistent resources.
+    /// Remove all strongly-owned runtime, generated and persistent resources.
     Purge,
     /// Print locally observed tunnel state.
     Status {

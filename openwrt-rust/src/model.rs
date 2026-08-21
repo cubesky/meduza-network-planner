@@ -264,7 +264,7 @@ pub struct DesiredInterface {
 impl DesiredInterface {
     pub fn validate(&self, generated_root: &Path) -> Result<()> {
         validate_instance_name(&self.instance)?;
-        validate_uci_name(&self.logical)?;
+        validate_logical_name(&self.logical)?;
         validate_device_name(&self.device)?;
         let expected_logical = logical_name(self.kind, &self.instance)?;
         if self.logical != expected_logical {
@@ -318,7 +318,7 @@ impl DesiredState {
                 );
             }
             if !logicals.insert(item.logical.clone()) {
-                bail!("duplicate desired UCI interface: {}", item.logical);
+                bail!("duplicate desired interface identity: {}", item.logical);
             }
             if !devices.insert(item.device.clone()) {
                 bail!("duplicate desired Linux device: {}", item.device);
@@ -431,7 +431,7 @@ pub fn logical_name(kind: VpnKind, instance: &str) -> Result<String> {
     validate_instance_name(instance)?;
     let normalized = instance.replace('-', "_");
     let logical = format!("{}_{}", kind.logical_prefix(), normalized);
-    validate_uci_name(&logical)?;
+    validate_logical_name(&logical)?;
     Ok(logical)
 }
 
@@ -501,13 +501,13 @@ pub fn validate_instance(value: &str) -> Result<()> {
     validate_instance_name(value)
 }
 
-pub fn validate_uci_name(value: &str) -> Result<()> {
+pub fn validate_logical_name(value: &str) -> Result<()> {
     if value.is_empty()
         || !value
             .bytes()
             .all(|byte| is_ascii_alnum(byte) || byte == b'_')
     {
-        bail!("unsafe UCI identifier: {value:?}");
+        bail!("unsafe logical interface identifier: {value:?}");
     }
     Ok(())
 }
@@ -629,7 +629,7 @@ mod tests {
             "true".into(),
         );
         let error = build_desired(&value).unwrap_err().to_string();
-        assert!(error.contains("duplicate desired UCI interface"));
+        assert!(error.contains("duplicate desired interface identity"));
     }
 
     #[test]

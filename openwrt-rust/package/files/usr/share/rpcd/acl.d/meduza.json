@@ -2,7 +2,14 @@
 	"luci-app-meduza": {
 		"description": "Configure the Meduza OpenWrt controller",
 		"read": {
-			"uci": [ "meduza", "firewall" ]
+			"uci": [ "meduza" ],
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/sbin/meduza-openwrt status --json": [ "exec" ]
+			},
+			"ubus": {
+				"log": [ "read" ]
+			}
 		},
 		"write": {
 			"uci": [ "meduza" ]

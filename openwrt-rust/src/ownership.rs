@@ -5,7 +5,6 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::OWNER;
 use crate::atomic;
@@ -20,10 +19,6 @@ pub struct OwnershipDb {
     pub version: u32,
     #[serde(default)]
     pub generated: BTreeMap<String, GeneratedRecord>,
-    #[serde(default)]
-    pub sections: BTreeMap<String, SectionRecord>,
-    #[serde(default)]
-    pub edges: BTreeMap<String, EdgeRecord>,
     #[serde(default)]
     pub wireguard_stages: BTreeMap<String, WireguardStageRecord>,
     #[serde(default)]
@@ -57,29 +52,6 @@ pub struct GeneratedRecord {
     /// describes the old marker until the replacement marker is durable.
     #[serde(default)]
     pub pending_entry: Option<ManifestEntry>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SectionRecord {
-    pub nonce: String,
-    pub phase: Phase,
-    pub package: String,
-    pub section: String,
-    #[serde(default)]
-    pub before: Option<String>,
-    #[serde(default)]
-    pub after: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EdgeRecord {
-    pub nonce: String,
-    pub phase: Phase,
-    pub zone: String,
-    pub member: String,
-    pub network_nonce: String,
-    #[serde(default)]
-    pub tag_option: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,44 +164,6 @@ impl OwnershipDb {
                     bail!("invalid generated ownership phase")
                 }
                 _ => {}
-            }
-        }
-
-        for (key, record) in &self.sections {
-            if !matches!(record.package.as_str(), "network" | "openvpn")
-                || key != &format!("{}.{}", record.package, record.section)
-            {
-                bail!("invalid UCI section ownership identity");
-            }
-            crate::config::validate_uci_name(&record.section)?;
-            validate_nonce(&record.nonce, "UCI section nonce")?;
-            validate_optional_hash(record.before.as_deref(), "UCI before fingerprint")?;
-            validate_optional_hash(record.after.as_deref(), "UCI after fingerprint")?;
-            if matches!(record.phase, Phase::Borrowed) {
-                bail!("invalid borrowed UCI section ownership phase");
-            }
-        }
-
-        for (key, record) in &self.edges {
-            if key != &format!("{}\0{}", record.zone, record.member) {
-                bail!("invalid firewall edge ownership key");
-            }
-            crate::config::validate_firewall_zone(&record.zone)?;
-            crate::config::validate_uci_name(&record.member)?;
-            validate_nonce(&record.network_nonce, "firewall network nonce")?;
-            if record.phase == Phase::Borrowed {
-                if !record.nonce.is_empty() || !record.tag_option.is_empty() {
-                    bail!("borrowed firewall edge has an ownership tag");
-                }
-            } else {
-                validate_nonce(&record.nonce, "firewall edge nonce")?;
-                let expected = format!(
-                    "meduza_edge_{}",
-                    &hex::encode(Sha256::digest(record.member.as_bytes()))[..16]
-                );
-                if record.tag_option != expected || record.phase == Phase::Updating {
-                    bail!("invalid firewall edge tag identity");
-                }
             }
         }
 
@@ -720,7 +654,7 @@ pub fn wireguard_stage_name(nonce: &str) -> String {
 fn validate_generated_entry(paths: &Paths, entry: &ManifestEntry) -> Result<()> {
     crate::model::validate_instance(&entry.instance)?;
     crate::model::validate_device(&entry.device)?;
-    crate::config::validate_uci_name(&entry.logical)?;
+    crate::config::validate_logical_name(&entry.logical)?;
     let kind = match entry.kind {
         crate::state::InterfaceKind::Tinc => crate::model::VpnKind::Tinc,
         crate::state::InterfaceKind::Openvpn => crate::model::VpnKind::OpenVpn,
@@ -999,6 +933,28 @@ mod tests {
         file.set_len((MAX_OWNERSHIP_FILE_BYTES + 1) as u64).unwrap();
 
         assert!(OwnershipDb::load(&paths).is_err());
+    }
+
+    #[test]
+    fn retired_uci_ownership_fields_are_ignored_without_touching_uci() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        paths.prepare().unwrap();
+        atomic::atomic_write(
+            &paths.ownership,
+            br#"{"version":1,"generated":{},"sections":{"network.ovpn_old":{"nonce":"0123456789abcdef0123456789abcdef","phase":"owned","package":"network","section":"ovpn_old"}},"edges":{"vpn\u0000ovpn_old":{"nonce":"0123456789abcdef0123456789abcdef","phase":"owned","zone":"vpn","member":"ovpn_old","network_nonce":"0123456789abcdef0123456789abcdef","tag_option":"meduza_edge_old"}},"wireguard_stages":{},"frr":null}"#,
+            0o600,
+        )
+        .unwrap();
+
+        let db = OwnershipDb::load(&paths).unwrap();
+        assert!(db.generated.is_empty());
+        assert!(db.wireguard_stages.is_empty());
+        assert!(db.frr.is_none());
+        db.save(&paths).unwrap();
+        let saved = String::from_utf8(fs::read(&paths.ownership).unwrap()).unwrap();
+        assert!(!saved.contains("sections"));
+        assert!(!saved.contains("edges"));
     }
 
     #[test]

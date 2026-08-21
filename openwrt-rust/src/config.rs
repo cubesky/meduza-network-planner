@@ -24,7 +24,6 @@ pub struct Settings {
     pub key: Option<PathBuf>,
     pub user: Option<String>,
     pub password: Option<String>,
-    pub firewall_zone: Option<String>,
 }
 
 impl Settings {
@@ -78,7 +77,6 @@ impl Settings {
             get("ETCD_KEY")?,
             get("ETCD_USER")?,
             get("ETCD_PASS")?,
-            get("VPN_FIREWALL_ZONE")?,
         )
     }
 
@@ -92,7 +90,6 @@ impl Settings {
         key: Option<String>,
         user: Option<String>,
         password: Option<String>,
-        firewall_zone: Option<String>,
     ) -> Result<Self> {
         validate_node_id(&node_id)?;
         let endpoints = endpoints
@@ -132,9 +129,6 @@ impl Settings {
         if cert.is_some() != key.is_some() {
             bail!("ETCD_CERT and ETCD_KEY must be configured together");
         }
-        if let Some(zone) = firewall_zone.as_deref() {
-            validate_firewall_zone(zone)?;
-        }
         if user.is_some() != password.is_some() {
             bail!("ETCD_USER and ETCD_PASS must be configured together");
         }
@@ -153,7 +147,6 @@ impl Settings {
             key: key.map(PathBuf::from),
             user,
             password,
-            firewall_zone,
         })
     }
 
@@ -215,29 +208,13 @@ pub fn validate_node_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_uci_name(value: &str) -> Result<()> {
+pub fn validate_logical_name(value: &str) -> Result<()> {
     if value.is_empty()
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
-        bail!("invalid UCI identifier: {value}");
-    }
-    Ok(())
-}
-
-/// Validate the value of a firewall zone's `name` option.  This is a UCI
-/// value, not a section identifier: common OpenWrt names such as `vpn-zone`
-/// are valid, while whitespace, control characters and path separators are
-/// deliberately rejected before the value is passed to rpcd/libuci.
-pub fn validate_firewall_zone(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    {
-        bail!("invalid firewall zone name: {value}");
+        bail!("invalid logical interface identifier: {value}");
     }
     Ok(())
 }
@@ -257,22 +234,17 @@ mod tests {
             None,
             None,
             None,
-            Some("lan".into()),
         )
         .unwrap();
         assert!(value.enabled);
         assert_eq!(value.endpoints[0], "https://etcd-a:2379");
         assert!(validate_node_id("-bad").is_err());
-        assert!(validate_uci_name("bad-name").is_err());
-        assert!(validate_firewall_zone("vpn-zone").is_ok());
-        assert!(validate_firewall_zone("bad zone").is_err());
-
+        assert!(validate_logical_name("bad-name").is_err());
         for endpoint in ["https://etcd.example:443", "http://etcd.example:80"] {
             Settings::from_values(
                 "false",
                 "router-01".into(),
                 endpoint.into(),
-                None,
                 None,
                 None,
                 None,
@@ -291,7 +263,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .is_err()
         );
@@ -300,7 +271,6 @@ mod tests {
             "false",
             "router-01".into(),
             "HTTPS://etcd.example:443".into(),
-            None,
             None,
             None,
             None,
@@ -330,7 +300,6 @@ mod tests {
             key: None,
             user: None,
             password: None,
-            firewall_zone: None,
         };
 
         assert!(settings.tls_material().is_err());

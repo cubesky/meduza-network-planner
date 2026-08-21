@@ -17,7 +17,8 @@ The intended input compatibility is:
 
 - the `/etc/config/meduza` `main` settings listed in [README.md](README.md);
 - the existing `/commit`, `/global/`, `/nodes/<NODE_ID>/` desired-state keys;
-- native tinc, OpenVPN, WireGuard, netifd/firewall and FRR integration.
+- direct daemon-owned tinc, OpenVPN, WireGuard interfaces and FRR integration;
+  only the Meduza settings section remains in UCI.
 
 The following old runtime state is **not automatically compatible** merely
 because it is stored below the same directory:
@@ -207,10 +208,10 @@ Keep automatic startup disabled for the first run. The target sequence is:
 1. run `recover` so a new-format interrupted transaction, if any, is resolved;
 2. validate `/etc/config/meduza` and etcd reachability;
 3. run one foreground `apply`;
-4. inspect `status`, the UCI diff, Linux links, firewall membership, VPN
-   processes and FRR running configuration;
-5. repeat `apply` and prove that no network/firewall reload occurs when desired
-   state is unchanged;
+4. inspect `status`, the unchanged UCI packages, Linux links, firewall policy,
+   VPN processes and FRR running configuration;
+5. repeat `apply` and prove that healthy VPN runtimes are not restarted or
+   reconfigured when desired state is unchanged;
 6. reboot once and prove recovery works without immediate etcd availability;
 7. only then enable and start the procd service.
 
@@ -226,8 +227,8 @@ state.
 1. stop and disable the Rust service;
 2. use the Rust build's `runtime-stop`, followed by `purge`, while its executable
    and ownership database are still present;
-3. verify that Rust-owned UCI sections, links, generated files and FRR takeover
-   state are gone or restored;
+3. verify that Rust-owned links and generated files are gone, FRR is restored,
+   and administrator UCI packages remain untouched;
 4. reinstall the previous package and restore its configuration only after the
    Rust ownership domain is empty;
 5. trigger one controlled old-controller reconciliation and verify the same
@@ -247,7 +248,7 @@ supported architecture and representative firmware:
 | Old controller isolation | no old process, boot link or pending transaction |
 | Foreign-resource preservation | user UCI, links, files and OpenClash `utun` unchanged |
 | First Rust apply | all requested VPN/FRR resources reach the intended state |
-| Second identical apply | zero unnecessary network/firewall reloads |
+| Second identical apply | zero unnecessary VPN restart or link reconfiguration |
 | Interrupted apply | reboot yields complete old or complete new generation |
 | etcd unavailable at boot | local LKG is restored; retry does not corrupt state |
 | etcd ack failure | committed local state remains; only acknowledgement retries |

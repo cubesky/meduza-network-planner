@@ -79,6 +79,23 @@ jobs:
           node --check \
             openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
 
+      - name: Check direct-runtime and LuCI contracts
+        run: |
+          test ! -e openwrt-rust/src/uci.rs
+          ! grep -REn 'status\("(ifup|ifdown)"|/etc/init.d/openvpn' \
+            openwrt-rust/src
+          grep -q -- '"--daemon"' openwrt-rust/src/runtime.rs
+          grep -q -- "data-tab': 'status'" \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- "data-tab': 'routing'" \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- "data-tab': 'settings'" \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- 'meduza-outbound-body' \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- 'callLogRead' \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+
   binary:
     name: Static ELF ${{ matrix.asset_arch }}
     runs-on: ubuntu-24.04
@@ -235,8 +252,12 @@ jobs:
         include:
           - format: ipk
             release: ${{ inputs.ipk_release || '24.10.0' }}
-            openwrt_target: armsr
-            openwrt_subtarget: armv8
+            # Cudy's current 64-bit ARM targets are MediaTek Filogic and
+            # advertise aarch64_cortex-a53 to opkg/apk.  The static ELF is
+            # still generic AArch64; this SDK selection sets correct package
+            # metadata instead of the incompatible aarch64_generic label.
+            openwrt_target: mediatek
+            openwrt_subtarget: filogic
             asset_arch: aarch64
           - format: ipk
             release: ${{ inputs.ipk_release || '24.10.0' }}
@@ -245,8 +266,8 @@ jobs:
             asset_arch: x86_64
           - format: apk
             release: ${{ inputs.apk_release || '25.12.2' }}
-            openwrt_target: armsr
-            openwrt_subtarget: armv8
+            openwrt_target: mediatek
+            openwrt_subtarget: filogic
             asset_arch: aarch64
           - format: apk
             release: ${{ inputs.apk_release || '25.12.2' }}
@@ -316,6 +337,11 @@ jobs:
           ASSET_ARCH: ${{ matrix.asset_arch }}
         run: |
           set -euo pipefail
+          (
+            cd openwrt-sdk
+            ./scripts/feeds update -a
+            ./scripts/feeds install ca-bundle ip-full rpcd ubus uci luci-base
+          )
           package_dir=openwrt-sdk/package/meduza-openwrt-rust
           cp -a openwrt-rust/package "${package_dir}"
           mkdir -p "${package_dir}/prebuilt"

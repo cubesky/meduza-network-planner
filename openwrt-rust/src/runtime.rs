@@ -14,7 +14,6 @@ use crate::state::{InterfaceKind, ManifestEntry, Paths};
 
 const MAX_GENERATED_CONFIG_BYTES: usize = 6 * 1024 * 1024;
 const MAX_LINK_ALIAS_BYTES: usize = 4096;
-const MAX_OPENVPN_RUNTIME_BYTES: usize = 256 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_PROC_CMDLINE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -33,27 +32,22 @@ impl<R: Runner> Runtime<R> {
 
     pub fn preflight(&self, desired: &[ManifestEntry], reusable: &[ManifestEntry]) -> Result<()> {
         for entry in desired {
-            if self.paths.openvpn_proto.is_file()
-                && entry.kind == InterfaceKind::Openvpn
-                && (native_openvpn_process_matches(entry)?
-                    || self.native_openvpn_namespace_exists(entry)?)
-                && !self.native_openvpn_runtime_owned(entry)?
+            if entry.kind == InterfaceKind::Openvpn
+                && process_matches(entry, None)?
+                && !OwnershipDb::load(&self.paths)?.authorizes_generated(entry)?
             {
                 let owners = reusable
                     .iter()
                     .filter(|old| {
                         old.kind == InterfaceKind::Openvpn && old.logical == entry.logical
                     })
-                    .map(|old| self.native_openvpn_runtime_owned(old))
+                    .map(|old| OwnershipDb::load(&self.paths)?.authorizes_generated(old))
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
                     .filter(|owned| *owned)
                     .count();
                 if owners != 1 {
-                    bail!(
-                        "OpenVPN runtime namespace is occupied by an unowned object: {}",
-                        entry.logical
-                    );
+                    bail!("OpenVPN process is not owned by Meduza: {}", entry.logical);
                 }
             }
             if self.link_exists(&entry.device)
@@ -95,15 +89,6 @@ impl<R: Runner> Runtime<R> {
                 );
             }
         }
-        if desired
-            .iter()
-            .any(|entry| entry.kind == InterfaceKind::Openvpn)
-            && !self.paths.openvpn_proto.is_file()
-            && !Path::new("/etc/init.d/openvpn").is_file()
-            && self.paths.root.is_none()
-        {
-            bail!("desired OpenVPN runtime has neither netifd proto nor init service");
-        }
         Ok(())
     }
 
@@ -140,60 +125,30 @@ impl<R: Runner> Runtime<R> {
 
     pub fn stop(&self, entry: &ManifestEntry) -> Result<()> {
         let mut errors = Vec::new();
-        let uci_owned = self.network_section_owned(entry)?;
-        let legacy_openvpn_owned = entry.kind == InterfaceKind::Openvpn
-            && crate::uci::live_section_owned(
-                &self.paths,
-                self.runner.clone(),
-                "openvpn",
-                &entry.logical,
-            )?;
         let generated_owned =
             OwnershipDb::load(&self.paths)?.authorizes_generated_resource(entry)?;
-        let native_openvpn_owned = entry.kind == InterfaceKind::Openvpn
-            && self.paths.openvpn_proto.is_file()
-            && self.native_openvpn_runtime_owned(entry)?;
         // A tinc-up/OpenVPN link-up script writes the deterministic short
         // alias before the controller can replace it with the generation
         // nonce.  Preserve that strong, process-backed recovery proof across
-        // teardown: ifdown/process termination may remove the evidence before
+        // teardown: process termination may remove the evidence before
         // we reach the final link cleanup below.
         let recoverable_link_owned = self.recoverable_script_alias(entry)?;
-        if uci_owned
-            && crate::command::command_exists("ifdown")
-            && let Err(error) = self.runner.status("ifdown", [entry.logical.as_str()])
-        {
-            errors.push(format!("ifdown failed: {error:#}"));
-        }
         match entry.kind {
             InterfaceKind::Openvpn => {
-                if (legacy_openvpn_owned || (uci_owned && !self.paths.openvpn_proto.is_file()))
-                    && Path::new("/etc/init.d/openvpn").is_file()
-                    && let Err(error) = self
-                        .runner
-                        .status("/etc/init.d/openvpn", ["stop", entry.logical.as_str()])
-                {
-                    errors.push(format!("OpenVPN procd stop failed: {error:#}"));
-                }
                 if generated_owned {
-                    if let Err(error) = terminate_matching_processes(entry, native_openvpn_owned) {
+                    if let Err(error) = terminate_matching_processes(entry) {
                         errors.push(format!("OpenVPN process stop failed: {error:#}"));
                     }
-                } else if process_matches(entry, None, native_openvpn_owned)? {
+                } else if process_matches(entry, None)? {
                     errors.push("OpenVPN process exists without generated ownership".into());
-                }
-                if !native_openvpn_owned && native_openvpn_process_matches(entry)? {
-                    errors.push(
-                        "native OpenVPN process exists without runtime-file ownership".into(),
-                    );
                 }
             }
             InterfaceKind::Tinc => {
                 if generated_owned {
-                    if let Err(error) = terminate_matching_processes(entry, false) {
+                    if let Err(error) = terminate_matching_processes(entry) {
                         errors.push(format!("tinc process stop failed: {error:#}"));
                     }
-                } else if process_matches(entry, None, false)? {
+                } else if process_matches(entry, None)? {
                     errors.push("tinc process exists without generated ownership".into());
                 }
             }
@@ -228,8 +183,8 @@ impl<R: Runner> Runtime<R> {
     }
 
     fn activate_tinc(&self, entry: &ManifestEntry, changed: bool) -> Result<()> {
-        if changed || !self.link_exists(&entry.device) {
-            if self.link_exists(&entry.device) {
+        if changed || !self.link_exists(&entry.device) || !self.process_running(entry) {
+            if self.link_exists(&entry.device) || self.process_running(entry) {
                 self.stop(entry)?;
             }
             let config_dir = entry
@@ -252,34 +207,44 @@ impl<R: Runner> Runtime<R> {
                 bail!("tinc did not create device {}", entry.device);
             }
         }
-        self.mark_device(entry)?;
-        self.runner.status("ifup", [entry.logical.as_str()])
+        if self.device_owned(entry)? {
+            Ok(())
+        } else {
+            self.mark_device(entry)
+        }
     }
 
     fn activate_openvpn(&self, entry: &ManifestEntry, changed: bool) -> Result<()> {
-        if self.paths.openvpn_proto.is_file() {
-            if changed {
-                self.runner.status("ifdown", [entry.logical.as_str()])?;
+        if changed || !self.process_running(entry) {
+            if self.process_running(entry) || self.link_exists(&entry.device) {
+                self.stop(entry)?;
             }
-            if changed || !self.interface_up(&entry.logical) {
-                self.runner.status("ifup", [entry.logical.as_str()])?;
-            }
-        } else {
-            if changed {
-                self.runner
-                    .status("/etc/init.d/openvpn", ["restart", entry.logical.as_str()])?;
-            } else if self
-                .runner
-                .status("/etc/init.d/openvpn", ["running", entry.logical.as_str()])
-                .is_err()
-            {
-                self.runner
-                    .status("/etc/init.d/openvpn", ["start", entry.logical.as_str()])?;
-            }
-            self.runner.status("ifup", [entry.logical.as_str()])?;
+            let directory = entry
+                .config
+                .parent()
+                .context("OpenVPN config has no directory")?;
+            let pidfile = self
+                .paths
+                .runtime
+                .join(format!("openvpn.{}.pid", entry.instance));
+            self.runner.status(
+                "openvpn",
+                [
+                    "--daemon",
+                    &format!("meduza-{}", entry.instance),
+                    "--writepid",
+                    &pidfile.display().to_string(),
+                    "--cd",
+                    &directory.display().to_string(),
+                    "--config",
+                    "openvpn.conf",
+                ],
+            )?;
         }
         if self.wait_link(&entry.device, true, Duration::from_secs(15)) {
-            self.mark_device(entry)?;
+            if !self.device_owned(entry)? {
+                self.mark_device(entry)?;
+            }
             Ok(())
         } else if self.process_running(entry) {
             tracing::info!(instance = %entry.instance, "OpenVPN is registered and still connecting");
@@ -378,9 +343,10 @@ impl<R: Runner> Runtime<R> {
                 }
             }
         }
-        self.runner
-            .status("ip", ["link", "set", "up", "dev", entry.device.as_str()])?;
-        self.runner.status("ifup", [entry.logical.as_str()])?;
+        if !self.link_up(&entry.device) {
+            self.runner
+                .status("ip", ["link", "set", "up", "dev", entry.device.as_str()])?;
+        }
         self.finish_wireguard_stage(entry)
     }
 
@@ -462,16 +428,7 @@ impl<R: Runner> Runtime<R> {
         if !db.authorizes_generated(entry)? {
             return Ok(false);
         }
-        // Native netifd OpenVPN invokes openvpn with the generated runtime
-        // wrapper in /var/run rather than entry.config directly.  Accept that
-        // argv shape only after the wrapper, network section, generated
-        // config markers, and external generation all independently prove
-        // ownership.  Tinc and legacy OpenVPN keep the stricter direct argv
-        // matcher.
-        let allow_native_openvpn = entry.kind == InterfaceKind::Openvpn
-            && self.paths.openvpn_proto.is_file()
-            && self.native_openvpn_runtime_owned(entry)?;
-        process_matches(entry, None, allow_native_openvpn)
+        process_matches(entry, None)
     }
 
     fn link_exists(&self, device: &str) -> bool {
@@ -489,15 +446,6 @@ impl<R: Runner> Runtime<R> {
             thread::sleep(Duration::from_millis(250));
         }
         self.link_exists(device) == present
-    }
-
-    pub(crate) fn interface_up(&self, logical: &str) -> bool {
-        self.runner
-            .text("ifstatus", [logical])
-            .ok()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-            .and_then(|value| value.get("up").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false)
     }
 
     pub(crate) fn link_up(&self, device: &str) -> bool {
@@ -518,96 +466,7 @@ impl<R: Runner> Runtime<R> {
         {
             return false;
         }
-        if process_matches(entry, None, false).unwrap_or(false) {
-            return true;
-        }
-        entry.kind == InterfaceKind::Openvpn
-            && self.native_openvpn_runtime_owned(entry).unwrap_or(false)
-            && process_matches(entry, None, true).unwrap_or(false)
-    }
-
-    fn network_section_owned(&self, entry: &ManifestEntry) -> Result<bool> {
-        crate::uci::live_section_owned(&self.paths, self.runner.clone(), "network", &entry.logical)
-    }
-
-    fn native_openvpn_runtime_path(&self, entry: &ManifestEntry) -> std::path::PathBuf {
-        crate::atomic::rooted(
-            self.paths.root.as_deref(),
-            &format!("/var/run/openvpn.{}.conf", entry.logical),
-        )
-    }
-
-    fn native_openvpn_namespace_exists(&self, entry: &ManifestEntry) -> Result<bool> {
-        match fs::symlink_metadata(self.native_openvpn_runtime_path(entry)) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn native_openvpn_runtime_owned(&self, entry: &ManifestEntry) -> Result<bool> {
-        if entry.kind != InterfaceKind::Openvpn || !self.network_section_owned(entry)? {
-            return Ok(false);
-        }
-        let db = OwnershipDb::load(&self.paths)?;
-        if !db.authorizes_generated_resource(entry)? {
-            return Ok(false);
-        }
-        let config_metadata = match fs::symlink_metadata(&entry.config) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if config_metadata.file_type().is_symlink() || !config_metadata.is_file() {
-            return Ok(false);
-        }
-        let generated = atomic::read_string_bounded(&entry.config, MAX_GENERATED_CONFIG_BYTES)?;
-        let owner = format!("setenv MEDUZA_OWNER {OWNER}");
-        let instance = format!("setenv MEDUZA_INSTANCE {}", entry.instance);
-        if !generated.lines().any(|line| line == owner)
-            || !generated.lines().any(|line| line == instance)
-        {
-            return Ok(false);
-        }
-
-        let runtime = self.native_openvpn_runtime_path(entry);
-        let metadata = match fs::symlink_metadata(&runtime) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Ok(false);
-        }
-        let body = atomic::read_string_bounded(&runtime, MAX_OPENVPN_RUNTIME_BYTES)?;
-        let expected = entry.config.display().to_string();
-        let mut found = false;
-        for line in body.lines() {
-            let mut fields = line.split_whitespace();
-            if fields.next() != Some("config") {
-                continue;
-            }
-            let Some(value) = fields.next() else {
-                return Ok(false);
-            };
-            if fields.next().is_some() {
-                return Ok(false);
-            }
-            let value = value
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-                .or_else(|| {
-                    value
-                        .strip_prefix('"')
-                        .and_then(|value| value.strip_suffix('"'))
-                })
-                .unwrap_or(value);
-            if value != expected || found {
-                return Ok(false);
-            }
-            found = true;
-        }
-        Ok(found)
+        process_matches(entry, None).unwrap_or(false)
     }
 
     fn device_alias(&self, entry: &ManifestEntry) -> Result<String> {
@@ -729,14 +588,14 @@ impl<R: Runner> Runtime<R> {
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_matching_processes(entry: &ManifestEntry, allow_native_openvpn: bool) -> Result<()> {
+fn terminate_matching_processes(entry: &ManifestEntry) -> Result<()> {
     let mut processes = Vec::new();
     for directory in fs::read_dir("/proc")? {
         let directory = directory?;
         let Ok(pid) = directory.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if let Some(start_time) = process_identity(entry, pid, allow_native_openvpn)? {
+        if let Some(start_time) = process_identity(entry, pid)? {
             // SAFETY: kill is invoked only with a PID whose executable and NUL
             // separated argv were matched against the strong manifest identity.
             unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -746,14 +605,14 @@ fn terminate_matching_processes(entry: &ManifestEntry, allow_native_openvpn: boo
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
         && processes.iter().any(|(pid, start)| {
-            process_identity(entry, *pid, allow_native_openvpn)
+            process_identity(entry, *pid)
                 .is_ok_and(|value| value.as_deref() == Some(start.as_str()))
         })
     {
         thread::sleep(Duration::from_millis(100));
     }
     for (pid, start) in &processes {
-        if process_identity(entry, *pid, allow_native_openvpn)?.as_deref() == Some(start.as_str()) {
+        if process_identity(entry, *pid)?.as_deref() == Some(start.as_str()) {
             // SAFETY: executable, argv and kernel start-time are revalidated,
             // so a recycled numeric PID is never signalled.
             unsafe { libc::kill(*pid, libc::SIGKILL) };
@@ -762,7 +621,7 @@ fn terminate_matching_processes(entry: &ManifestEntry, allow_native_openvpn: boo
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if !processes.iter().any(|(pid, start)| {
-            process_identity(entry, *pid, allow_native_openvpn)
+            process_identity(entry, *pid)
                 .is_ok_and(|value| value.as_deref() == Some(start.as_str()))
         }) {
             return Ok(());
@@ -770,8 +629,7 @@ fn terminate_matching_processes(entry: &ManifestEntry, allow_native_openvpn: boo
         thread::sleep(Duration::from_millis(100));
     }
     if processes.iter().any(|(pid, start)| {
-        process_identity(entry, *pid, allow_native_openvpn)
-            .is_ok_and(|value| value.as_deref() == Some(start.as_str()))
+        process_identity(entry, *pid).is_ok_and(|value| value.as_deref() == Some(start.as_str()))
     }) {
         bail!("owned process did not exit")
     }
@@ -779,7 +637,7 @@ fn terminate_matching_processes(entry: &ManifestEntry, allow_native_openvpn: boo
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminate_matching_processes(_entry: &ManifestEntry, _allow_native_openvpn: bool) -> Result<()> {
+fn terminate_matching_processes(_entry: &ManifestEntry) -> Result<()> {
     Ok(())
 }
 
@@ -799,11 +657,7 @@ fn read_optional_string(path: &Path, max_bytes: usize) -> Result<Option<String>>
 }
 
 #[cfg(target_os = "linux")]
-fn process_matches(
-    entry: &ManifestEntry,
-    only_pid: Option<i32>,
-    allow_native_openvpn: bool,
-) -> Result<bool> {
+fn process_matches(entry: &ManifestEntry, only_pid: Option<i32>) -> Result<bool> {
     let pids: Vec<i32> = if let Some(pid) = only_pid {
         vec![pid]
     } else {
@@ -813,7 +667,7 @@ fn process_matches(
             .collect()
     };
     for pid in pids {
-        if process_identity(entry, pid, allow_native_openvpn)?.is_some() {
+        if process_identity(entry, pid)?.is_some() {
             return Ok(true);
         }
     }
@@ -821,50 +675,7 @@ fn process_matches(
 }
 
 #[cfg(target_os = "linux")]
-fn native_openvpn_process_matches(entry: &ManifestEntry) -> Result<bool> {
-    if entry.kind != InterfaceKind::Openvpn {
-        return Ok(false);
-    }
-    let expected = format!("/var/run/openvpn.{}.conf", entry.logical);
-    for process in fs::read_dir("/proc")? {
-        let process = process?;
-        let Ok(pid) = process.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        let root = Path::new("/proc").join(pid.to_string());
-        let Ok(exe) = fs::read_link(root.join("exe")) else {
-            continue;
-        };
-        if proc_exe_basename(&exe).as_deref() != Some("openvpn") {
-            continue;
-        }
-        let Ok(Some(raw)) = read_optional_bytes(&root.join("cmdline"), MAX_PROC_CMDLINE_BYTES)
-        else {
-            continue;
-        };
-        let argv: Vec<_> = raw
-            .split(|byte| *byte == 0)
-            .filter(|value| !value.is_empty())
-            .map(|value| String::from_utf8_lossy(value).into_owned())
-            .collect();
-        if argv_option(&argv, "--config", "--config", &expected) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn native_openvpn_process_matches(_entry: &ManifestEntry) -> Result<bool> {
-    Ok(false)
-}
-
-#[cfg(target_os = "linux")]
-fn process_identity(
-    entry: &ManifestEntry,
-    pid: i32,
-    allow_native_openvpn: bool,
-) -> Result<Option<String>> {
+fn process_identity(entry: &ManifestEntry, pid: i32) -> Result<Option<String>> {
     let root = Path::new("/proc").join(pid.to_string());
     let Ok(exe) = fs::read_link(root.join("exe")) else {
         return Ok(None);
@@ -886,7 +697,7 @@ fn process_identity(
         .filter(|value| !value.is_empty())
         .map(|value| String::from_utf8_lossy(value).into_owned())
         .collect();
-    if !process_argv_matches(entry, &argv, allow_native_openvpn) {
+    if !process_argv_matches(entry, &argv) {
         return Ok(None);
     }
     let stat = match read_optional_string(&root.join("stat"), MAX_PROC_STAT_BYTES) {
@@ -915,11 +726,7 @@ pub(crate) fn proc_exe_basename(path: &Path) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_matches(
-    _entry: &ManifestEntry,
-    _only_pid: Option<i32>,
-    _allow_native_openvpn: bool,
-) -> Result<bool> {
+fn process_matches(_entry: &ManifestEntry, _only_pid: Option<i32>) -> Result<bool> {
     Ok(false)
 }
 
@@ -934,11 +741,7 @@ fn argv_option(argv: &[String], short: &str, long: &str, value: &str) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn process_argv_matches(
-    entry: &ManifestEntry,
-    argv: &[String],
-    allow_native_openvpn: bool,
-) -> bool {
+fn process_argv_matches(entry: &ManifestEntry, argv: &[String]) -> bool {
     let config = entry.config.display().to_string();
     let Some(parent) = entry.config.parent() else {
         return false;
@@ -953,13 +756,6 @@ fn process_argv_matches(
             argv_option(argv, "--config", "--config", &config)
                 || (argv_option(argv, "--cd", "--cd", &directory)
                     && argv_option(argv, "--config", "--config", "openvpn.conf"))
-                || (allow_native_openvpn
-                    && argv_option(
-                        argv,
-                        "--config",
-                        "--config",
-                        &format!("/var/run/openvpn.{}.conf", entry.logical),
-                    ))
         }
         InterfaceKind::Wireguard => false,
     }
@@ -981,15 +777,14 @@ mod tests {
     }
 
     #[test]
-    fn native_openvpn_argv_requires_runtime_ownership_authorization() {
+    fn native_openvpn_runtime_wrapper_is_not_daemon_owned() {
         let entry = openvpn_entry();
         let argv = vec![
             "openvpn".into(),
             "--config".into(),
             "/var/run/openvpn.ovpn_office.conf".into(),
         ];
-        assert!(!process_argv_matches(&entry, &argv, false));
-        assert!(process_argv_matches(&entry, &argv, true));
+        assert!(!process_argv_matches(&entry, &argv));
     }
 
     #[test]
@@ -1002,6 +797,6 @@ mod tests {
             "--config".into(),
             "openvpn.conf".into(),
         ];
-        assert!(process_argv_matches(&entry, &argv, false));
+        assert!(process_argv_matches(&entry, &argv));
     }
 }

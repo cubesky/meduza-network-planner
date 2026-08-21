@@ -11,7 +11,6 @@ pub mod render;
 pub mod report;
 pub mod runtime;
 pub mod state;
-pub mod uci;
 
 pub const OWNER: &str = "meduza-openwrt-rust-v1";
 
@@ -20,7 +19,7 @@ pub use cli::{Cli, Command};
 pub async fn execute(cli: Cli) -> anyhow::Result<()> {
     // Root-prefixing remains an internal test facility on `Paths`; exposing it
     // through the production CLI would mix offline files with the live host's
-    // ubus, UCI, process and network namespaces.
+    // process and network namespaces.
     let paths = state::Paths::from_root(None);
     let runner = command::SystemRunner;
 

@@ -29,12 +29,11 @@ pub struct Paths {
     pub pending_manifest: PathBuf,
     pub ownership: PathBuf,
     pub reported: PathBuf,
+    pub daemon_status: PathBuf,
     pub lock: PathBuf,
     pub ip_forward: PathBuf,
     pub ip_forward_marker: PathBuf,
     pub frr_config: PathBuf,
-    pub uci_config_dir: PathBuf,
-    pub openvpn_proto: PathBuf,
 }
 
 impl Paths {
@@ -52,12 +51,11 @@ impl Paths {
             ownership: managed.join("ownership.json"),
             reported: managed.join("reported.json"),
             runtime: atomic::rooted(root, "/var/run/meduza"),
+            daemon_status: atomic::rooted(root, "/var/run/meduza/status.json"),
             lock: atomic::rooted(root, "/var/lock/meduza-openwrt.lock"),
             ip_forward: atomic::rooted(root, "/proc/sys/net/ipv4/ip_forward"),
             ip_forward_marker: atomic::rooted(root, "/var/run/meduza/ip-forward.changed"),
             frr_config: atomic::rooted(root, "/etc/frr/frr.conf"),
-            uci_config_dir: atomic::rooted(root, "/etc/config"),
-            openvpn_proto: atomic::rooted(root, "/lib/netifd/proto/openvpn.sh"),
             data,
             state,
             managed,
@@ -518,7 +516,7 @@ impl ManifestEntry {
             value => bail!("unknown interface kind: {value}"),
         };
         crate::model::validate_instance(fields[1])?;
-        crate::config::validate_uci_name(fields[2])?;
+        crate::config::validate_logical_name(fields[2])?;
         crate::model::validate_device(fields[3])?;
         Ok(Self {
             kind,
