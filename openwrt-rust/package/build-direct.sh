@@ -20,7 +20,7 @@ output=$6
 
 package_name=meduza-openwrt-rust
 description='Meduza OpenWrt VPN reconciler (Rust)'
-dependencies='ca-bundle ip-full rpcd ubus uci luci-base'
+dependencies='ca-bundle ip-full netifd rpcd ubus uci luci-base'
 
 case "$format" in
 	ipk|apk) ;;
@@ -113,7 +113,7 @@ build_ipk() {
 	cat >"$control/control" <<EOF
 Package: $package_name
 Version: $package_version
-Depends: ca-bundle, ip-full, rpcd, ubus, uci, luci-base
+Depends: ca-bundle, ip-full, netifd, rpcd, ubus, uci, luci-base
 Conflicts: meduza-openwrt-lite
 Source: $package_name
 SourceName: $package_name
@@ -133,9 +133,14 @@ EOF
 	cat >"$control/postinst" <<'EOF'
 #!/bin/sh
 [ "${IPKG_NO_SCRIPT:-}" = "1" ] && exit 0
-[ -s "${IPKG_INSTROOT:-}/lib/functions.sh" ] || exit 0
-. "${IPKG_INSTROOT:-}/lib/functions.sh"
-default_postinst "$0" "$@"
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+rm -f /tmp/luci-indexcache.*
+if [ "${PKG_UPGRADE:-0}" != 1 ]; then
+	/etc/init.d/meduza enable >/dev/null 2>&1 || exit 1
+fi
+( trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2; \
+	/etc/init.d/meduza start || logger -t meduza "deferred post-install start failed" ) &
+exit 0
 EOF
 	cat >"$control/prerm" <<'EOF'
 #!/bin/sh
@@ -186,12 +191,14 @@ build_apk() {
 	cat >"$scripts/post-install" <<'EOF'
 #!/bin/sh
 [ "${IPKG_NO_SCRIPT:-}" = "1" ] && exit 0
-[ -s "${IPKG_INSTROOT:-}/lib/functions.sh" ] || exit 0
-. "${IPKG_INSTROOT:-}/lib/functions.sh"
-export root="${IPKG_INSTROOT:-}"
-export pkgname="meduza-openwrt-rust"
-add_group_and_user
-default_postinst
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+rm -f /tmp/luci-indexcache.*
+if [ "${PKG_UPGRADE:-0}" != 1 ]; then
+	/etc/init.d/meduza enable >/dev/null 2>&1 || exit 1
+fi
+( trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2; \
+	/etc/init.d/meduza start || logger -t meduza "deferred post-install start failed" ) &
+exit 0
 EOF
 	{
 		echo '#!/bin/sh'

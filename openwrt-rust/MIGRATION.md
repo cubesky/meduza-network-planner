@@ -211,9 +211,11 @@ Keep automatic startup disabled for the first run. The target sequence is:
 1. run `recover` so a new-format interrupted transaction, if any, is resolved;
 2. validate `/etc/config/meduza` and etcd reachability;
 3. run one foreground `apply`;
-4. inspect `status`, the unchanged network/OpenVPN UCI packages, Linux links,
-   the selected firewall zone's exact device additions, firewall policy, VPN
-   processes and FRR running configuration;
+4. inspect `status`, the owner-marked `proto none` network sections, the
+   unchanged OpenVPN UCI package, Linux links, the dedicated `meduza` zone's
+   exact logical-network additions, both forwarding directions to the selected
+   interconnect zone, firewall policy, VPN processes and FRR running
+   configuration;
    confirm that `/etc/frr/frr.conf` is still the administrator baseline and
    the Meduza overlay exists only at
    `/var/run/meduza/generated/frr/frr.conf`;

@@ -24,8 +24,8 @@ pub struct Settings {
     pub key: Option<PathBuf>,
     pub user: Option<String>,
     pub password: Option<String>,
-    /// Optional firewall zone whose device list receives every managed VPN
-    /// interface. An empty value leaves firewall membership unmanaged.
+    /// Optional administrator zone connected bidirectionally to the dedicated
+    /// `meduza` zone. An empty value disables firewall integration.
     pub firewall_zone: Option<String>,
 }
 
@@ -142,6 +142,9 @@ impl Settings {
             .filter(|value| !value.is_empty());
         if let Some(zone) = &firewall_zone {
             validate_firewall_zone(zone)?;
+            if zone == "meduza" {
+                bail!("VPN_FIREWALL_ZONE must select a zone other than meduza");
+            }
         }
         let ca = ca.map(PathBuf::from).or_else(|| {
             endpoints
@@ -270,6 +273,20 @@ mod tests {
         assert!(validate_logical_name("bad-name").is_err());
         assert!(validate_firewall_zone("vpn-zone").is_ok());
         assert!(validate_firewall_zone("bad zone").is_err());
+        assert!(
+            Settings::from_values(
+                "false",
+                "router-01".into(),
+                "https://etcd.example:443".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("meduza".into()),
+            )
+            .is_err()
+        );
         for endpoint in ["https://etcd.example:443", "http://etcd.example:80"] {
             Settings::from_values(
                 "false",

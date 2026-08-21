@@ -64,10 +64,11 @@ function statusClass(state) {
 }
 
 function statusBadge(state) {
+	var label = state === 'stopped' ? _('Not connected') : (state || _('unknown'));
 	return E('span', {
 		'class': 'label ' + statusClass(state),
 		'style': 'display:inline-block;min-width:6em;text-align:center'
-	}, [ state || _('unknown') ]);
+	}, [ label ]);
 }
 
 function emptyRow(columns, message) {
@@ -77,7 +78,7 @@ function emptyRow(columns, message) {
 function fetchStatus() {
 	return L.resolveDefault(
 		fs.exec_direct('/usr/sbin/meduza-openwrt', [ 'status', '--json' ], 'json'),
-		{ etcd: { state: 'unknown' }, interface_details: [], frr: 'down' }
+		{ etcd: { state: 'unknown' }, interface_details: [], tinc_peers: [], frr: 'down', frr_peers: [] }
 	);
 }
 
@@ -122,28 +123,42 @@ return view.extend({
 
 		var details = Array.isArray(status.interface_details) ? status.interface_details : [];
 		var outbound = details.filter(function(item) { return item.kind !== 'tinc'; });
-		var tinc = details.filter(function(item) { return item.kind === 'tinc'; });
+		var tinc = Array.isArray(status.tinc_peers) ? status.tinc_peers : [];
 		var outboundBody = document.getElementById('meduza-outbound-body');
 		if (outboundBody)
 			dom.content(outboundBody, outbound.length ? outbound.map(function(item) {
 				return E('tr', {}, [
 					E('td', {}, [ item.kind ]), E('td', {}, [ item.instance ]),
+					E('td', {}, [ item.logical ]),
 					E('td', {}, [ item.device ]), E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(4, _('No outbound VPN connections are managed.')) ]);
+			}) : [ emptyRow(5, _('No outbound VPN connections are managed.')) ]);
 
 		var tincBody = document.getElementById('meduza-tinc-body');
 		if (tincBody)
 			dom.content(tincBody, tinc.length ? tinc.map(function(item) {
 				return E('tr', {}, [
-					E('td', {}, [ item.instance ]), E('td', {}, [ item.device ]),
+					E('td', {}, [ item.peer ]), E('td', {}, [ item.network ]),
 					E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(3, _('Tinc is not managed on this node.')) ]);
+			}) : [ emptyRow(3, _('No remote Tinc peers are configured.')) ]);
 
 		var frr = document.getElementById('meduza-frr-status');
 		if (frr)
 			dom.content(frr, statusBadge(status.frr || 'down'));
+		var frrPeers = Array.isArray(status.frr_peers) ? status.frr_peers : [];
+		var frrBody = document.getElementById('meduza-frr-body');
+		if (frrBody)
+				dom.content(frrBody, frrPeers.length ? frrPeers.map(function(item) {
+				return E('tr', {}, [
+					E('td', {}, [ String(item.protocol || '').toUpperCase() ]),
+					E('td', {}, [ item.peer || '-' ]),
+					E('td', {}, [ item.remote_as == null ? '-' : String(item.remote_as) ]),
+					E('td', {}, [ item.interface || '-' ]),
+					E('td', {}, [ item.detail || '-' ]),
+					E('td', {}, [ statusBadge(item.state) ])
+				]);
+			}) : [ emptyRow(6, _('No FRR peers are currently known.')) ]);
 	},
 
 	updateLog: function(entries) {
@@ -165,21 +180,24 @@ return view.extend({
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'VPN_FIREWALL_ZONE', _('VPN firewall zone'));
+		o = s.option(form.ListValue, 'VPN_FIREWALL_ZONE', _('Interconnect firewall zone'));
 		o.rmempty = true;
-		o.value('', _('Do not manage firewall membership'));
+		o.validate = function(sectionId, value) {
+			return value === 'meduza' ? _('Select a zone other than meduza.') : true;
+		};
+		o.value('', _('Disable firewall integration'));
 		var knownZones = {};
 		uci.sections('firewall', 'zone', function(zone) {
 			var name = String(zone.name || '');
-			if (/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(name) && !knownZones[name]) {
+			if (name !== 'meduza' && /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(name) && !knownZones[name]) {
 				knownZones[name] = true;
 				o.value(name, name);
 			}
 		});
 		var configuredZone = String(uci.get('meduza', 'main', 'VPN_FIREWALL_ZONE') || '');
-		if (configuredZone && !knownZones[configuredZone])
+		if (configuredZone && configuredZone !== 'meduza' && !knownZones[configuredZone])
 			o.value(configuredZone, configuredZone + ' (' + _('missing') + ')');
-		o.description = _('All Meduza-managed Tinc, OpenVPN and WireGuard device names are added to this zone. Existing members and all zone policies remain administrator-owned.');
+		o.description = _('VPN interfaces are placed in a dedicated meduza zone. If it does not exist, Meduza creates it and adds bidirectional forwarding between meduza and the selected existing zone. The zone is retained and reused; an existing zone or matching forwarding is never adopted.');
 
 		o = s.option(form.Value, 'NODE_ID', _('Node ID'));
 		o.rmempty = false;
@@ -218,14 +236,23 @@ return view.extend({
 			var outboundTable = E('table', { 'class': 'table cbi-section-table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', {}, [ _('Type') ]), E('th', {}, [ _('Instance') ]),
+					E('th', {}, [ _('Network') ]),
 					E('th', {}, [ _('Interface') ]), E('th', {}, [ _('Status') ])
 				]), E('tbody', { 'id': 'meduza-outbound-body' })
 			]);
 			var tincTable = E('table', { 'class': 'table cbi-section-table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
-					E('th', {}, [ _('Instance') ]), E('th', {}, [ _('Interface') ]),
+					E('th', {}, [ _('Peer') ]), E('th', {}, [ _('Network') ]),
 					E('th', {}, [ _('Status') ])
 				]), E('tbody', { 'id': 'meduza-tinc-body' })
+			]);
+			var frrTable = E('table', { 'class': 'table cbi-section-table' }, [
+				E('tr', { 'class': 'tr table-titles' }, [
+					E('th', {}, [ _('Protocol') ]), E('th', {}, [ _('Peer') ]),
+					E('th', {}, [ _('Remote AS') ]),
+					E('th', {}, [ _('Interface') ]), E('th', {}, [ _('FRR state') ]),
+					E('th', {}, [ _('Status') ])
+				]), E('tbody', { 'id': 'meduza-frr-body' })
 			]);
 			var tabs = E('div', {}, [
 				E('div', { 'class': 'cbi-section', 'data-tab': 'status', 'data-tab-title': _('Status') }, [
@@ -238,7 +265,8 @@ return view.extend({
 				]),
 				E('div', { 'class': 'cbi-section', 'data-tab': 'routing', 'data-tab-title': _('Tinc & FRR') }, [
 					E('h3', {}, [ _('Tinc status') ]), tincTable,
-					E('h3', {}, [ _('FRR status') ]), E('div', { 'id': 'meduza-frr-status' })
+					E('h3', {}, [ _('FRR status') ]), E('div', { 'id': 'meduza-frr-status' }),
+					frrTable
 				]),
 				E('div', { 'class': 'cbi-section', 'data-tab': 'settings', 'data-tab-title': _('Settings') }, [ settingsForm ])
 			]);

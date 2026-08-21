@@ -20,7 +20,11 @@ pub enum Command {
     /// Stop only Meduza-owned VPN runtimes and restore FRR.
     RuntimeStop,
     /// Remove all strongly-owned runtime, generated and persistent resources.
-    Purge,
+    Purge {
+        /// After cleanup, publish a volatile administratively-stopped status.
+        #[arg(long, hide = true)]
+        disabled: bool,
+    },
     /// Print locally observed tunnel state.
     Status {
         #[arg(long)]

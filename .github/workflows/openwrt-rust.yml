@@ -84,8 +84,12 @@ jobs:
       - name: Check direct-runtime and LuCI contracts
         run: |
           test ! -e openwrt-rust/src/uci.rs
-          ! grep -REn 'status\("(ifup|ifdown)"|/etc/init.d/openvpn' \
-            openwrt-rust/src
+          ! grep -REn '/etc/init.d/openvpn' openwrt-rust/src
+          grep -q -- '"ifup"' openwrt-rust/src/network.rs
+          grep -q -- 'proto=none' openwrt-rust/src/network.rs
+          grep -q -- 'const MEDUZA_ZONE: &str = "meduza"' openwrt-rust/src/firewall.rs
+          grep -q -- 'forwarding_key(MEDUZA_ZONE, zone)' openwrt-rust/src/firewall.rs
+          grep -q -- 'forwarding_key(zone, MEDUZA_ZONE)' openwrt-rust/src/firewall.rs
           grep -q -- '"--daemon"' openwrt-rust/src/runtime.rs
           grep -q -- "data-tab': 'status'" \
             openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
@@ -97,6 +101,13 @@ jobs:
             openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- 'callLogRead' \
             openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- 'status.tinc_peers' \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- '"reachable".to_owned()' \
+            openwrt-rust/src/report.rs
+          ! grep -q -- 'default_postinst' openwrt-rust/package/build-direct.sh
+          grep -q -- "trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2" \
+            openwrt-rust/package/build-direct.sh
 
   binary:
     name: Static ELF ${{ matrix.asset_arch }}

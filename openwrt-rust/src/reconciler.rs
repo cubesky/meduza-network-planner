@@ -11,6 +11,7 @@ use crate::command::{Runner, command_exists};
 use crate::config::Settings;
 use crate::firewall::Firewall;
 use crate::model::{BuildOptions, FlatSnapshot, build_desired_with_options};
+use crate::network::NetworkInterfaces;
 use crate::ownership::{FrrRecord, OwnershipDb, Phase};
 use crate::render::{RenderOptions, RenderedFile, render_all_with_options};
 use crate::runtime::Runtime;
@@ -98,10 +99,12 @@ impl<R: Runner> Reconciler<R> {
         inventory = merge_inventory(&inventory, &[]);
         let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
         let firewall = Firewall::new(self.paths.clone(), self.runner.clone());
+        let network = NetworkInterfaces::new(self.paths.clone(), self.runner.clone());
         // All collision checks precede persistent file/runtime mutation.
         runtime.validate_dependencies(&desired_entries)?;
         runtime.preflight(&desired_entries, &inventory)?;
         firewall.validate_zone(settings.firewall_zone.as_deref())?;
+        network.validate(&desired_entries)?;
 
         let rendered = render_all_with_options(
             &flat,
@@ -163,8 +166,9 @@ impl<R: Runner> Reconciler<R> {
             }
         }
 
-        // VPN processes and links are owned directly by the daemon. Firewall
-        // UCI is touched only through narrow, tagged `list device` deltas.
+        // VPN processes and links remain daemon-owned. UCI receives only a
+        // minimal `proto none` status wrapper plus narrow, tagged firewall
+        // `list network` membership.
         ownership = OwnershipDb::load(&self.paths)?;
         let desired_generated: BTreeSet<_> = desired_entries
             .iter()
@@ -176,8 +180,11 @@ impl<R: Runner> Reconciler<R> {
             }
         }
 
+        network.ensure(&desired_entries)?;
         firewall.sync(settings.firewall_zone.as_deref(), &desired_entries)?;
+        network.prune(&desired_entries)?;
         runtime.activate(&desired_entries, &changed)?;
+        network.activate(&desired_entries)?;
         self.apply_frr(&frr_file)?;
 
         write_manifest(&self.paths.manifest, &desired_entries)?;
@@ -225,11 +232,15 @@ impl<R: Runner> Reconciler<R> {
         }
         let entries = read_manifest(&self.paths.manifest)?;
         let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
+        let network = NetworkInterfaces::new(self.paths.clone(), self.runner.clone());
         runtime.validate_dependencies(&entries)?;
         runtime.preflight(&entries, &[])?;
+        network.ensure(&entries)?;
         Firewall::new(self.paths.clone(), self.runner.clone())
             .sync(settings.firewall_zone.as_deref(), &entries)?;
+        network.prune(&entries)?;
         runtime.activate(&entries, &BTreeSet::new())?;
+        network.activate(&entries)?;
         self.ensure_frr_running()
     }
 
@@ -255,6 +266,11 @@ impl<R: Runner> Reconciler<R> {
         }
         if let Err(error) = Firewall::new(self.paths.clone(), self.runner.clone()).sync(None, &[]) {
             errors.push(format!("firewall membership cleanup failed: {error:#}"));
+        }
+        if let Err(error) =
+            NetworkInterfaces::new(self.paths.clone(), self.runner.clone()).prune(&[])
+        {
+            errors.push(format!("network interface cleanup failed: {error:#}"));
         }
         if let Err(error) = restore_ip_forward(&self.paths) {
             errors.push(format!("IPv4 forwarding restore failed: {error:#}"));
@@ -308,6 +324,11 @@ impl<R: Runner> Reconciler<R> {
         if let Err(error) = Firewall::new(self.paths.clone(), self.runner.clone()).sync(None, &[]) {
             errors.push(format!("firewall membership cleanup failed: {error:#}"));
         }
+        if let Err(error) =
+            NetworkInterfaces::new(self.paths.clone(), self.runner.clone()).prune(&[])
+        {
+            errors.push(format!("network interface cleanup failed: {error:#}"));
+        }
         if let Err(error) = restore_ip_forward(&self.paths) {
             errors.push(format!("IPv4 forwarding restore failed: {error:#}"));
         }
@@ -319,6 +340,7 @@ impl<R: Runner> Reconciler<R> {
             || !db.wireguard_stages.is_empty()
             || db.frr.is_some()
             || object_exists(&self.paths.firewall_state)?
+            || object_exists(&self.paths.network_state)?
         {
             bail!("purge left active ownership records; state retained for retry");
         }
@@ -340,6 +362,7 @@ impl<R: Runner> Reconciler<R> {
             self.paths.managed.join("frr.reload.pending"),
             self.paths.managed.join("uci-reload.pending"),
             self.paths.firewall_state.clone(),
+            self.paths.network_state.clone(),
             self.paths.ip_forward_marker.clone(),
         ];
         for path in &cleanup_files {
@@ -966,6 +989,7 @@ fn meduza_state_exists(paths: &Paths) -> Result<bool> {
         paths.pending_manifest.as_path(),
         paths.ownership.as_path(),
         paths.firewall_state.as_path(),
+        paths.network_state.as_path(),
         paths.reported.as_path(),
         paths.generated.as_path(),
         paths.managed.as_path(),

@@ -6,6 +6,7 @@ pub mod config;
 pub mod etcd;
 pub mod firewall;
 pub mod model;
+pub mod network;
 pub mod ownership;
 pub mod reconciler;
 pub mod render;
@@ -36,7 +37,13 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             reconciler::Reconciler::new(paths, runner).recover(&settings)
         }
         Command::RuntimeStop => reconciler::Reconciler::new(paths, runner).runtime_stop(),
-        Command::Purge => reconciler::Reconciler::new(paths, runner).purge(),
+        Command::Purge { disabled } => {
+            reconciler::Reconciler::new(paths.clone(), runner).purge()?;
+            if disabled {
+                report::persist_disabled_status(&paths, &runner)?;
+            }
+            Ok(())
+        }
         Command::Status { json } => {
             reconciler::Reconciler::new(paths.clone(), runner).migrate_layout()?;
             report::print_status(&paths, &runner, json)

@@ -23,7 +23,9 @@ start_service() {
 		return 0
 	}
 	if [ "$enable" != 1 ]; then
-		"$PROG" purge || MEDUZA_START_STATUS=$?
+		# Clean up without loading or validating etcd credentials, then publish
+		# a volatile "stopped" status for LuCI. No etcd connection is made.
+		"$PROG" purge --disabled || MEDUZA_START_STATUS=$?
 		return 0
 	fi
 

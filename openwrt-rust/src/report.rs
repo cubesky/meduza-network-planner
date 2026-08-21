@@ -11,6 +11,9 @@ use crate::state::{InterfaceKind, ManifestEntry, Paths, read_manifest, regular_f
 
 const MAX_REPORTED_FILE_BYTES: usize = 1024 * 1024;
 const MAX_DAEMON_STATUS_BYTES: usize = 64 * 1024;
+const MAX_TINC_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_TINC_DUMP_BYTES: usize = 1024 * 1024;
+const MAX_FRR_STATUS_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EtcdStatus {
@@ -43,13 +46,32 @@ pub struct InterfaceStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TincPeerStatus {
+    pub network: String,
+    pub peer: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrrPeerStatus {
+    pub protocol: String,
+    pub peer: String,
+    pub state: String,
+    pub detail: String,
+    pub remote_as: Option<u64>,
+    pub interface: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalStatus {
     pub node_id: Option<String>,
     pub observed_at: String,
     pub etcd: EtcdStatus,
     pub interfaces: BTreeMap<String, String>,
     pub interface_details: Vec<InterfaceStatus>,
+    pub tinc_peers: Vec<TincPeerStatus>,
     pub frr: String,
+    pub frr_peers: Vec<FrrPeerStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -63,7 +85,23 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
     let runtime = Runtime::new(paths.clone(), runner.clone());
     let mut interfaces = BTreeMap::new();
     let mut interface_details = Vec::new();
+    let mut tinc_peers = Vec::new();
     for entry in status_inventory(paths)? {
+        if entry.kind == InterfaceKind::Tinc {
+            match tinc_peer_states(paths, &runtime, runner, &entry) {
+                Ok(peers) => {
+                    for peer in peers {
+                        interfaces.insert(format!("tinc/{}", peer.peer), peer.state.clone());
+                        tinc_peers.push(peer);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    instance = %entry.instance,
+                    "could not inspect Tinc peer status: {error:#}"
+                ),
+            }
+            continue;
+        }
         let state = match interface_state(&runtime, runner, &entry) {
             Ok(state) => state,
             Err(error) => {
@@ -75,11 +113,7 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
                 "unavailable".into()
             }
         };
-        let name = if entry.kind == InterfaceKind::Tinc {
-            "tinc/default".to_owned()
-        } else {
-            format!("{}/{}", entry.kind.as_str(), entry.instance)
-        };
+        let name = format!("{}/{}", entry.kind.as_str(), entry.instance);
         interfaces.insert(name, state.clone());
         interface_details.push(InterfaceStatus {
             kind: entry.kind.as_str().into(),
@@ -89,14 +123,21 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
             state,
         });
     }
-    interfaces
-        .entry("tinc/default".into())
-        .or_insert_with(|| "down".into());
-    let frr = if process_name_running(&["zebra", "watchfrr"]) {
-        "up"
+    tinc_peers
+        .sort_by(|left, right| (&left.network, &left.peer).cmp(&(&right.network, &right.peer)));
+    let frr_running = process_name_running(&["zebra", "watchfrr"]);
+    let frr = if frr_running { "up" } else { "down" };
+    let frr_peers = if frr_running {
+        collect_frr_peers(runner)
     } else {
-        "down"
+        Vec::new()
     };
+    for peer in &frr_peers {
+        interfaces.insert(
+            format!("frr/{}/{}", peer.protocol, peer.peer),
+            peer.state.clone(),
+        );
+    }
     let etcd = read_etcd_status(paths)?.unwrap_or_else(|| EtcdStatus {
         version: 1,
         state: "unknown".into(),
@@ -110,8 +151,333 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
         etcd,
         interfaces,
         interface_details,
+        tinc_peers,
         frr: frr.into(),
+        frr_peers,
     })
+}
+
+fn collect_frr_peers<R: Runner>(runner: &R) -> Vec<FrrPeerStatus> {
+    let mut peers = BTreeMap::<(String, String), FrrPeerStatus>::new();
+    collect_frr_command(
+        runner,
+        "show bgp summary json",
+        parse_bgp_summary,
+        &mut peers,
+    );
+    collect_frr_command(
+        runner,
+        "show ip ospf neighbor json",
+        parse_ospf_neighbors,
+        &mut peers,
+    );
+    peers.into_values().collect()
+}
+
+fn collect_frr_command<R: Runner>(
+    runner: &R,
+    command: &str,
+    parser: fn(&[u8]) -> Result<Vec<FrrPeerStatus>>,
+    peers: &mut BTreeMap<(String, String), FrrPeerStatus>,
+) {
+    let output = match runner.output("vtysh", ["-c", command]) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::warn!(command, status = %output.status, "FRR status command failed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(command, "could not query FRR peer status: {error:#}");
+            return;
+        }
+    };
+    match parser(&output.stdout) {
+        Ok(values) => {
+            for value in values {
+                peers.insert((value.protocol.clone(), value.peer.clone()), value);
+            }
+        }
+        Err(error) => tracing::warn!(command, "could not parse FRR peer status: {error:#}"),
+    }
+}
+
+fn parse_frr_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    if bytes.len() > MAX_FRR_STATUS_BYTES {
+        bail!("FRR status response is too large");
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+fn parse_bgp_summary(bytes: &[u8]) -> Result<Vec<FrrPeerStatus>> {
+    let value = parse_frr_json(bytes)?;
+    let mut peers = BTreeMap::new();
+    walk_bgp_summary(&value, &mut peers);
+    Ok(peers.into_values().collect())
+}
+
+fn walk_bgp_summary(value: &serde_json::Value, peers: &mut BTreeMap<String, FrrPeerStatus>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::Object(values)) = object.get("peers") {
+                for (peer, data) in values {
+                    let Some(data) = data.as_object() else {
+                        continue;
+                    };
+                    let detail = json_string(data, &["state", "peerState"])
+                        .unwrap_or_else(|| "Unknown".into());
+                    let state = normalize_bgp_state(&detail).into();
+                    peers.insert(
+                        peer.clone(),
+                        FrrPeerStatus {
+                            protocol: "bgp".into(),
+                            peer: peer.clone(),
+                            state,
+                            detail,
+                            remote_as: data.get("remoteAs").and_then(serde_json::Value::as_u64),
+                            interface: None,
+                        },
+                    );
+                }
+            }
+            for child in object.values() {
+                walk_bgp_summary(child, peers);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                walk_bgp_summary(child, peers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_ospf_neighbors(bytes: &[u8]) -> Result<Vec<FrrPeerStatus>> {
+    let value = parse_frr_json(bytes)?;
+    let mut peers = BTreeMap::new();
+    walk_ospf_neighbors(&value, &mut peers);
+    Ok(peers.into_values().collect())
+}
+
+fn walk_ospf_neighbors(value: &serde_json::Value, peers: &mut BTreeMap<String, FrrPeerStatus>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let detail = json_string(object, &["nbrState", "neighborState"]);
+            let peer = json_string(
+                object,
+                &["neighborId", "neighborID", "routerId", "routerID"],
+            );
+            if let (Some(peer), Some(detail)) = (peer, detail) {
+                let interface = json_string(
+                    object,
+                    &["ifaceName", "interfaceName", "interface", "ifName"],
+                );
+                peers.insert(
+                    peer.clone(),
+                    FrrPeerStatus {
+                        protocol: "ospf".into(),
+                        peer,
+                        state: normalize_ospf_state(&detail).into(),
+                        detail,
+                        remote_as: None,
+                        interface,
+                    },
+                );
+            }
+            for child in object.values() {
+                walk_ospf_neighbors(child, peers);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                walk_ospf_neighbors(child, peers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn normalize_bgp_state(value: &str) -> &'static str {
+    let normalized = value.to_ascii_lowercase();
+    if normalized == "established" || normalized == "ok" {
+        "up"
+    } else if normalized.contains("idle")
+        || normalized.contains("shutdown")
+        || normalized.contains("deleted")
+    {
+        "down"
+    } else {
+        "connecting"
+    }
+}
+
+fn normalize_ospf_state(value: &str) -> &'static str {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.starts_with("full") {
+        "up"
+    } else if normalized.starts_with("down") || normalized.starts_with("attempt") {
+        "down"
+    } else {
+        "connecting"
+    }
+}
+
+fn tinc_peer_states<R: Runner>(
+    paths: &Paths,
+    runtime: &Runtime<R>,
+    runner: &R,
+    entry: &ManifestEntry,
+) -> Result<Vec<TincPeerStatus>> {
+    let directory = entry
+        .config
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Tinc config has no parent directory"))?;
+    let local_name = read_tinc_local_name(&entry.config)?;
+    let peers = read_tinc_peer_names(&directory.join("hosts"), &local_name)?;
+    if peers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let common_state = if !regular_config_exists(&entry.config)?
+        || !runtime.status_interface_owned(entry)?
+        || !runtime.link_up(&entry.device)
+        || !runtime.process_running(entry)
+    {
+        Some("down")
+    } else {
+        None
+    };
+    let reachable = if common_state.is_none() {
+        let args = vec![
+            "-c".to_owned(),
+            directory.display().to_string(),
+            "-n".to_owned(),
+            entry.instance.clone(),
+            format!(
+                "--pidfile={}",
+                paths
+                    .runtime
+                    .join(format!("tinc.{}.pid", entry.instance))
+                    .display()
+            ),
+            "dump".to_owned(),
+            "reachable".to_owned(),
+            "nodes".to_owned(),
+        ];
+        match runner.output("tinc", args) {
+            Ok(output) if output.status.success() => {
+                Some(parse_reachable_tinc_nodes(&output.stdout)?)
+            }
+            Ok(_) | Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(peers
+        .into_iter()
+        .map(|peer| {
+            let state = if let Some(state) = common_state {
+                state
+            } else if let Some(reachable) = &reachable {
+                if reachable.contains(&peer) {
+                    "up"
+                } else {
+                    "down"
+                }
+            } else {
+                "unavailable"
+            };
+            TincPeerStatus {
+                network: entry.instance.clone(),
+                peer,
+                state: state.into(),
+            }
+        })
+        .collect())
+}
+
+fn read_tinc_local_name(config: &std::path::Path) -> Result<String> {
+    let bytes = atomic::read_bounded(config, MAX_TINC_CONFIG_BYTES)?;
+    let text = std::str::from_utf8(&bytes)?;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("Name") {
+            let value = value.trim();
+            validate_tinc_host_name(value)?;
+            return Ok(value.into());
+        }
+    }
+    bail!("Tinc config does not contain a valid local Name");
+}
+
+fn read_tinc_peer_names(hosts: &std::path::Path, local_name: &str) -> Result<Vec<String>> {
+    let metadata = fs::symlink_metadata(hosts)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("Tinc hosts path is not a real directory");
+    }
+    let mut peers = Vec::new();
+    for child in fs::read_dir(hosts)? {
+        let child = child?;
+        let metadata = fs::symlink_metadata(child.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("Tinc hosts directory contains a non-regular entry");
+        }
+        let name = child
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Tinc peer name is not UTF-8"))?;
+        validate_tinc_host_name(&name)?;
+        if name != local_name {
+            peers.push(name);
+        }
+    }
+    peers.sort();
+    peers.dedup();
+    Ok(peers)
+}
+
+fn parse_reachable_tinc_nodes(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    if bytes.len() > MAX_TINC_DUMP_BYTES {
+        bail!("Tinc node dump is too large");
+    }
+    let text = std::str::from_utf8(bytes)?;
+    let mut nodes = BTreeSet::new();
+    for line in text.lines() {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        validate_tinc_host_name(name)?;
+        nodes.insert(name.into());
+    }
+    Ok(nodes)
+}
+
+fn validate_tinc_host_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid Tinc host name");
+    }
+    Ok(())
 }
 
 /// A pending manifest is the best status view during reconciliation. It is
@@ -128,6 +494,26 @@ fn status_inventory(paths: &Paths) -> Result<Vec<ManifestEntry>> {
 
 pub fn persist_etcd_status(paths: &Paths, value: &EtcdStatus) -> Result<()> {
     atomic::atomic_json_bounded(&paths.daemon_status, value, MAX_DAEMON_STATUS_BYTES).map(|_| ())
+}
+
+/// Publish the state of an administratively disabled controller without
+/// loading or validating etcd credentials. This path is used after purge, so
+/// it recreates only `/var/run/meduza`; no persistent directory or cache is
+/// created. A malformed/missing NODE_ID is represented as an empty identity
+/// rather than preventing the controller from being disabled safely.
+pub fn persist_disabled_status<R: Runner>(paths: &Paths, runner: &R) -> Result<()> {
+    let node_id = match runner.output("uci", ["-q", "get", "meduza.main.NODE_ID"]) {
+        Ok(output) if output.status.success() && output.stdout.len() <= 129 => {
+            String::from_utf8(output.stdout)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| crate::config::validate_node_id(value).is_ok())
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    atomic::ensure_private_dir(&paths.runtime, 0o700)?;
+    persist_etcd_status(paths, &EtcdStatus::new("stopped", &node_id, None))
 }
 
 fn read_etcd_status(paths: &Paths) -> Result<Option<EtcdStatus>> {
@@ -157,6 +543,12 @@ pub fn print_status<R: Runner>(paths: &Paths, runner: &R, json: bool) -> Result<
             println!("{name}: {value}");
         }
         println!("frr/default: {}", status.frr);
+        for peer in status.frr_peers {
+            println!(
+                "frr/{}/{}: {} ({})",
+                peer.protocol, peer.peer, peer.state, peer.detail
+            );
+        }
     }
     Ok(())
 }
@@ -291,8 +683,24 @@ pub fn validate_status_value(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::process::Output;
+
     use super::*;
     use crate::state::write_manifest;
+
+    #[derive(Clone, Copy)]
+    struct UnavailableUci;
+
+    impl Runner for UnavailableUci {
+        fn output<I, S>(&self, _program: &str, _args: I) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            bail!("UCI unavailable")
+        }
+    }
 
     fn manifest_entry(instance: &str) -> ManifestEntry {
         ManifestEntry {
@@ -338,6 +746,22 @@ mod tests {
     }
 
     #[test]
+    fn disabled_status_needs_only_volatile_storage_and_no_valid_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+
+        persist_disabled_status(&paths, &UnavailableUci).unwrap();
+
+        let status = read_etcd_status(&paths).unwrap().unwrap();
+        assert_eq!(status.state, "stopped");
+        assert!(status.node_id.is_empty());
+        assert!(status.commit.is_none());
+        assert!(!paths.data.exists());
+        assert!(!paths.state.exists());
+        assert!(paths.daemon_status.is_file());
+    }
+
+    #[test]
     fn pending_manifest_is_visible_before_apply_commit() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(Some(temp.path()));
@@ -361,5 +785,92 @@ mod tests {
         file.set_len((MAX_REPORTED_FILE_BYTES + 1) as u64).unwrap();
 
         assert!(read_reported(&paths, "router-01").is_err());
+    }
+
+    #[test]
+    fn tinc_peer_inventory_excludes_local_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        fs::create_dir(&hosts).unwrap();
+        fs::write(hosts.join("local_node"), "local").unwrap();
+        fs::write(hosts.join("remote_b"), "remote").unwrap();
+        fs::write(hosts.join("remote_a"), "remote").unwrap();
+
+        assert_eq!(
+            read_tinc_peer_names(&hosts, "local_node").unwrap(),
+            vec!["remote_a", "remote_b"]
+        );
+    }
+
+    #[test]
+    fn tinc_reachable_dump_uses_node_name_column() {
+        let reachable = parse_reachable_tinc_nodes(
+            b"remote_a id abc at 192.0.2.1 port 655 status 001f\n\
+              remote_b id def at 192.0.2.2 port 655 status 001f\n",
+        )
+        .unwrap();
+
+        assert!(reachable.contains("remote_a"));
+        assert!(reachable.contains("remote_b"));
+        assert_eq!(reachable.len(), 2);
+    }
+
+    #[test]
+    fn tinc_local_name_is_read_from_generated_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("tinc.conf");
+        fs::write(&config, "Mode=switch\nName = local_node\n").unwrap();
+
+        assert_eq!(read_tinc_local_name(&config).unwrap(), "local_node");
+    }
+
+    #[test]
+    fn bgp_summary_reports_each_peer_and_remote_as() {
+        let peers = parse_bgp_summary(
+            br#"{
+                "ipv4Unicast": {
+                    "peers": {
+                        "10.20.0.2": { "remoteAs": 65002, "state": "Established" },
+                        "10.30.0.2": { "remoteAs": 65003, "state": "Active" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer, "10.20.0.2");
+        assert_eq!(peers[0].state, "up");
+        assert_eq!(peers[0].remote_as, Some(65002));
+        assert_eq!(peers[1].state, "connecting");
+    }
+
+    #[test]
+    fn ospf_neighbors_report_router_state_and_interface() {
+        let peers = parse_ospf_neighbors(
+            br#"{
+                "default": {
+                    "neighbors": [
+                        {
+                            "routerId": "10.255.0.2",
+                            "nbrState": "Full/DR",
+                            "ifaceName": "wg-backbone:10.30.0.1"
+                        },
+                        {
+                            "routerId": "10.255.0.3",
+                            "nbrState": "ExStart/BDR",
+                            "ifaceName": "tnc0:10.10.0.1"
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer, "10.255.0.2");
+        assert_eq!(peers[0].state, "up");
+        assert_eq!(peers[0].interface.as_deref(), Some("wg-backbone:10.30.0.1"));
+        assert_eq!(peers[1].state, "connecting");
     }
 }

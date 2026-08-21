@@ -104,6 +104,11 @@ impl Etcd {
         Ok(())
     }
 
+    pub async fn delete(&mut self, key: &str) -> Result<()> {
+        self.kv.delete(key, None).await?;
+        Ok(())
+    }
+
     pub async fn put_with_lease(&mut self, key: &str, value: &str, ttl: i64) -> Result<()> {
         let lease = self.client.lease_grant(ttl, None).await?;
         self.kv

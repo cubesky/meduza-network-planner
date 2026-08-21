@@ -412,6 +412,29 @@ Behavior:
 - Public key can be `Ed25519PublicKey` or RSA (multi-line); value is stored verbatim in hosts file.
 - Connects to peers with `address` set.
 
+Per-peer reachability is reported from the running Tinc control interface:
+
+```
+/updated/<NODE_ID>/tinc/<TINC_HOST_NAME>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
+```
+
+`up` means the remote node is present in `tinc dump reachable nodes`; `down`
+means the configured peer is currently unreachable, and `unavailable` means
+the local control interface could not be queried. The local Tinc node is not
+reported as its own peer.
+
+FRR peer state is reported separately for every peer discovered by the local
+FRR control interface:
+
+```
+/updated/<NODE_ID>/frr/bgp/<PEER_ADDRESS>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
+/updated/<NODE_ID>/frr/ospf/<ROUTER_ID>/status = "<state> <YYYY-MM-DDTHH:mm:ss+0000>"
+```
+
+The LuCI routing tab also displays the native FRR neighbor state, BGP remote
+AS, and OSPF interface. The existing `/frr/default/status` key remains the
+overall FRR process state.
+
 ## Clash
 
 Global subscriptions (shared, so updates are consistent):

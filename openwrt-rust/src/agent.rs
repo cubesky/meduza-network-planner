@@ -36,7 +36,14 @@ impl<R: Runner> Agent<R> {
 
     pub async fn serve(mut self) -> Result<()> {
         if !self.settings.enabled {
-            Reconciler::new(self.paths, self.runner).purge()?;
+            Reconciler::new(self.paths.clone(), self.runner.clone()).purge()?;
+            // Purge intentionally removes the runtime directory and its old
+            // connection record. Recreate only the volatile status parent so
+            // LuCI can distinguish an administratively disabled controller
+            // from an unknown or crashed one. No etcd connection is made.
+            crate::atomic::ensure_private_dir(&self.paths.runtime, 0o700)?;
+            self.commit = None;
+            self.persist_etcd_state("stopped");
             return Ok(());
         }
         Reconciler::new(self.paths.clone(), self.runner.clone()).prepare()?;
@@ -301,7 +308,7 @@ impl<R: Runner> Agent<R> {
                     &format!("{state} {}", status.observed_at),
                 )
                 .await?;
-            if matches!(kind, "openvpn" | "wireguard") {
+            if matches!(kind, "openvpn" | "wireguard" | "tinc" | "frr") {
                 current.push((kind.to_owned(), name.to_owned()));
             }
         }
@@ -315,6 +322,17 @@ impl<R: Runner> Agent<R> {
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        // Early Rust builds reported one synthetic Tinc instance. Remove that
+        // compatibility key once real per-peer reporting is available, unless
+        // a peer is genuinely named "default".
+        if !current_set.contains(&("tinc".into(), "default".into())) {
+            client
+                .delete(&format!(
+                    "/updated/{}/tinc/default/status",
+                    self.settings.node_id
+                ))
+                .await?;
+        }
         for (kind, name) in
             report::read_reported(&self.paths, &self.settings.node_id)?.difference(&current_set)
         {

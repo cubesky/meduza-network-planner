@@ -40,15 +40,21 @@ routed OpenWrt side gateway:
 - create and operate Meduza-owned tinc, OpenVPN and WireGuard instances;
 - generate and activate FRR OSPF/BGP configuration;
 - directly create, configure and remove only its own Linux VPN interfaces;
+- publish a minimal `proto none`, `auto 0` UCI network description for every
+  daemon-owned VPN so netifd and LuCI can represent its status;
 - publish node, service and tunnel status under `/updated/<NODE_ID>/`;
 - retain a durable last-known-good state and recover interrupted work after a
   reboot or power loss.
 
-VPN instances are not represented by `network` or `openvpn` UCI sections and
-reconciliation never calls `ifup`/`ifdown`. When `VPN_FIREWALL_ZONE` is set,
-Meduza makes narrow, tagged changes only to that firewall zone's `device` list;
-it never rewrites the list or changes zone policy, forwarding, NAT or network
-membership. It must not take ownership of an administrator's Linux interface,
+VPN daemons are not started by netifd/procd; the Rust daemon owns their full
+lifecycle. Their generated `network.<logical>` sections use `proto none` and
+only bind netifd status to the already-created Linux device. When
+`VPN_FIREWALL_ZONE` is set, Meduza puts those logical interfaces in a dedicated
+`meduza` zone and creates bidirectional forwarding between `meduza` and the
+selected existing zone. If the `meduza` zone or either matching forwarding
+already exists, it is reused without being adopted. Meduza never changes the
+selected zone's policy or NAT. It must not take ownership of an administrator's UCI
+section, Linux interface,
 VPN process, configuration file, existing firewall member, or OpenClash's
 `utun` device.
 
@@ -139,13 +145,16 @@ administrator does not have to re-enter connection settings:
 | `ETCD_KEY` | Optional client private-key path |
 | `ETCD_USER` | Optional etcd username |
 | `ETCD_PASS` | Optional etcd password |
-| `VPN_FIREWALL_ZONE` | Optional firewall zone for every managed Tinc/OpenVPN/WireGuard device |
+| `VPN_FIREWALL_ZONE` | Existing firewall zone connected bidirectionally to the dedicated `meduza` zone |
 
 When the package is installed with LuCI, open **Services → Meduza** to edit
 these values. The page masks `ETCD_PASS`, but UCI still stores the value in the
 root-readable `/etc/config/meduza` file. The first tab shows etcd,
-OpenVPN/WireGuard and filtered Meduza logs; the second shows Tinc and FRR; the
-third contains these settings and certificate paths.
+OpenVPN/WireGuard and filtered Meduza logs; the second shows each remote Tinc
+peer's live reachability plus individual BGP/OSPF neighbor state from FRR; the
+third contains these settings and certificate paths. Disabling the controller
+performs owner-aware cleanup without contacting etcd and leaves a volatile
+`Not connected` status for the page.
 
 Example configuration:
 
@@ -156,7 +165,7 @@ uci set meduza.main.ETCD_ENDPOINTS='https://etcd.example.net:2379'
 uci set meduza.main.ETCD_CA='/etc/meduza/pki/ca.crt'
 uci set meduza.main.ETCD_CERT='/etc/meduza/pki/client.crt'
 uci set meduza.main.ETCD_KEY='/etc/meduza/pki/client.key'
-uci set meduza.main.VPN_FIREWALL_ZONE='vpn'
+uci set meduza.main.VPN_FIREWALL_ZONE='lan'
 uci commit meduza
 ```
 
@@ -172,20 +181,28 @@ daemons, routing daemon, or the kernel. Install the native packages for
 the enabled features from the router firmware's own feed. Package names vary by
 vendor, but commonly include:
 
-- core integration: `uci`, `ubus`, `rpcd`, `luci-base`, procd and a usable
-  `ip` (`uci` stores controller settings and the optional narrow firewall
-  membership; `ubus`/`rpcd`/`luci-base` serve the web UI);
-- tinc: `tinc` providing `tincd`;
+- core integration: `netifd`, `uci`, `ubus`, `rpcd`, `luci-base`, procd and a usable
+  `ip` (`uci` stores controller settings, minimal VPN interface descriptions,
+  and optional narrow firewall membership; `ubus`/`rpcd`/`luci-base` serve the
+  web UI);
+- tinc 1.1 providing both `tincd` and the `tinc` control command used for
+  per-peer reachability;
 - OpenVPN: `openvpn-openssl` or a compatible vendor OpenVPN build;
 - WireGuard: `wireguard-tools` providing `wg`;
 - routing: `frr` providing `vtysh` and the required OSPF/BGP daemons.
 
-Firewall policy remains outside daemon ownership. The optional firewall-zone
-setting only adds each stable VPN device name as a `list device` member. Meduza
-records whether a member was already present, never deletes borrowed members,
-and removes only its exact tagged additions when the zone changes, the daemon
-stops, or `purge` runs. OpenClash members and all other zone configuration are
-preserved.
+The optional firewall-zone setting names an existing interconnect zone, such as
+`lan`; it must not be `meduza`. Meduza places every stable VPN logical interface
+in a dedicated `meduza` zone and ensures `meduza -> <selected>` plus
+`<selected> -> meduza` forwarding. A missing `meduza` zone is created with
+`input`, `output` and `forward` set to `ACCEPT`. An existing `meduza` zone,
+matching forwarding or membership is borrowed as-is and never deleted. Meduza
+removes only forwarding and membership objects carrying its exact external
+ownership record and nonce when the setting changes, the daemon stops, or
+`purge` runs. An automatically created `meduza` zone is retained after its
+ownership markers are released, so administrator additions cannot be lost and
+the next start reuses it. OpenClash members, the selected zone's policy, NAT and
+every unrelated firewall object are preserved.
 
 WireGuard kernel support must come from the running firmware. If a separate
 `kmod-wireguard` package is required, it must match that firmware's exact kernel

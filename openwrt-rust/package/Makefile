@@ -21,13 +21,14 @@ define Package/meduza-openwrt-rust
   TITLE:=Meduza OpenWrt VPN reconciler (Rust)
   URL:=https://github.com/cubesky/meduza-network-planner
   PKGARCH:=$(ARCH_PACKAGES)
-  DEPENDS:=+ca-bundle +ip-full +rpcd +ubus +uci +luci-base
+  DEPENDS:=+ca-bundle +ip-full +netifd +rpcd +ubus +uci +luci-base
   CONFLICTS:=meduza-openwrt-lite
 endef
 
 define Package/meduza-openwrt-rust/description
  A statically linked Rust controller which directly owns Meduza's tinc,
- OpenVPN, WireGuard interfaces and FRR configuration without VPN UCI sections.
+ OpenVPN, WireGuard interfaces and FRR configuration, with minimal proto-none
+ UCI interfaces for netifd/LuCI status and a dedicated Meduza firewall zone.
 endef
 
 define Package/meduza-openwrt-rust/conffiles

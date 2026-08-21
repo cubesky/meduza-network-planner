@@ -29,6 +29,7 @@ pub struct Paths {
     pub pending_manifest: PathBuf,
     pub ownership: PathBuf,
     pub firewall_state: PathBuf,
+    pub network_state: PathBuf,
     pub reported: PathBuf,
     pub daemon_status: PathBuf,
     pub lock: PathBuf,
@@ -58,6 +59,7 @@ impl Paths {
             pending_manifest: managed.join("interfaces.pending"),
             ownership: managed.join("ownership.json"),
             firewall_state: managed.join("firewall.json"),
+            network_state: managed.join("network.json"),
             reported: managed.join("reported.json"),
             runtime,
             daemon_status: atomic::rooted(root, "/var/run/meduza/status.json"),
@@ -204,6 +206,7 @@ impl Paths {
         legacy.pending_manifest = legacy.managed.join("interfaces.pending");
         legacy.ownership = legacy.managed.join("ownership.json");
         legacy.firewall_state = legacy.managed.join("firewall.json");
+        legacy.network_state = legacy.managed.join("network.json");
         legacy.reported = legacy.managed.join("reported.json");
         legacy.generated = self.data.join("generated");
         legacy
@@ -288,6 +291,7 @@ fn validate_legacy_managed_dir(path: &Path) -> Result<()> {
         "interfaces.pending",
         "ownership.json",
         "firewall.json",
+        "network.json",
         "reported.json",
         "frr.conf.backup",
         "frr.pending.conf",
