@@ -408,7 +408,11 @@ impl<R: Runner> Firewall<R> {
     fn uci_private(&self, savedir: &Path, operation: &str, expression: &str) -> Result<()> {
         let savedir = savedir.to_string_lossy().into_owned();
         self.runner
-            .status("uci", ["-q", "-P", savedir.as_str(), operation, expression])
+            // `uci -P` also sets CLI_FLAG_NOCOMMIT, so `uci -P ... commit`
+            // returns success without writing /etc/config. `-t` selects an
+            // isolated delta save directory while retaining real commit
+            // semantics.
+            .status("uci", ["-q", "-t", savedir.as_str(), operation, expression])
     }
 
     fn reset_savedir(&self) -> Result<PathBuf> {
@@ -603,7 +607,7 @@ mod tests {
             }
             assert_eq!(args.len(), 5);
             assert_eq!(args[0], "-q");
-            assert_eq!(args[1], "-P");
+            assert_eq!(args[1], "-t");
             let operation = args[3].as_str();
             let expression = args[4].as_str();
             match operation {
