@@ -1,1 +1,3 @@
 __pycache__/
+/openwrt-rust/target/
+/openwrt-rust/target-root/

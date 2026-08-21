@@ -1,0 +1,117 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/meduza-openwrt
+MEDUZA_START_STATUS=0
+
+extra_command "purge" "Stop Meduza and remove all owner-marked resources"
+extra_command "recover" "Replay or roll back an interrupted transaction"
+extra_command "doctor" "Check configuration and native runtime dependencies"
+extra_command "status_json" "Print detailed Meduza status as JSON"
+
+start_service() {
+	local enable
+	MEDUZA_START_STATUS=0
+	config_load meduza
+	config_get_bool enable main enable 0
+	[ -x "$PROG" ] || {
+		logger -t meduza "cannot start: $PROG is missing or not executable"
+		MEDUZA_START_STATUS=1
+		return 0
+	}
+	if [ "$enable" != 1 ]; then
+		"$PROG" purge || MEDUZA_START_STATUS=$?
+		return 0
+	fi
+
+	procd_open_instance main
+	procd_set_param command "$PROG" daemon
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param term_timeout 30
+	procd_set_param limits core="0"
+	procd_close_instance
+}
+
+service_started() {
+	[ "${MEDUZA_START_STATUS:-0}" -eq 0 ] || return "$MEDUZA_START_STATUS"
+}
+
+service_triggers() {
+	procd_add_reload_trigger meduza
+}
+
+reload_service() {
+	# A restart also causes startup recovery to run before a new etcd snapshot is
+	# accepted.  It therefore remains safe if power was lost during the reload.
+	restart
+}
+
+restart() {
+	stop || return 1
+	start
+}
+
+service_stopped() {
+	# procd calls this after the supervised process is gone, so cleanup cannot
+	# race an in-flight reconcile.  Persistent LKG and ownership remain intact.
+	"$PROG" runtime-stop
+}
+
+purge() {
+	stop || return 1
+	"$PROG" purge
+}
+
+recover() {
+	stop || return 1
+	"$PROG" recover
+}
+
+doctor() {
+	"$PROG" doctor
+}
+
+status_json() {
+	"$PROG" status --json
+}
+
+meduza_rc_link_owned() {
+	local path=$1 target
+	[ -L "$path" ] || return 1
+	target=$(readlink "$path") || return 1
+	[ "$target" = "../init.d/meduza" ] || [ "$target" = "/etc/init.d/meduza" ]
+}
+
+meduza_validate_rc_link() {
+	local path=$1
+	[ ! -e "$path" ] && [ ! -L "$path" ] && return 0
+	meduza_rc_link_owned "$path" || {
+		logger -t meduza "refusing to replace foreign rc.d entry: $path"
+		return 1
+	}
+}
+
+enable() {
+	local s=/etc/rc.d/S95meduza k=/etc/rc.d/K10meduza
+	meduza_validate_rc_link "$s" || return 1
+	meduza_validate_rc_link "$k" || return 1
+	[ -L "$s" ] || ln -s ../init.d/meduza "$s" || return 1
+	[ -L "$k" ] || ln -s ../init.d/meduza "$k" || return 1
+}
+
+disable() {
+	local s=/etc/rc.d/S95meduza k=/etc/rc.d/K10meduza
+	meduza_validate_rc_link "$s" || return 1
+	meduza_validate_rc_link "$k" || return 1
+	[ ! -L "$s" ] || rm -f "$s" || return 1
+	[ ! -L "$k" ] || rm -f "$k" || return 1
+}
+
+enabled() {
+	meduza_rc_link_owned /etc/rc.d/S95meduza
+}

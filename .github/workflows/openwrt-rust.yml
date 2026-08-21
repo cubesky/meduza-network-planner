@@ -1,0 +1,438 @@
+name: build-openwrt-rust
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+    paths:
+      - "openwrt-rust/**"
+      - ".github/workflows/openwrt-rust.yml"
+  pull_request:
+    paths:
+      - "openwrt-rust/**"
+      - ".github/workflows/openwrt-rust.yml"
+  workflow_dispatch:
+    inputs:
+      ipk_release:
+        description: OpenWrt release used to package IPK
+        required: true
+        default: "24.10.0"
+        type: string
+      apk_release:
+        description: OpenWrt release used to package APK
+        required: true
+        default: "25.12.2"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: "1.90.0"
+  # The static ELF is independent of OpenWrt user-space libraries.  The newer
+  # SDK is used solely as a known musl cross toolchain for the two Rust builds.
+  BINARY_SDK_RELEASE: "25.12.2"
+  DOWNLOAD_DIR: ${{ github.workspace }}/.openwrt-downloads
+
+jobs:
+  test:
+    name: Rust tests and package checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler
+          rustup toolchain install "${RUST_VERSION}" --profile minimal \
+            --component clippy --component rustfmt
+
+      - name: Check formatting
+        working-directory: openwrt-rust
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        working-directory: openwrt-rust
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run unit and integration tests
+        working-directory: openwrt-rust
+        run: cargo test --locked --all-features
+
+      - name: Check OpenWrt package scripts
+        run: |
+          sh -n openwrt-rust/package/files/etc/init.d/meduza
+          python3 -m json.tool \
+            openwrt-rust/package/files/usr/share/luci/menu.d/meduza.json \
+            >/dev/null
+          python3 -m json.tool \
+            openwrt-rust/package/files/usr/share/rpcd/acl.d/meduza.json \
+            >/dev/null
+          node --check \
+            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+
+  binary:
+    name: Static ELF ${{ matrix.asset_arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_arch: aarch64
+            rust_target: aarch64-unknown-linux-musl
+            openwrt_target: armsr
+            openwrt_subtarget: armv8
+            elf_machine: AArch64
+          - asset_arch: x86_64
+            rust_target: x86_64-unknown-linux-musl
+            openwrt_target: x86
+            openwrt_subtarget: "64"
+            elf_machine: Advanced Micro Devices X86-64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host and Rust target dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential binutils curl file make protobuf-compiler \
+            qemu-user-static xz-utils zstd
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup target add --toolchain "${RUST_VERSION}" "${{ matrix.rust_target }}"
+
+      - name: Cache OpenWrt SDK archive and Cargo data
+        uses: actions/cache@v4
+        with:
+          path: |
+            .openwrt-downloads
+            ~/.cargo/registry
+            ~/.cargo/git
+            openwrt-rust/target
+          key: rust-openwrt-${{ env.BINARY_SDK_RELEASE }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}-${{ hashFiles('openwrt-rust/Cargo.lock') }}
+
+      - name: Download and verify OpenWrt SDK
+        shell: bash
+        env:
+          OPENWRT_RELEASE: ${{ env.BINARY_SDK_RELEASE }}
+          OPENWRT_TARGET: ${{ matrix.openwrt_target }}
+          OPENWRT_SUBTARGET: ${{ matrix.openwrt_subtarget }}
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+          mkdir -p "${DOWNLOAD_DIR}"
+          sdk_name="$(curl --fail --silent --show-error --location "${base}/" \
+            | grep -oE 'openwrt-sdk-[^" ]+\.tar\.(zst|xz)' \
+            | sort -u | head -n 1)"
+          test -n "${sdk_name}"
+          sdk_archive="${DOWNLOAD_DIR}/${sdk_name}"
+          if [ ! -s "${sdk_archive}" ]; then
+            curl --fail --show-error --location --retry 3 \
+              --output "${sdk_archive}" "${base}/${sdk_name}"
+          fi
+          curl --fail --show-error --location --retry 3 \
+            --output "${DOWNLOAD_DIR}/sha256sums-${OPENWRT_RELEASE}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}" \
+            "${base}/sha256sums"
+          sums="${DOWNLOAD_DIR}/sha256sums-${OPENWRT_RELEASE}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}"
+          expected="$(awk -v name="${sdk_name}" '
+            {
+              file=$2
+              if (substr(file, 1, 1) == "*") file=substr(file, 2)
+              if (substr(file, 1, 2) == "./") file=substr(file, 3)
+              if (file == name) { print $1; exit }
+            }
+          ' "${sums}")"
+          test -n "${expected}"
+          printf '%s  %s\n' "${expected}" "${sdk_archive}" | sha256sum --check
+          mkdir -p openwrt-sdk
+          tar --extract --file "${sdk_archive}" --directory openwrt-sdk --strip-components=1
+
+      - name: Build the static Rust executable
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          cc="$(find openwrt-sdk/staging_dir \
+            \( -type f -o -type l \) \
+            -path '*/bin/*-openwrt-linux-musl*-gcc' -print -quit)"
+          test -x "${cc}"
+          cc="$(realpath "${cc}")"
+          tool_prefix="${cc%-gcc}"
+          ar="${tool_prefix}-gcc-ar"
+          test -x "${ar}"
+          ar="$(realpath "${ar}")"
+
+          target_key="$(printf '%s' "${RUST_TARGET}" | tr '[:lower:]-' '[:upper:]_')"
+          target_suffix="$(printf '%s' "${RUST_TARGET}" | tr '-' '_')"
+          export "CARGO_TARGET_${target_key}_LINKER=${cc}"
+          export "CARGO_TARGET_${target_key}_RUSTFLAGS=-C target-feature=+crt-static -C target-cpu=generic -C link-arg=-static"
+          export "CC_${target_suffix}=${cc}"
+          export "AR_${target_suffix}=${ar}"
+          export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+          cargo +"${RUST_VERSION}" build --manifest-path openwrt-rust/Cargo.toml \
+            --locked --release --target "${RUST_TARGET}"
+
+      - name: Prove the artifact is the expected static ELF
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          ELF_MACHINE: ${{ matrix.elf_machine }}
+        run: |
+          set -euo pipefail
+          source="openwrt-rust/target/${RUST_TARGET}/release/meduza-openwrt"
+          test -x "${source}"
+          file "${source}" | grep -Eiq 'ELF .* (static|statically)'
+          readelf --file-header "${source}" \
+            | grep -Eq "^[[:space:]]*Machine:[[:space:]]+${ELF_MACHINE}$"
+          if readelf --program-headers "${source}" | grep -q 'INTERP'; then
+            echo 'static ELF unexpectedly contains a program interpreter' >&2
+            exit 1
+          fi
+          if readelf --dynamic "${source}" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo 'static ELF unexpectedly contains a shared-library dependency' >&2
+            exit 1
+          fi
+          case "${ASSET_ARCH}" in
+            x86_64) "${source}" --version ;;
+            aarch64) qemu-aarch64-static "${source}" --version ;;
+            *) exit 1 ;;
+          esac
+          mkdir -p build-artifact
+          destination="build-artifact/meduza-openwrt-linux-${ASSET_ARCH}"
+          cp "${source}" "${destination}"
+          chmod 755 "${destination}"
+          sha256sum "${destination}" >"${destination}.sha256"
+
+      - name: Upload architecture-specific executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-rust-bin-${{ matrix.asset_arch }}
+          path: build-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: OpenWrt ${{ matrix.release }} ${{ matrix.format }} ${{ matrix.asset_arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: ipk
+            release: ${{ inputs.ipk_release || '24.10.0' }}
+            openwrt_target: armsr
+            openwrt_subtarget: armv8
+            asset_arch: aarch64
+          - format: ipk
+            release: ${{ inputs.ipk_release || '24.10.0' }}
+            openwrt_target: x86
+            openwrt_subtarget: "64"
+            asset_arch: x86_64
+          - format: apk
+            release: ${{ inputs.apk_release || '25.12.2' }}
+            openwrt_target: armsr
+            openwrt_subtarget: armv8
+            asset_arch: aarch64
+          - format: apk
+            release: ${{ inputs.apk_release || '25.12.2' }}
+            openwrt_target: x86
+            openwrt_subtarget: "64"
+            asset_arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the verified static executable
+        uses: actions/download-artifact@v4
+        with:
+          name: meduza-openwrt-rust-bin-${{ matrix.asset_arch }}
+          path: binary
+
+      - name: Install SDK host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential curl file gawk gettext git libncurses-dev make \
+            rsync unzip xz-utils zlib1g-dev zstd
+
+      - name: Cache OpenWrt SDK archive and downloads
+        uses: actions/cache@v4
+        with:
+          path: .openwrt-downloads
+          key: package-openwrt-${{ matrix.release }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}
+
+      - name: Download and verify OpenWrt SDK
+        shell: bash
+        env:
+          OPENWRT_RELEASE: ${{ matrix.release }}
+          OPENWRT_TARGET: ${{ matrix.openwrt_target }}
+          OPENWRT_SUBTARGET: ${{ matrix.openwrt_subtarget }}
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+          mkdir -p "${DOWNLOAD_DIR}"
+          sdk_name="$(curl --fail --silent --show-error --location "${base}/" \
+            | grep -oE 'openwrt-sdk-[^" ]+\.tar\.(zst|xz)' \
+            | sort -u | head -n 1)"
+          test -n "${sdk_name}"
+          sdk_archive="${DOWNLOAD_DIR}/${sdk_name}"
+          if [ ! -s "${sdk_archive}" ]; then
+            curl --fail --show-error --location --retry 3 \
+              --output "${sdk_archive}" "${base}/${sdk_name}"
+          fi
+          sums="${DOWNLOAD_DIR}/sha256sums-${OPENWRT_RELEASE}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}"
+          curl --fail --show-error --location --retry 3 --output "${sums}" "${base}/sha256sums"
+          expected="$(awk -v name="${sdk_name}" '
+            {
+              file=$2
+              if (substr(file, 1, 1) == "*") file=substr(file, 2)
+              if (substr(file, 1, 2) == "./") file=substr(file, 3)
+              if (file == name) { print $1; exit }
+            }
+          ' "${sums}")"
+          test -n "${expected}"
+          printf '%s  %s\n' "${expected}" "${sdk_archive}" | sha256sum --check
+          mkdir -p openwrt-sdk
+          tar --extract --file "${sdk_archive}" --directory openwrt-sdk --strip-components=1
+
+      - name: Install and compile the package definition
+        shell: bash
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+          package_dir=openwrt-sdk/package/meduza-openwrt-rust
+          cp -a openwrt-rust/package "${package_dir}"
+          mkdir -p "${package_dir}/prebuilt"
+          cp "binary/meduza-openwrt-linux-${ASSET_ARCH}" \
+            "${package_dir}/prebuilt/meduza-openwrt"
+          chmod 755 "${package_dir}/prebuilt/meduza-openwrt"
+          export MEDUZA_PKG_RELEASE="${GITHUB_RUN_NUMBER}"
+          printf '%s\n' 'CONFIG_PACKAGE_meduza-openwrt-rust=m' >openwrt-sdk/.config
+          make -C openwrt-sdk defconfig
+          set -o pipefail
+          mkdir -p build-artifact
+          make -C openwrt-sdk package/meduza-openwrt-rust/compile \
+            -j"$(nproc)" V=s 2>&1 | tee build-artifact/build.log
+          if grep -Eq -- '--info[[:space:]]+"?arch:noarch"?' build-artifact/build.log; then
+            echo 'native Rust package was incorrectly tagged noarch' >&2
+            exit 1
+          fi
+
+      - name: Collect the architecture-specific package
+        shell: bash
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          PACKAGE_FORMAT: ${{ matrix.format }}
+          OPENWRT_RELEASE: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          case "${PACKAGE_FORMAT}" in
+            ipk) pattern='meduza-openwrt-rust_*.ipk' ;;
+            apk) pattern='meduza-openwrt-rust-*.apk' ;;
+            *) exit 1 ;;
+          esac
+          mapfile -t found < <(find openwrt-sdk/bin -type f -name "${pattern}" -print)
+          test "${#found[@]}" -eq 1
+          release_date="$(date -u +%Y%m%d)"
+          short_hash="${GITHUB_SHA:0:7}"
+          output="build-artifact/meduza-openwrt-rust-${release_date}-${short_hash}-${ASSET_ARCH}.${PACKAGE_FORMAT}"
+          cp "${found[0]}" "${output}"
+          sha256sum "${output}" >"${output}.sha256"
+          printf '%s\n' \
+            "OpenWrt release: ${OPENWRT_RELEASE}" \
+            "Package format: ${PACKAGE_FORMAT}" \
+            "CPU architecture: ${ASSET_ARCH}" \
+            "Package release: ${GITHUB_RUN_NUMBER}" \
+            "Commit: ${GITHUB_SHA}" >build-artifact/BUILD-INFO.txt
+
+      - name: Upload OpenWrt package
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-rust-pkg-${{ matrix.format }}-${{ matrix.asset_arch }}
+          path: |
+            build-artifact/*.${{ matrix.format }}
+            build-artifact/*.${{ matrix.format }}.sha256
+            build-artifact/BUILD-INFO.txt
+            build-artifact/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+  bundle:
+    name: Assemble two-architecture release bundle
+    runs-on: ubuntu-24.04
+    needs: package
+    steps:
+      - name: Download the two static executables
+        uses: actions/download-artifact@v4
+        with:
+          pattern: meduza-openwrt-rust-bin-*
+          path: release-assets/bin
+          merge-multiple: true
+
+      - name: Download APK and IPK packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: meduza-openwrt-rust-pkg-*
+          path: release-assets/packages
+          merge-multiple: false
+
+      - name: Validate and checksum release contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f release-assets/bin/*.sha256
+          test -f release-assets/bin/meduza-openwrt-linux-aarch64
+          test -f release-assets/bin/meduza-openwrt-linux-x86_64
+          test "$(find release-assets/bin -maxdepth 1 -type f -name 'meduza-openwrt-linux-*' | wc -l)" -eq 2
+          test "$(find release-assets/packages -type f -name '*.ipk' | wc -l)" -eq 2
+          test "$(find release-assets/packages -type f -name '*.apk' | wc -l)" -eq 2
+          find release-assets -type f \( -name 'meduza-openwrt-linux-*' -o -name '*.ipk' -o -name '*.apk' \) \
+            -print0 | sort -z | while IFS= read -r -d '' asset; do
+              digest="$(sha256sum "${asset}" | awk '{print $1}')"
+              printf '%s  %s\n' "${digest}" "$(basename "${asset}")"
+            done >release-assets/SHA256SUMS
+
+      - name: Upload complete release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: meduza-openwrt-rust-release
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_date="$(date -u +%Y%m%d)"
+          short_hash="${GITHUB_SHA:0:7}"
+          release_tag="meduza-openwrt-rust-${release_date}-${short_hash}"
+          if ! gh release view "${release_tag}" >/dev/null 2>&1; then
+            gh release create "${release_tag}" --target "${GITHUB_SHA}" \
+              --title "${release_date}-${short_hash}" \
+              --notes 'Two static Rust executables plus OpenWrt APK/IPK packages for aarch64 and x86_64.'
+          fi
+          mapfile -d '' assets < <(find release-assets -type f \
+            \( -name 'meduza-openwrt-linux-*' -o -name '*.ipk' -o -name '*.apk' -o -name 'SHA256SUMS' \) \
+            -print0)
+          gh release upload "${release_tag}" --clobber "${assets[@]}"
