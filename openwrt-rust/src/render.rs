@@ -37,9 +37,6 @@ impl RenderedFile {
 pub struct RenderOptions {
     pub owner: String,
     pub frr_path: PathBuf,
-    /// The option is only emitted for a static-key configuration when the
-    /// caller has detected it in `openvpn --help`.
-    pub openvpn_static_compat: bool,
 }
 
 impl Default for RenderOptions {
@@ -47,7 +44,6 @@ impl Default for RenderOptions {
         Self {
             owner: DEFAULT_OWNER.to_owned(),
             frr_path: PathBuf::from(DEFAULT_FRR_PATH),
-            openvpn_static_compat: false,
         }
     }
 }
@@ -390,7 +386,15 @@ fn render_openvpn(
     writeln!(config, "setenv MEDUZA_INSTANCE {}", interface.instance)?;
     writeln!(config, "script-security 2")?;
     writeln!(config, "up {}", path_text(&link_up_path)?)?;
-    if present_secrets.contains("secret") && options.openvpn_static_compat {
+    if present_secrets.contains("secret") {
+        // OpenVPN 2.7 refuses static-key mode unless this compatibility
+        // switch is present. OpenVPN 2.3.3 through 2.6 understand
+        // ignore-unknown-option, so one configuration remains usable across
+        // both supported OpenWrt generations.
+        writeln!(
+            config,
+            "ignore-unknown-option allow-deprecated-insecure-static-crypto"
+        )?;
         writeln!(config, "allow-deprecated-insecure-static-crypto")?;
     }
 
@@ -1022,10 +1026,7 @@ mod tests {
     fn renders_three_vpns_and_frr_without_writing_disk() {
         let snapshot = comprehensive_snapshot();
         let desired = build_desired(&snapshot).unwrap();
-        let options = RenderOptions {
-            openvpn_static_compat: true,
-            ..RenderOptions::default()
-        };
+        let options = RenderOptions::default();
         let files = render_all_with_options(&snapshot, &desired, &options).unwrap();
 
         let tinc = find(&files, "/tinc/mesh/tinc.conf").text().unwrap();
@@ -1034,6 +1035,7 @@ mod tests {
         assert_eq!(find(&files, "/tinc/mesh/rsa_key.priv").mode, 0o600);
 
         let openvpn = find(&files, "/openvpn/office/openvpn.conf").text().unwrap();
+        assert!(openvpn.contains("ignore-unknown-option allow-deprecated-insecure-static-crypto"));
         assert!(openvpn.contains("allow-deprecated-insecure-static-crypto"));
         assert!(openvpn.contains("remote vpn-a.example 1194"));
         assert!(openvpn.contains("route-nopull"));
@@ -1051,6 +1053,28 @@ mod tests {
         assert!(frr.contains("neighbor 10.30.0.2 update-source wg-backbone"));
         assert!(frr.contains("neighbor 10.255.0.2 remote-as internal"));
         assert!(frr.contains("network 172.16.10.0/24"));
+    }
+
+    #[test]
+    fn tls_openvpn_does_not_enable_static_key_compatibility() {
+        let mut snapshot = comprehensive_snapshot();
+        snapshot
+            .node
+            .remove("/nodes/router-01/openvpn/office/secret");
+        snapshot.node.insert(
+            "/nodes/router-01/openvpn/office/tls_client".into(),
+            "true".into(),
+        );
+        snapshot.node.insert(
+            "/nodes/router-01/openvpn/office/ca".into(),
+            "certificate-authority".into(),
+        );
+        let desired = build_desired(&snapshot).unwrap();
+        let files = render_all(&snapshot, &desired).unwrap();
+        let openvpn = find(&files, "/openvpn/office/openvpn.conf").text().unwrap();
+
+        assert!(openvpn.contains("tls-client"));
+        assert!(!openvpn.contains("allow-deprecated-insecure-static-crypto"));
     }
 
     #[test]

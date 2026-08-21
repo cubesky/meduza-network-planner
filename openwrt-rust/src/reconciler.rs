@@ -97,22 +97,12 @@ impl<R: Runner> Reconciler<R> {
         runtime.preflight(&desired_entries, &inventory)?;
         firewall.validate_zone(settings.firewall_zone.as_deref())?;
 
-        let static_compat = self
-            .runner
-            .output("openvpn", ["--help"])
-            .is_ok_and(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .contains("--allow-deprecated-insecure-static-crypto")
-                    || String::from_utf8_lossy(&output.stderr)
-                        .contains("--allow-deprecated-insecure-static-crypto")
-            });
         let rendered = render_all_with_options(
             &flat,
             &desired,
             &RenderOptions {
                 owner: OWNER.into(),
                 frr_path: self.paths.generated_frr.clone(),
-                openvpn_static_compat: static_compat,
             },
         )?;
         let (vpn_files, frr_file): (Vec<_>, Vec<_>) = rendered
