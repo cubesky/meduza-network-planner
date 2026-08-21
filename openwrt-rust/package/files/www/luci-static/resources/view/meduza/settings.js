@@ -103,7 +103,12 @@ function renderLog(entries) {
 
 return view.extend({
 	load: function() {
-		return Promise.all([ uci.load('meduza'), fetchStatus(), fetchMeduzaLog() ]);
+		return Promise.all([
+			uci.load('meduza'),
+			L.resolveDefault(uci.load('firewall'), null),
+			fetchStatus(),
+			fetchMeduzaLog()
+		]);
 	},
 
 	updateStatus: function(status) {
@@ -159,6 +164,22 @@ return view.extend({
 		o = s.option(form.Flag, 'enable', _('Enable controller'));
 		o.default = o.disabled;
 		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'VPN_FIREWALL_ZONE', _('VPN firewall zone'));
+		o.rmempty = true;
+		o.value('', _('Do not manage firewall membership'));
+		var knownZones = {};
+		uci.sections('firewall', 'zone', function(zone) {
+			var name = String(zone.name || '');
+			if (/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(name) && !knownZones[name]) {
+				knownZones[name] = true;
+				o.value(name, name);
+			}
+		});
+		var configuredZone = String(uci.get('meduza', 'main', 'VPN_FIREWALL_ZONE') || '');
+		if (configuredZone && !knownZones[configuredZone])
+			o.value(configuredZone, configuredZone + ' (' + _('missing') + ')');
+		o.description = _('All Meduza-managed Tinc, OpenVPN and WireGuard device names are added to this zone. Existing members and all zone policies remain administrator-owned.');
 
 		o = s.option(form.Value, 'NODE_ID', _('Node ID'));
 		o.rmempty = false;
@@ -224,8 +245,8 @@ return view.extend({
 			var page = E([], [ E('h2', {}, [ _('Meduza') ]), tabs ]);
 			ui.tabs.initTabGroup(tabs.childNodes);
 			window.setTimeout(L.bind(function() {
-				this.updateStatus(data[1]);
-				this.updateLog(data[2]);
+				this.updateStatus(data[2]);
+				this.updateLog(data[3]);
 			}, this), 0);
 			poll.add(L.bind(function() {
 				return Promise.all([ fetchStatus(), fetchMeduzaLog() ]).then(L.bind(function(values) {

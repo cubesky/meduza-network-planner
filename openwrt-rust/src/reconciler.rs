@@ -9,6 +9,7 @@ use crate::OWNER;
 use crate::atomic;
 use crate::command::{Runner, command_exists};
 use crate::config::Settings;
+use crate::firewall::Firewall;
 use crate::model::{BuildOptions, FlatSnapshot, build_desired_with_options};
 use crate::ownership::{FrrRecord, OwnershipDb, Phase};
 use crate::render::{RenderOptions, RenderedFile, render_all_with_options};
@@ -18,6 +19,8 @@ use crate::state::{
 };
 
 const MAX_FRR_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GENERATED_FILE_BYTES: usize = 6 * 1024 * 1024;
+const MAX_GENERATED_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SMALL_MARKER_BYTES: usize = 4096;
 
 pub struct Reconciler<R: Runner> {
@@ -44,6 +47,10 @@ impl<R: Runner> Reconciler<R> {
     /// purge entry points.
     pub fn migrate_layout(&self) -> Result<bool> {
         let _lock = ApplyLock::acquire(&self.paths)?;
+        // Status is observational: it may relocate the small persistent state
+        // journal, but must never retire a generated tree while a previous
+        // runtime could still be using it. Daemon/apply preparation performs
+        // that second migration after package upgrade has stopped the service.
         self.paths.migrate_legacy_rust_state()
     }
 
@@ -84,9 +91,11 @@ impl<R: Runner> Reconciler<R> {
         }
         inventory = merge_inventory(&inventory, &[]);
         let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
+        let firewall = Firewall::new(self.paths.clone(), self.runner.clone());
         // All collision checks precede persistent file/runtime mutation.
         runtime.validate_dependencies(&desired_entries)?;
         runtime.preflight(&desired_entries, &inventory)?;
+        firewall.validate_zone(settings.firewall_zone.as_deref())?;
 
         let static_compat = self
             .runner
@@ -102,17 +111,24 @@ impl<R: Runner> Reconciler<R> {
             &desired,
             &RenderOptions {
                 owner: OWNER.into(),
-                frr_path: self.paths.frr_config.clone(),
+                frr_path: self.paths.generated_frr.clone(),
                 openvpn_static_compat: static_compat,
             },
         )?;
         let (vpn_files, frr_file): (Vec<_>, Vec<_>) = rendered
             .into_iter()
-            .partition(|file| file.path != self.paths.frr_config);
+            .partition(|file| file.path != self.paths.generated_frr);
         let frr_file = frr_file
             .into_iter()
             .next()
             .context("FRR renderer produced no file")?;
+        validate_rendered_vpn_size(&vpn_files)?;
+        if self.paths.root.is_none()
+            && Path::new("/etc/init.d/frr").is_file()
+            && !command_exists("vtysh")
+        {
+            bail!("installed FRR runtime requires missing command: vtysh");
+        }
 
         // From here onward every persistent or runtime mutation is replayable
         // from the validated snapshot and the five-column pending journal.
@@ -151,8 +167,8 @@ impl<R: Runner> Reconciler<R> {
             }
         }
 
-        // Runtime resources are owned directly by the daemon. UCI is used
-        // only for the Meduza settings section and is never mutated here.
+        // VPN processes and links are owned directly by the daemon. Firewall
+        // UCI is touched only through narrow, tagged `list device` deltas.
         ownership = OwnershipDb::load(&self.paths)?;
         let desired_generated: BTreeSet<_> = desired_entries
             .iter()
@@ -164,8 +180,9 @@ impl<R: Runner> Reconciler<R> {
             }
         }
 
+        firewall.sync(settings.firewall_zone.as_deref(), &desired_entries)?;
         runtime.activate(&desired_entries, &changed)?;
-        self.apply_frr(&frr_file, &flat)?;
+        self.apply_frr(&frr_file)?;
 
         write_manifest(&self.paths.manifest, &desired_entries)?;
         if self.paths.pending_manifest.exists() {
@@ -203,9 +220,9 @@ impl<R: Runner> Reconciler<R> {
     /// rewriting generated configuration. This is the daemon-side supervisor
     /// for directly managed VPN processes and links, replacing netifd/procd
     /// supervision of the individual tunnel instances.
-    pub fn ensure_runtime(&self) -> Result<()> {
+    pub fn ensure_runtime(&self, settings: &Settings) -> Result<()> {
         let _lock = ApplyLock::acquire(&self.paths)?;
-        self.paths.migrate_legacy_rust_state()?;
+        self.paths.migrate_layout()?;
         let pending = read_manifest(&self.paths.pending_manifest)?;
         if !pending.is_empty() {
             bail!("an interrupted apply must be recovered before runtime supervision");
@@ -214,13 +231,15 @@ impl<R: Runner> Reconciler<R> {
         let runtime = Runtime::new(self.paths.clone(), self.runner.clone());
         runtime.validate_dependencies(&entries)?;
         runtime.preflight(&entries, &[])?;
+        Firewall::new(self.paths.clone(), self.runner.clone())
+            .sync(settings.firewall_zone.as_deref(), &entries)?;
         runtime.activate(&entries, &BTreeSet::new())?;
         self.ensure_frr_running()
     }
 
     pub fn runtime_stop(&self) -> Result<()> {
         let _lock = ApplyLock::acquire(&self.paths)?;
-        self.paths.migrate_legacy_rust_state()?;
+        self.paths.migrate_layout()?;
         self.runtime_stop_locked()
     }
 
@@ -238,6 +257,9 @@ impl<R: Runner> Reconciler<R> {
         if let Err(error) = self.restore_frr() {
             errors.push(format!("FRR restore failed: {error:#}"));
         }
+        if let Err(error) = Firewall::new(self.paths.clone(), self.runner.clone()).sync(None, &[]) {
+            errors.push(format!("firewall membership cleanup failed: {error:#}"));
+        }
         if let Err(error) = restore_ip_forward(&self.paths) {
             errors.push(format!("IPv4 forwarding restore failed: {error:#}"));
         }
@@ -250,7 +272,7 @@ impl<R: Runner> Reconciler<R> {
 
     pub fn purge(&self) -> Result<()> {
         let _lock = ApplyLock::acquire(&self.paths)?;
-        self.paths.migrate_legacy_rust_state()?;
+        self.paths.migrate_layout()?;
         self.purge_locked()
     }
 
@@ -287,6 +309,9 @@ impl<R: Runner> Reconciler<R> {
         if let Err(error) = self.restore_frr() {
             errors.push(format!("FRR restore failed: {error:#}"));
         }
+        if let Err(error) = Firewall::new(self.paths.clone(), self.runner.clone()).sync(None, &[]) {
+            errors.push(format!("firewall membership cleanup failed: {error:#}"));
+        }
         if let Err(error) = restore_ip_forward(&self.paths) {
             errors.push(format!("IPv4 forwarding restore failed: {error:#}"));
         }
@@ -294,7 +319,11 @@ impl<R: Runner> Reconciler<R> {
             bail!("{}", errors.join("; "));
         }
         let db = OwnershipDb::load(&self.paths)?;
-        if !db.generated.is_empty() || !db.wireguard_stages.is_empty() || db.frr.is_some() {
+        if !db.generated.is_empty()
+            || !db.wireguard_stages.is_empty()
+            || db.frr.is_some()
+            || object_exists(&self.paths.firewall_state)?
+        {
             bail!("purge left active ownership records; state retained for retry");
         }
 
@@ -314,6 +343,7 @@ impl<R: Runner> Reconciler<R> {
             self.paths.managed.join("frr.pending.conf"),
             self.paths.managed.join("frr.reload.pending"),
             self.paths.managed.join("uci-reload.pending"),
+            self.paths.firewall_state.clone(),
             self.paths.ip_forward_marker.clone(),
         ];
         for path in &cleanup_files {
@@ -350,175 +380,128 @@ impl<R: Runner> Reconciler<R> {
         Ok(())
     }
 
-    fn apply_frr(&self, rendered: &RenderedFile, _snapshot: &FlatSnapshot) -> Result<()> {
+    fn apply_frr(&self, rendered: &RenderedFile) -> Result<()> {
+        // Development builds before the volatile layout may have an active
+        // takeover of /etc/frr/frr.conf. Restore that transaction exactly
+        // once before the new runtime-only model is allowed to start.
+        self.restore_legacy_frr()?;
+
         if !Path::new("/etc/init.d/frr").is_file() && self.paths.root.is_none() {
+            self.restore_runtime_frr()?;
             tracing::info!("FRR is not installed; skipping FRR");
             return Ok(());
+        }
+        if rendered.path != self.paths.generated_frr {
+            bail!("FRR renderer returned an unexpected runtime path");
         }
         if rendered.contents.len() > MAX_FRR_FILE_BYTES {
             bail!("rendered FRR configuration exceeds {MAX_FRR_FILE_BYTES} byte limit");
         }
+
+        let rendered_hash = sha256(&rendered.contents);
+        if let Some(marker) = read_runtime_frr_marker(&self.paths)?
+            && marker.phase == RuntimeFrrPhase::Owned
+            && marker.sha256 == rendered_hash
+            && runtime_frr_file_matches(&self.paths, &marker.sha256)?
+            && self.frr_running()
+        {
+            return Ok(());
+        }
+
+        // Always return to the administrator's persistent FRR baseline before
+        // applying a different complete runtime generation. This prevents
+        // removed peers/networks from accumulating in the live configuration.
+        self.restore_runtime_frr()?;
         let parent = self
             .paths
-            .frr_config
+            .generated_frr
             .parent()
-            .context("FRR configuration has no parent")?;
-        atomic::confirm_dir(parent)?;
-        atomic::reject_symlink(&self.paths.frr_config)?;
-        let mut ownership = OwnershipDb::load(&self.paths)?;
-        let backup = self.paths.managed.join("frr.conf.backup");
-        let pending = self.paths.managed.join("frr.pending.conf");
-        let rendered_hash = sha256(&rendered.contents);
-
-        if ownership
-            .frr
-            .as_ref()
-            .is_some_and(|record| matches!(record.phase, Phase::Deleting | Phase::Retired))
-        {
-            self.restore_frr()?;
-            return self.apply_frr(rendered, _snapshot);
-        }
-        if ownership.frr.is_none() {
-            let current = read_frr_file(&self.paths.frr_config)?;
-            #[cfg(unix)]
-            let (parent_uid, parent_gid) = {
-                use std::os::unix::fs::MetadataExt;
-                let metadata = fs::metadata(parent)?;
-                (metadata.uid(), metadata.gid())
-            };
-            let (origin, original_sha256, backup_path, mode, uid, gid) =
-                if let Some(current) = current {
-                    (
-                        "backup".to_owned(),
-                        Some(current.sha256.clone()),
-                        Some(backup.clone()),
-                        Some(current.mode),
-                        Some(current.uid),
-                        Some(current.gid),
-                    )
-                } else {
-                    ("absent".to_owned(), None, None, None, None, None)
-                };
-            atomic::atomic_write(&pending, &rendered.contents, 0o600)?;
-            ownership.frr = Some(FrrRecord {
-                phase: Phase::Creating,
-                origin,
-                original_sha256,
-                backup: backup_path,
-                active_sha256: None,
-                pending_sha256: Some(rendered_hash.clone()),
-                original_mode: mode,
-                original_uid: uid,
-                original_gid: gid,
-                managed_mode: Some(mode.unwrap_or(0o640)),
-                #[cfg(unix)]
-                managed_uid: Some(uid.unwrap_or(parent_uid)),
-                #[cfg(not(unix))]
-                managed_uid: None,
-                #[cfg(unix)]
-                managed_gid: Some(gid.unwrap_or(parent_gid)),
-                #[cfg(not(unix))]
-                managed_gid: None,
-            });
-            ownership.save(&self.paths)?;
-        }
-
-        let record = ownership.frr.clone().context("missing FRR ownership")?;
-        if record.phase == Phase::Owned {
-            let current = read_frr_file(&self.paths.frr_config)?
-                .context("owned FRR configuration disappeared")?;
-            if !frr_has_owner(&current.bytes)
-                || record.active_sha256.as_deref() != Some(current.sha256.as_str())
-            {
-                bail!("FRR configuration ownership changed");
-            }
-            if current.sha256 == rendered_hash {
-                if pending.is_file() {
-                    atomic::durable_remove(&pending)?;
-                }
-                return Ok(());
-            }
-            atomic::atomic_write(&pending, &rendered.contents, 0o600)?;
-            let record = ownership.frr.as_mut().expect("record exists");
-            record.phase = Phase::Updating;
-            record.pending_sha256 = Some(rendered_hash.clone());
-            ownership.save(&self.paths)?;
-        } else if record.phase != Phase::Creating && record.phase != Phase::Updating {
-            bail!("invalid FRR apply phase");
-        }
-
-        self.finish_frr_apply(&mut ownership)?;
-        let active = ownership
-            .frr
-            .as_ref()
-            .and_then(|record| record.active_sha256.as_deref());
-        if active != Some(rendered_hash.as_str()) {
-            return self.apply_frr(rendered, _snapshot);
-        }
-        Ok(())
-    }
-
-    fn finish_frr_apply(&self, ownership: &mut OwnershipDb) -> Result<()> {
-        let record = ownership.frr.clone().context("missing FRR ownership")?;
-        if !matches!(record.phase, Phase::Creating | Phase::Updating) {
-            bail!("FRR is not in an apply transition");
-        }
-        let pending_path = self.paths.managed.join("frr.pending.conf");
-        let pending = atomic::read_bounded(&pending_path, MAX_FRR_FILE_BYTES)
-            .context("FRR pending content is missing")?;
-        let pending_hash = sha256(&pending);
-        if record.pending_sha256.as_deref() != Some(pending_hash.as_str()) {
-            bail!("FRR pending content hash changed");
-        }
-        ensure_frr_backup(&self.paths, &record)?;
-        let current = read_frr_file(&self.paths.frr_config)?;
-        let already_written = current
-            .as_ref()
-            .is_some_and(|value| value.sha256 == pending_hash && frr_has_owner(&value.bytes));
-        if !already_written {
-            match record.phase {
-                Phase::Creating => verify_frr_origin(&record, current.as_ref())?,
-                Phase::Updating => {
-                    let current = current.context("managed FRR configuration disappeared")?;
-                    if !frr_has_owner(&current.bytes)
-                        || record.active_sha256.as_deref() != Some(current.sha256.as_str())
-                    {
-                        bail!("FRR configuration changed during update");
-                    }
-                }
-                _ => unreachable!(),
-            }
-            write_frr_reload_marker(&self.paths, "apply", &pending_hash)?;
-            atomic::atomic_write(
-                &self.paths.frr_config,
-                &pending,
-                record.managed_mode.unwrap_or(0o640),
-            )?;
-        } else {
-            write_frr_reload_marker(&self.paths, "apply", &pending_hash)?;
-        }
-        // A crash may occur after rename but before chmod/chown. Metadata is
-        // therefore repaired on both the before- and after-image replay path.
-        apply_frr_metadata(
-            &self.paths.frr_config,
-            record.managed_mode.unwrap_or(0o640),
-            record.managed_uid,
-            record.managed_gid,
+            .context("generated FRR configuration has no parent")?;
+        atomic::ensure_private_dir(parent, 0o700)?;
+        atomic::atomic_write(&self.paths.generated_frr, &rendered.contents, rendered.mode)?;
+        write_runtime_frr_marker(
+            &self.paths,
+            &RuntimeFrrMarker {
+                phase: RuntimeFrrPhase::Applying,
+                sha256: rendered_hash.clone(),
+            },
         )?;
-        self.reload_frr()?;
-        clear_frr_reload_marker(&self.paths)?;
-        let live = ownership.frr.as_mut().expect("record exists");
-        live.phase = Phase::Owned;
-        live.active_sha256 = Some(pending_hash);
-        live.pending_sha256 = None;
-        ownership.save(&self.paths)?;
-        if pending_path.is_file() {
-            atomic::durable_remove(&pending_path)?;
+
+        let generated_path = self.paths.generated_frr.to_string_lossy().into_owned();
+        if let Err(error) = self.restart_frr_baseline().and_then(|()| {
+            self.runner
+                .status("vtysh", ["-b", "-f", generated_path.as_str()])
+        }) {
+            let rollback = self.restore_runtime_frr();
+            return match rollback {
+                Ok(()) => Err(error).context("could not apply volatile FRR configuration"),
+                Err(rollback) => bail!(
+                    "could not apply volatile FRR configuration: {error:#}; baseline restore also failed: {rollback:#}"
+                ),
+            };
         }
-        Ok(())
+
+        write_runtime_frr_marker(
+            &self.paths,
+            &RuntimeFrrMarker {
+                phase: RuntimeFrrPhase::Owned,
+                sha256: rendered_hash,
+            },
+        )
     }
 
     fn restore_frr(&self) -> Result<()> {
+        self.restore_runtime_frr()?;
+        self.restore_legacy_frr()
+    }
+
+    fn restore_runtime_frr(&self) -> Result<()> {
+        let marker = read_runtime_frr_marker(&self.paths)?;
+        let file = read_frr_file(&self.paths.generated_frr)?;
+
+        let Some(marker) = marker else {
+            if let Some(file) = file {
+                if !frr_has_owner(&file.bytes) {
+                    bail!("unowned volatile FRR file exists without a runtime marker");
+                }
+                // The file is written before the Applying marker, and live
+                // FRR is mutated only afterwards. This exact crash state can
+                // therefore be removed without restarting the service.
+                atomic::durable_remove(&self.paths.generated_frr)?;
+                remove_empty_dir(
+                    self.paths
+                        .generated_frr
+                        .parent()
+                        .context("generated FRR configuration has no parent")?,
+                    false,
+                )?;
+            }
+            return Ok(());
+        };
+
+        let file_matches = file
+            .as_ref()
+            .is_some_and(|file| frr_has_owner(&file.bytes) && file.sha256 == marker.sha256);
+        // The marker is durable before vtysh can mutate the live service, so
+        // it authorizes returning FRR to its administrator-owned baseline.
+        self.restart_frr_baseline()?;
+        if file.is_some() && !file_matches {
+            bail!("volatile FRR configuration changed after it was activated");
+        }
+        if file_matches {
+            atomic::durable_remove(&self.paths.generated_frr)?;
+        }
+        clear_runtime_frr_marker(&self.paths)?;
+        remove_empty_dir(
+            self.paths
+                .generated_frr
+                .parent()
+                .context("generated FRR configuration has no parent")?,
+            false,
+        )
+    }
+
+    fn restore_legacy_frr(&self) -> Result<()> {
         let mut ownership = OwnershipDb::load(&self.paths)?;
         let Some(mut record) = ownership.frr.clone() else {
             return Ok(());
@@ -661,30 +644,41 @@ impl<R: Runner> Reconciler<R> {
         Ok(())
     }
 
+    fn restart_frr_baseline(&self) -> Result<()> {
+        if Path::new("/etc/init.d/frr").is_file() || self.paths.root.is_some() {
+            self.runner.status("/etc/init.d/frr", ["restart"])?;
+        }
+        Ok(())
+    }
+
+    fn frr_running(&self) -> bool {
+        self.runner
+            .output("/etc/init.d/frr", ["running"])
+            .is_ok_and(|output| output.status.success())
+    }
+
     fn ensure_frr_running(&self) -> Result<()> {
-        let ownership = OwnershipDb::load(&self.paths)?;
-        let Some(record) = ownership.frr else {
+        self.restore_legacy_frr()?;
+        let Some(marker) = read_runtime_frr_marker(&self.paths)? else {
             return Ok(());
         };
-        if record.phase != Phase::Owned {
-            bail!("FRR ownership transition must be recovered before supervision");
+        if !runtime_frr_file_matches(&self.paths, &marker.sha256)? {
+            bail!("volatile FRR configuration no longer matches its runtime marker");
         }
-        let current = read_frr_file(&self.paths.frr_config)?
-            .context("owned FRR configuration disappeared")?;
-        if !frr_has_owner(&current.bytes)
-            || record.active_sha256.as_deref() != Some(current.sha256.as_str())
-        {
-            bail!("FRR configuration ownership changed");
-        }
-        let running = self
-            .runner
-            .output("/etc/init.d/frr", ["running"])
-            .is_ok_and(|output| output.status.success());
-        if running {
+        if marker.phase == RuntimeFrrPhase::Owned && self.frr_running() {
             Ok(())
         } else {
-            tracing::warn!("managed FRR service is not running; attempting recovery");
-            self.reload_frr()
+            tracing::warn!("managed FRR runtime is incomplete; attempting recovery");
+            self.restart_frr_baseline()?;
+            let path = self.paths.generated_frr.to_string_lossy().into_owned();
+            self.runner.status("vtysh", ["-b", "-f", path.as_str()])?;
+            write_runtime_frr_marker(
+                &self.paths,
+                &RuntimeFrrMarker {
+                    phase: RuntimeFrrPhase::Owned,
+                    sha256: marker.sha256,
+                },
+            )
         }
     }
 }
@@ -693,9 +687,92 @@ impl<R: Runner> Reconciler<R> {
 struct FrrFileState {
     bytes: Vec<u8>,
     sha256: String,
-    mode: u32,
-    uid: u32,
-    gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeFrrPhase {
+    Applying,
+    Owned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeFrrMarker {
+    phase: RuntimeFrrPhase,
+    sha256: String,
+}
+
+fn runtime_frr_marker(paths: &Paths) -> std::path::PathBuf {
+    paths.runtime.join("frr.runtime")
+}
+
+fn read_runtime_frr_marker(paths: &Paths) -> Result<Option<RuntimeFrrMarker>> {
+    let path = runtime_frr_marker(paths);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("invalid volatile FRR runtime marker")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let value = atomic::read_string_bounded(&path, MAX_SMALL_MARKER_BYTES)?;
+    let line = value
+        .strip_suffix('\n')
+        .context("volatile FRR runtime marker has no final newline")?;
+    if line.contains('\n') || line.contains('\r') {
+        bail!("volatile FRR runtime marker has extra lines");
+    }
+    let mut fields = line.split('\t');
+    if fields.next() != Some("v1") {
+        bail!("unsupported volatile FRR runtime marker");
+    }
+    let phase = match fields.next() {
+        Some("applying") => RuntimeFrrPhase::Applying,
+        Some("owned") => RuntimeFrrPhase::Owned,
+        _ => bail!("invalid volatile FRR runtime phase"),
+    };
+    let sha256 = fields
+        .next()
+        .context("volatile FRR runtime marker has no hash")?;
+    if fields.next().is_some()
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("invalid volatile FRR runtime hash");
+    }
+    Ok(Some(RuntimeFrrMarker {
+        phase,
+        sha256: sha256.to_ascii_lowercase(),
+    }))
+}
+
+fn write_runtime_frr_marker(paths: &Paths, marker: &RuntimeFrrMarker) -> Result<()> {
+    let phase = match marker.phase {
+        RuntimeFrrPhase::Applying => "applying",
+        RuntimeFrrPhase::Owned => "owned",
+    };
+    let value = format!("v1\t{phase}\t{}\n", marker.sha256);
+    atomic::atomic_write(&runtime_frr_marker(paths), value.as_bytes(), 0o600)?;
+    Ok(())
+}
+
+fn clear_runtime_frr_marker(paths: &Paths) -> Result<()> {
+    let path = runtime_frr_marker(paths);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("invalid volatile FRR runtime marker")
+        }
+        Ok(_) => atomic::durable_remove(&path).map(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic::sync_dir(&paths.runtime)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn runtime_frr_file_matches(paths: &Paths, expected_hash: &str) -> Result<bool> {
+    Ok(read_frr_file(&paths.generated_frr)?
+        .is_some_and(|file| frr_has_owner(&file.bytes) && file.sha256 == expected_hash))
 }
 
 fn read_frr_file(path: &Path) -> Result<Option<FrrFileState>> {
@@ -708,27 +785,10 @@ fn read_frr_file(path: &Path) -> Result<Option<FrrFileState>> {
         bail!("FRR configuration is not a regular file");
     }
     let bytes = atomic::read_bounded(path, MAX_FRR_FILE_BYTES)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(Some(FrrFileState {
-            sha256: sha256(&bytes),
-            bytes,
-            mode: metadata.mode() & 0o7777,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-        }))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(Some(FrrFileState {
-            sha256: sha256(&bytes),
-            bytes,
-            mode: 0o640,
-            uid: 0,
-            gid: 0,
-        }))
-    }
+    Ok(Some(FrrFileState {
+        sha256: sha256(&bytes),
+        bytes,
+    }))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -909,6 +969,7 @@ fn meduza_state_exists(paths: &Paths) -> Result<bool> {
         paths.manifest.as_path(),
         paths.pending_manifest.as_path(),
         paths.ownership.as_path(),
+        paths.firewall_state.as_path(),
         paths.reported.as_path(),
         paths.generated.as_path(),
         paths.managed.as_path(),
@@ -978,6 +1039,23 @@ fn write_rendered_files(
 ) -> Result<BTreeSet<String>> {
     let mut changed = BTreeSet::new();
     for file in files {
+        let parent = file.path.parent().context("rendered file has no parent")?;
+        let owned = entries.iter().any(|entry| {
+            entry
+                .config
+                .parent()
+                .is_some_and(|directory| file.path.starts_with(directory))
+        });
+        if !owned {
+            bail!(
+                "rendered VPN file escaped every owned generated directory: {}",
+                file.path.display()
+            );
+        }
+        // Renderers can create nested trees such as tinc/<network>/hosts.
+        // `atomic_write` intentionally refuses to invent parents, so create
+        // and fsync those private, Meduza-owned directories explicitly.
+        atomic::ensure_private_dir(parent, 0o700)?;
         if atomic::atomic_write(&file.path, &file.contents, file.mode)? {
             for entry in entries {
                 let directory = entry.config.parent().context("config has no parent")?;
@@ -989,6 +1067,25 @@ fn write_rendered_files(
         }
     }
     Ok(changed)
+}
+
+fn validate_rendered_vpn_size(files: &[RenderedFile]) -> Result<()> {
+    let mut total = 0usize;
+    for file in files {
+        if file.contents.len() > MAX_GENERATED_FILE_BYTES {
+            bail!(
+                "generated VPN file exceeds {MAX_GENERATED_FILE_BYTES} byte limit: {}",
+                file.path.display()
+            );
+        }
+        total = total
+            .checked_add(file.contents.len())
+            .context("generated VPN size overflow")?;
+        if total > MAX_GENERATED_TOTAL_BYTES {
+            bail!("generated VPN files exceed {MAX_GENERATED_TOTAL_BYTES} byte aggregate limit");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_ip_forward(paths: &Paths) -> Result<()> {
@@ -1049,6 +1146,8 @@ pub fn doctor<R: Runner>(paths: &Paths, runner: &R) -> Result<()> {
         bail!("configured etcd CA does not exist");
     }
     let _ = OwnershipDb::load(paths)?;
+    Firewall::new(paths.clone(), runner.clone())
+        .validate_zone(settings.firewall_zone.as_deref())?;
     let _ = read_manifest(&paths.manifest)?;
     println!("meduza-openwrt doctor: ok (node {})", settings.node_id);
     Ok(())
@@ -1130,13 +1229,44 @@ mod tests {
     #[test]
     fn inventory_union_is_sorted_and_deduplicated() {
         let row = ManifestEntry::parse_tsv(
-            "tinc\tmesh\ttinc_mesh\ttnc0\t/etc/meduza/generated/tinc/mesh/tinc.conf",
+            "tinc\tmesh\ttinc_mesh\ttnc0\t/var/run/meduza/generated/tinc/mesh/tinc.conf",
         )
         .unwrap();
         assert_eq!(
             merge_inventory(std::slice::from_ref(&row), std::slice::from_ref(&row)).len(),
             1
         );
+    }
+
+    #[test]
+    fn rendered_tinc_hosts_create_private_nested_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("generated/tinc/mesh");
+        atomic::ensure_private_dir(&directory, 0o700).unwrap();
+        let entry = ManifestEntry::parse_tsv(&format!(
+            "tinc\tmesh\ttinc_mesh\ttnc0\t{}",
+            directory.join("tinc.conf").display()
+        ))
+        .unwrap();
+        let host = RenderedFile {
+            path: directory.join("hosts/router-01"),
+            mode: 0o600,
+            contents: b"Subnet = 10.0.0.1/32\n".to_vec(),
+        };
+
+        let changed = write_rendered_files(std::slice::from_ref(&host), &[entry]).unwrap();
+        assert!(changed.contains("tinc_mesh"));
+        assert_eq!(fs::read(host.path).unwrap(), host.contents);
+    }
+
+    #[test]
+    fn oversized_generated_file_is_rejected_before_writing() {
+        let file = RenderedFile {
+            path: "/var/run/meduza/generated/tinc/mesh/tinc.conf".into(),
+            mode: 0o600,
+            contents: vec![0; MAX_GENERATED_FILE_BYTES + 1],
+        };
+        assert!(validate_rendered_vpn_size(&[file]).is_err());
     }
 
     #[test]
@@ -1147,6 +1277,37 @@ mod tests {
         file.set_len((MAX_FRR_FILE_BYTES + 1) as u64).unwrap();
 
         assert!(read_frr_file(&path).is_err());
+    }
+
+    #[test]
+    fn volatile_frr_marker_round_trips_below_var_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        atomic::ensure_private_dir(&paths.runtime, 0o700).unwrap();
+        let marker = RuntimeFrrMarker {
+            phase: RuntimeFrrPhase::Applying,
+            sha256: "a".repeat(64),
+        };
+
+        write_runtime_frr_marker(&paths, &marker).unwrap();
+
+        assert_eq!(read_runtime_frr_marker(&paths).unwrap(), Some(marker));
+        assert!(runtime_frr_marker(&paths).starts_with(&paths.runtime));
+        assert!(!runtime_frr_marker(&paths).starts_with(&paths.data));
+    }
+
+    #[test]
+    fn volatile_frr_marker_rejects_extra_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        atomic::ensure_private_dir(&paths.runtime, 0o700).unwrap();
+        fs::write(
+            runtime_frr_marker(&paths),
+            format!("v1\towned\t{}\nforeign\n", "b".repeat(64)),
+        )
+        .unwrap();
+
+        assert!(read_runtime_frr_marker(&paths).is_err());
     }
 
     #[test]

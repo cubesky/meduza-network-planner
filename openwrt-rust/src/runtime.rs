@@ -772,7 +772,7 @@ mod tests {
             instance: "office".into(),
             logical: "ovpn_office".into(),
             device: "ovpn-office".into(),
-            config: PathBuf::from("/etc/meduza/generated/openvpn/office/openvpn.conf"),
+            config: PathBuf::from("/var/run/meduza/generated/openvpn/office/openvpn.conf"),
         }
     }
 
@@ -793,7 +793,7 @@ mod tests {
         let argv = vec![
             "openvpn".into(),
             "--cd".into(),
-            "/etc/meduza/generated/openvpn/office".into(),
+            "/var/run/meduza/generated/openvpn/office".into(),
             "--config".into(),
             "openvpn.conf".into(),
         ];

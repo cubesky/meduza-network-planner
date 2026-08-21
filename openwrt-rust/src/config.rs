@@ -24,6 +24,9 @@ pub struct Settings {
     pub key: Option<PathBuf>,
     pub user: Option<String>,
     pub password: Option<String>,
+    /// Optional firewall zone whose device list receives every managed VPN
+    /// interface. An empty value leaves firewall membership unmanaged.
+    pub firewall_zone: Option<String>,
 }
 
 impl Settings {
@@ -77,6 +80,7 @@ impl Settings {
             get("ETCD_KEY")?,
             get("ETCD_USER")?,
             get("ETCD_PASS")?,
+            get("VPN_FIREWALL_ZONE")?,
         )
     }
 
@@ -90,6 +94,7 @@ impl Settings {
         key: Option<String>,
         user: Option<String>,
         password: Option<String>,
+        firewall_zone: Option<String>,
     ) -> Result<Self> {
         validate_node_id(&node_id)?;
         let endpoints = endpoints
@@ -132,6 +137,12 @@ impl Settings {
         if user.is_some() != password.is_some() {
             bail!("ETCD_USER and ETCD_PASS must be configured together");
         }
+        let firewall_zone = firewall_zone
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(zone) = &firewall_zone {
+            validate_firewall_zone(zone)?;
+        }
         let ca = ca.map(PathBuf::from).or_else(|| {
             endpoints
                 .iter()
@@ -147,6 +158,7 @@ impl Settings {
             key: key.map(PathBuf::from),
             user,
             password,
+            firewall_zone,
         })
     }
 
@@ -219,6 +231,20 @@ pub fn validate_logical_name(value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_firewall_zone(value: &str) -> Result<()> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        bail!("firewall zone is empty")
+    };
+    if value.len() > 64
+        || !(first.is_ascii_alphanumeric() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        bail!("firewall zone contains unsafe characters");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,17 +260,22 @@ mod tests {
             None,
             None,
             None,
+            Some("vpn-zone".into()),
         )
         .unwrap();
         assert!(value.enabled);
         assert_eq!(value.endpoints[0], "https://etcd-a:2379");
+        assert_eq!(value.firewall_zone.as_deref(), Some("vpn-zone"));
         assert!(validate_node_id("-bad").is_err());
         assert!(validate_logical_name("bad-name").is_err());
+        assert!(validate_firewall_zone("vpn-zone").is_ok());
+        assert!(validate_firewall_zone("bad zone").is_err());
         for endpoint in ["https://etcd.example:443", "http://etcd.example:80"] {
             Settings::from_values(
                 "false",
                 "router-01".into(),
                 endpoint.into(),
+                None,
                 None,
                 None,
                 None,
@@ -263,6 +294,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .is_err()
         );
@@ -271,6 +303,7 @@ mod tests {
             "false",
             "router-01".into(),
             "HTTPS://etcd.example:443".into(),
+            None,
             None,
             None,
             None,
@@ -300,6 +333,7 @@ mod tests {
             key: None,
             user: None,
             password: None,
+            firewall_zone: None,
         };
 
         assert!(settings.tls_material().is_err());

@@ -44,10 +44,13 @@ routed OpenWrt side gateway:
 - retain a durable last-known-good state and recover interrupted work after a
   reboot or power loss.
 
-Only `/etc/config/meduza` is read through UCI. Reconciliation never creates or
-changes `network`, `openvpn` or `firewall` UCI sections and never calls
-`ifup`/`ifdown`. It must not take ownership of an administrator's Linux
-interface, VPN process, configuration file, or OpenClash's `utun` device.
+VPN instances are not represented by `network` or `openvpn` UCI sections and
+reconciliation never calls `ifup`/`ifdown`. When `VPN_FIREWALL_ZONE` is set,
+Meduza makes narrow, tagged changes only to that firewall zone's `device` list;
+it never rewrites the list or changes zone policy, forwarding, NAT or network
+membership. It must not take ownership of an administrator's Linux interface,
+VPN process, configuration file, existing firewall member, or OpenClash's
+`utun` device.
 
 ## Runtime layout
 
@@ -60,19 +63,28 @@ The target layout is:
 | `/etc/config/meduza` | Administrator-owned UCI configuration | persistent conffile |
 | `/www/luci-static/resources/view/meduza/settings.js` | LuCI settings view | package payload |
 | `/etc/meduza/pki/` | Administrator-provided etcd CA/client material | persistent, never generated cleanup data |
-| `/etc/meduza/generated/` | Meduza-owned generated VPN data | persistent, mode-restricted |
 | `/etc/meduza-state/cache.json` | Last-known-good desired-state cache | persistent |
 | `/etc/meduza-state/cache.pending.json` | Interrupted cache transaction | persistent journal |
 | `/etc/meduza-state/managed/` | Ownership records and replayable transaction journals | persistent |
+| `/var/run/meduza/generated/` | VPN and FRR configurations regenerated from the current etcd generation | volatile, mode-restricted |
 | `/var/run/meduza/` | PIDs, live status JSON and other reconstructable runtime data | volatile |
 | Linux abstract socket `meduza-openwrt-transaction-v1` | Cross-command reconciliation lock | kernel-only; disappears on exit/crash |
 
-`/etc/meduza` is deliberately limited to operator configuration/PKI and
-Meduza-generated VPN configuration. Controller journals, ownership evidence and
-LKG caches belong only in `/etc/meduza-state`; the executable belongs in
-`/usr/sbin`, not either data directory. `purge` removes the Rust-owned state root
-after its external resources have been restored, but it never recursively
-deletes `/etc/meduza` and therefore does not delete `/etc/meduza/pki`.
+`/etc/meduza` is deliberately limited to operator configuration and PKI.
+Generated VPN and FRR files are reconstructed beneath `/var/run/meduza` only
+after the daemon reads the current etcd generation. `/etc/frr/frr.conf` remains
+the administrator-owned baseline: Meduza restarts that baseline and loads its
+volatile routing overlay through `vtysh`, then restores the baseline on stop.
+Controller journals, ownership
+evidence and bounded rollback caches belong only in `/etc/meduza-state`; the
+executable belongs in `/usr/sbin`, not any data directory. `purge` removes the
+Rust-owned state root after its external resources have been restored, but it
+never recursively deletes `/etc/meduza` and therefore does not delete
+`/etc/meduza/pki`.
+
+The renderer rejects any generated VPN file larger than 6 MiB, rejects a VPN
+generation larger than 16 MiB in aggregate, and rejects a generated FRR file
+larger than 16 MiB before writing to tmpfs.
 
 Persistent formats may evolve while the Rust implementation is being built.
 Every format must be versioned, atomically replaced, and directory-fsynced.
@@ -127,6 +139,7 @@ administrator does not have to re-enter connection settings:
 | `ETCD_KEY` | Optional client private-key path |
 | `ETCD_USER` | Optional etcd username |
 | `ETCD_PASS` | Optional etcd password |
+| `VPN_FIREWALL_ZONE` | Optional firewall zone for every managed Tinc/OpenVPN/WireGuard device |
 
 When the package is installed with LuCI, open **Services → Meduza** to edit
 these values. The page masks `ETCD_PASS`, but UCI still stores the value in the
@@ -143,6 +156,7 @@ uci set meduza.main.ETCD_ENDPOINTS='https://etcd.example.net:2379'
 uci set meduza.main.ETCD_CA='/etc/meduza/pki/ca.crt'
 uci set meduza.main.ETCD_CERT='/etc/meduza/pki/client.crt'
 uci set meduza.main.ETCD_KEY='/etc/meduza/pki/client.key'
+uci set meduza.main.VPN_FIREWALL_ZONE='vpn'
 uci commit meduza
 ```
 
@@ -159,16 +173,19 @@ the enabled features from the router firmware's own feed. Package names vary by
 vendor, but commonly include:
 
 - core integration: `uci`, `ubus`, `rpcd`, `luci-base`, procd and a usable
-  `ip` (`ubus`/`rpcd`/`luci-base` serve the web UI, not VPN reconciliation);
+  `ip` (`uci` stores controller settings and the optional narrow firewall
+  membership; `ubus`/`rpcd`/`luci-base` serve the web UI);
 - tinc: `tinc` providing `tincd`;
 - OpenVPN: `openvpn-openssl` or a compatible vendor OpenVPN build;
 - WireGuard: `wireguard-tools` providing `wg`;
 - routing: `frr` providing `vtysh` and the required OSPF/BGP daemons.
 
-Firewall policy is deliberately outside daemon ownership. If the router's
-policy blocks traffic on dynamically created interfaces, add rules using the
-stable device names from the status page; Meduza does not rewrite a firewall
-zone behind the administrator or OpenClash.
+Firewall policy remains outside daemon ownership. The optional firewall-zone
+setting only adds each stable VPN device name as a `list device` member. Meduza
+records whether a member was already present, never deletes borrowed members,
+and removes only its exact tagged additions when the zone changes, the daemon
+stops, or `purge` runs. OpenClash members and all other zone configuration are
+preserved.
 
 WireGuard kernel support must come from the running firmware. If a separate
 `kmod-wireguard` package is required, it must match that firmware's exact kernel

@@ -114,6 +114,91 @@ impl OwnershipDb {
         Ok(value)
     }
 
+    /// Retire the first Rust generated-data location. Only directories backed
+    /// by the exact external record and marker are removed; unrecognized
+    /// objects below `/etc/meduza/generated` are preserved. The new runtime
+    /// generation is recreated from etcd under `/var/run`.
+    pub fn migrate_legacy_generated_layout(paths: &Paths, legacy_generated: &Path) -> Result<bool> {
+        if paths.generated == legacy_generated {
+            return Ok(false);
+        }
+
+        let ownership_exists = match fs::symlink_metadata(&paths.ownership) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                bail!("persistent ownership database is not a regular file")
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !ownership_exists {
+            return Ok(false);
+        }
+        let marker = paths.managed.join("generated-layout.retiring");
+        let marker_exists = match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                bail!("generated layout migration marker is not a regular file")
+            }
+            Ok(_) => {
+                if atomic::read_bounded(&marker, 32)? != b"v1\n" {
+                    bail!("invalid generated layout migration marker")
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+
+        match Self::load(paths) {
+            Ok(_) if marker_exists => {
+                let _ = remove_empty_legacy_generated_root(legacy_generated)?;
+                atomic::durable_remove(&marker)?;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(current_error) => {
+                let mut legacy_paths = paths.clone();
+                legacy_paths.generated = legacy_generated.to_path_buf();
+                let mut legacy = Self::load(&legacy_paths).with_context(|| {
+                    format!(
+                        "ownership is invalid for the volatile generated layout ({current_error:#}) and is not a valid legacy generated layout"
+                    )
+                })?;
+                if !legacy.wireguard_stages.is_empty() {
+                    bail!(
+                        "legacy generated layout has an active WireGuard staging transaction; stop it with the prior binary before upgrading"
+                    );
+                }
+                let entries = legacy
+                    .generated
+                    .values()
+                    .map(|record| record.entry.clone())
+                    .collect::<Vec<_>>();
+                if entries.is_empty() {
+                    return Err(current_error);
+                }
+                if !marker_exists {
+                    atomic::atomic_write(&marker, b"v1\n", 0o600)?;
+                }
+                for entry in &entries {
+                    legacy.remove_generated(&legacy_paths, entry)?;
+                }
+                if !legacy.generated.is_empty() {
+                    bail!("legacy generated ownership migration did not converge");
+                }
+                legacy.save(paths)?;
+                let _ = remove_empty_legacy_generated_root(legacy_generated)?;
+                atomic::durable_remove(&marker)?;
+                tracing::info!(
+                    from = %legacy_generated.display(),
+                    to = %paths.generated.display(),
+                    "retired persistent generated VPN layout"
+                );
+                Ok(true)
+            }
+        }
+    }
+
     fn validate(&self, paths: &Paths) -> Result<()> {
         for (key, record) in &self.generated {
             validate_nonce(&record.nonce, "generated nonce")?;
@@ -338,6 +423,17 @@ impl OwnershipDb {
             if record.directory != directory {
                 bail!("generated ownership identity changed for {key}");
             }
+            if volatile_generated_objects_absent(paths, &record, &key)? {
+                let live = self.generated.get_mut(&key).expect("record exists");
+                live.nonce = atomic::random_nonce();
+                live.phase = Phase::Creating;
+                live.entry = entry.clone();
+                live.tombstone = None;
+                live.pending_entry = None;
+                self.save(paths)?;
+                self.finish_generated_creation(paths, key.clone())?;
+                return self.ensure_generated(paths, entry);
+            }
             match record.phase {
                 Phase::Owned => {
                     verify_generated_marker(&directory, &record)?;
@@ -487,6 +583,11 @@ impl OwnershipDb {
             }
             return Ok(());
         };
+        if volatile_generated_objects_absent(paths, &record, &key)? {
+            self.generated.remove(&key);
+            self.save(paths)?;
+            return Ok(());
+        }
         if record.phase == Phase::Creating {
             self.finish_generated_creation(paths, key.clone())?;
             record = self.generated.get(&key).cloned().expect("record exists");
@@ -721,6 +822,71 @@ fn object_exists(path: &Path) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn volatile_generated_objects_absent(
+    paths: &Paths,
+    record: &GeneratedRecord,
+    key: &str,
+) -> Result<bool> {
+    if !paths.generated.starts_with(&paths.runtime)
+        || !record.directory.starts_with(&paths.generated)
+        || object_exists(&record.directory)?
+    {
+        return Ok(false);
+    }
+    if let Some(tombstone) = &record.tombstone
+        && object_exists(tombstone)?
+    {
+        return Ok(false);
+    }
+    let parent = record
+        .directory
+        .parent()
+        .context("generated directory has no parent")?;
+    let stage = parent.join(format!(
+        ".meduza-create-{}-{}",
+        sanitize_filename(key),
+        record.nonce
+    ));
+    Ok(!object_exists(&stage)?)
+}
+
+fn remove_empty_legacy_generated_root(root: &Path) -> Result<bool> {
+    let mut removed = false;
+    for kind in ["tinc", "openvpn", "wireguard"] {
+        let directory = root.join(kind);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        if fs::read_dir(&directory)?.next().transpose()?.is_none() {
+            fs::remove_dir(&directory)?;
+            atomic::sync_dir(root)?;
+            removed = true;
+        }
+    }
+
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(removed),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(removed);
+    }
+    if fs::read_dir(root)?.next().transpose()?.is_none() {
+        fs::remove_dir(root)?;
+        if let Some(parent) = root.parent() {
+            atomic::sync_dir(parent)?;
+        }
+        removed = true;
+    }
+    Ok(removed)
 }
 
 fn verify_real_directory(directory: &Path) -> Result<()> {
@@ -972,6 +1138,49 @@ mod tests {
             !db.generated
                 .contains_key(&OwnershipDb::generated_key(&entry))
         );
+    }
+
+    #[test]
+    fn volatile_generated_directory_is_recreated_after_tmpfs_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        paths.prepare().unwrap();
+        let entry = wireguard_entry(&paths, "wg_office", "wg-office");
+        let key = OwnershipDb::generated_key(&entry);
+        let mut db = OwnershipDb::load(&paths).unwrap();
+        let directory = db.ensure_generated(&paths, &entry).unwrap();
+        let original_nonce = db.generated.get(&key).unwrap().nonce.clone();
+        clear_directory_marker_last(&directory).unwrap();
+
+        let mut recovered = OwnershipDb::load(&paths).unwrap();
+        recovered.ensure_generated(&paths, &entry).unwrap();
+        assert!(directory.is_dir());
+        assert_ne!(recovered.generated.get(&key).unwrap().nonce, original_nonce);
+        verify_generated_marker(&directory, recovered.generated.get(&key).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn owned_legacy_generated_tree_is_retired_from_etc() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        atomic::ensure_private_dir(&paths.state, 0o700).unwrap();
+        atomic::ensure_private_dir(&paths.managed, 0o700).unwrap();
+        let mut legacy_paths = paths.clone();
+        legacy_paths.generated = paths.data.join("generated");
+        atomic::ensure_private_dir(&legacy_paths.generated, 0o700).unwrap();
+        let entry = wireguard_entry(&legacy_paths, "wg_office", "wg-office");
+        let mut db = OwnershipDb::load(&legacy_paths).unwrap();
+        let directory = db.ensure_generated(&legacy_paths, &entry).unwrap();
+        atomic::atomic_write(&directory.join("wg.conf"), b"private", 0o600).unwrap();
+
+        assert!(OwnershipDb::load(&paths).is_err());
+        assert!(
+            OwnershipDb::migrate_legacy_generated_layout(&paths, &paths.data.join("generated"))
+                .unwrap()
+        );
+        assert!(!paths.data.join("generated").exists());
+        assert!(OwnershipDb::load(&paths).unwrap().generated.is_empty());
+        assert!(!paths.managed.join("generated-layout.retiring").exists());
     }
 
     #[test]

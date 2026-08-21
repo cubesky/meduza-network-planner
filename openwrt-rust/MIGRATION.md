@@ -38,15 +38,18 @@ must be preserved.
 
 Early Rust builds temporarily placed their LKG cache and Rust ownership
 journals at `/etc/meduza/cache*.json` and `/etc/meduza/managed/`. Current builds
-reserve `/etc/meduza` for operator PKI/configuration plus
-`/etc/meduza/generated`, and keep controller state under `/etc/meduza-state`.
+reserve `/etc/meduza` for operator PKI/configuration, keep bounded controller
+state under `/etc/meduza-state`, and regenerate VPN files under
+`/var/run/meduza/generated`.
 
 Stop the earlier Rust service before installing or starting the current build.
 The first current invocation performs a crash-replayable, one-time relocation
 only when `managed/ownership.json` is a valid Rust ownership database. It moves
 the managed directory first, rewrites the one stored FRR backup path, and then
 moves stable/pending caches. A power loss between those operations is resumed
-from the relocated ownership database on the next invocation.
+from the relocated ownership database on the next invocation. A positively
+owned early-Rust `/etc/meduza/generated` tree is then retired; unknown files
+are preserved rather than adopted or deleted.
 
 The retired Lite implementation used the same cache and manifest names but did
 not create Rust `ownership.json`. Therefore cache or manifest files without
@@ -208,11 +211,16 @@ Keep automatic startup disabled for the first run. The target sequence is:
 1. run `recover` so a new-format interrupted transaction, if any, is resolved;
 2. validate `/etc/config/meduza` and etcd reachability;
 3. run one foreground `apply`;
-4. inspect `status`, the unchanged UCI packages, Linux links, firewall policy,
-   VPN processes and FRR running configuration;
+4. inspect `status`, the unchanged network/OpenVPN UCI packages, Linux links,
+   the selected firewall zone's exact device additions, firewall policy, VPN
+   processes and FRR running configuration;
+   confirm that `/etc/frr/frr.conf` is still the administrator baseline and
+   the Meduza overlay exists only at
+   `/var/run/meduza/generated/frr/frr.conf`;
 5. repeat `apply` and prove that healthy VPN runtimes are not restarted or
    reconfigured when desired state is unchanged;
-6. reboot once and prove recovery works without immediate etcd availability;
+6. reboot once and prove the volatile generated tree is empty until etcd is
+   reached, then is rebuilt from the current generation;
 7. only then enable and start the procd service.
 
 Use the actual `--help` output for arguments to `recover`, `apply` and `status`.
@@ -249,8 +257,8 @@ supported architecture and representative firmware:
 | Foreign-resource preservation | user UCI, links, files and OpenClash `utun` unchanged |
 | First Rust apply | all requested VPN/FRR resources reach the intended state |
 | Second identical apply | zero unnecessary VPN restart or link reconfiguration |
-| Interrupted apply | reboot yields complete old or complete new generation |
-| etcd unavailable at boot | local LKG is restored; retry does not corrupt state |
+| Interrupted apply | reboot waits for etcd, then converges to one complete generation |
+| etcd unavailable at boot | VPN runtimes stay stopped and etcd retry does not mutate generated state |
 | etcd ack failure | committed local state remains; only acknowledgement retries |
 | Runtime stop | only Rust-owned processes and links stop; restart data remains |
 | Purge/rollback rehearsal | only Rust-owned persistent state is removed/restored |

@@ -4,6 +4,7 @@ pub mod cli;
 pub mod command;
 pub mod config;
 pub mod etcd;
+pub mod firewall;
 pub mod model;
 pub mod ownership;
 pub mod reconciler;

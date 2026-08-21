@@ -88,72 +88,32 @@ impl<R: Runner> Agent<R> {
         }
     }
 
-    /// Run the local boot/recovery barrier before an iteration is allowed to
-    /// touch etcd. `true` means that this iteration was consumed by local
-    /// initialization and the caller must return before connecting to etcd.
-    fn restore_lkg(&mut self) -> Result<bool> {
-        let apply_paths = self.paths.clone();
-        let apply_runner = self.runner.clone();
-        let apply_settings = self.settings.clone();
+    /// Clear any prior runtime before the first etcd connection. Generated
+    /// configurations live on tmpfs and are rebuilt only from the current
+    /// etcd generation; a persistent LKG remains available for explicit
+    /// rollback/recovery but is never auto-applied at daemon startup.
+    fn initialize_local_runtime(&mut self) -> Result<()> {
         let stop_paths = self.paths.clone();
         let stop_runner = self.runner.clone();
-        self.restore_lkg_with(
-            move |source| {
-                let snapshot = Snapshot::read_from(source)?;
-                Reconciler::new(apply_paths, apply_runner).apply(&apply_settings, &snapshot)?;
-                Ok(snapshot)
-            },
-            move || Reconciler::new(stop_paths, stop_runner).runtime_stop(),
-        )
+        self.initialize_local_runtime_with(move || {
+            Reconciler::new(stop_paths, stop_runner).runtime_stop()
+        })
     }
 
-    fn restore_lkg_with<A, S>(&mut self, apply: A, runtime_stop: S) -> Result<bool>
+    fn initialize_local_runtime_with<S>(&mut self, runtime_stop: S) -> Result<()>
     where
-        A: FnOnce(&std::path::Path) -> Result<Snapshot>,
         S: FnOnce() -> Result<()>,
     {
         if self.local_initialized {
-            return Ok(false);
+            return Ok(());
         }
-        let source = if regular_file_exists(&self.paths.cache)? {
-            Some(self.paths.cache.clone())
-        } else if regular_file_exists(&self.paths.cache_pending)? {
-            Some(self.paths.cache_pending.clone())
-        } else {
-            None
-        };
-        let Some(source) = source else {
-            tracing::info!("no persistent configuration cache; waiting for etcd");
-            // A successful safety stop is a one-shot barrier. A transient stop
-            // failure must be retried before etcd is allowed to drive a new
-            // apply over an unknown local runtime state.
-            runtime_stop().context("initial runtime safety stop failed")?;
-            self.local_initialized = true;
-            return Ok(true);
-        };
-        match apply(&source) {
-            Ok(snapshot) => {
-                self.commit = Some(snapshot.commit);
-                self.pending_last_ack = Some(if snapshot.applied_at.is_empty() {
-                    report::timestamp()
-                } else {
-                    snapshot.applied_at
-                });
-                self.local_initialized = true;
-                tracing::info!("restored persistent last-known-good configuration");
-                Ok(true)
-            }
-            Err(error) => {
-                tracing::error!("persistent configuration cache was not restored: {error:#}");
-                // Leave local_initialized false. The next exponentially
-                // backed-off iteration must retry the durable cache before it
-                // is allowed to attempt an etcd connection.
-                if let Err(stop_error) = runtime_stop() {
-                    tracing::error!("runtime safety stop failed: {stop_error:#}");
-                }
-                Err(error.context("persistent configuration cache was not restored"))
-            }
-        }
+        // A successful safety stop is a one-shot barrier. A transient stop
+        // failure must be retried before etcd is allowed to drive a new apply
+        // over an unknown local runtime state.
+        runtime_stop().context("initial runtime safety stop failed")?;
+        self.local_initialized = true;
+        tracing::info!("volatile runtime initialized; waiting for etcd");
+        Ok(())
     }
 
     async fn iteration(
@@ -161,14 +121,13 @@ impl<R: Runner> Agent<R> {
         etcd: &mut Option<Etcd>,
         next_report: &mut Instant,
     ) -> Result<()> {
-        if self.restore_lkg()? {
-            return Ok(());
-        }
+        self.initialize_local_runtime()?;
         // Once a generation is locally committed, supervise its native
         // runtimes before touching etcd. This keeps VPN and FRR recovery
         // working while the server or management path is unavailable.
         if self.commit.is_some() {
-            Reconciler::new(self.paths.clone(), self.runner.clone()).ensure_runtime()?;
+            Reconciler::new(self.paths.clone(), self.runner.clone())
+                .ensure_runtime(&self.settings)?;
         }
         if etcd.is_none() {
             self.persist_etcd_state("connecting");
@@ -411,18 +370,7 @@ mod tests {
             key: None,
             user: None,
             password: None,
-        }
-    }
-
-    fn snapshot() -> Snapshot {
-        Snapshot {
-            version: 1,
-            node_id: "router-01".into(),
-            commit: "generation-1".into(),
-            applied_at: "2026-08-21T00:00:00Z".into(),
-            node: Default::default(),
-            global: Default::default(),
-            all_nodes: Default::default(),
+            firewall_zone: None,
         }
     }
 
@@ -438,64 +386,35 @@ mod tests {
     }
 
     #[test]
-    fn local_lkg_retries_before_etcd_and_succeeds_on_second_attempt() {
+    fn startup_does_not_auto_apply_a_persistent_lkg() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(Some(temp.path()));
         std::fs::create_dir_all(&paths.state).unwrap();
         std::fs::write(&paths.cache, b"test cache marker").unwrap();
         let mut agent = agent(paths);
-        let apply_attempts = Cell::new(0usize);
         let safety_stops = Cell::new(0usize);
-        let etcd_connections = Cell::new(0usize);
 
-        let first = agent.restore_lkg_with(
-            |_| {
-                apply_attempts.set(apply_attempts.get() + 1);
-                bail!("injected first local apply failure")
-            },
-            || {
+        agent
+            .initialize_local_runtime_with(|| {
                 safety_stops.set(safety_stops.get() + 1);
                 Ok(())
-            },
-        );
-        if first.as_ref().is_ok_and(|consumed| !consumed) {
-            etcd_connections.set(etcd_connections.get() + 1);
-        }
-        assert!(first.is_err());
-        assert!(!agent.local_initialized);
-        assert_eq!(safety_stops.get(), 1);
-        assert_eq!(etcd_connections.get(), 0);
-
-        let second = agent
-            .restore_lkg_with(
-                |_| {
-                    apply_attempts.set(apply_attempts.get() + 1);
-                    Ok(snapshot())
-                },
-                || panic!("a successful local retry must not run the safety stop"),
-            )
+            })
             .unwrap();
-        if !second {
-            etcd_connections.set(etcd_connections.get() + 1);
-        }
-        assert!(second, "the successful local retry consumes this iteration");
         assert!(agent.local_initialized);
-        assert_eq!(agent.commit.as_deref(), Some("generation-1"));
-        assert_eq!(apply_attempts.get(), 2);
-        assert_eq!(etcd_connections.get(), 0);
-
-        assert!(
-            !agent
-                .restore_lkg_with(
-                    |_| panic!("initialized local state must not be applied again"),
-                    || panic!("initialized local state must not be stopped again"),
-                )
-                .unwrap()
-        );
+        assert!(agent.commit.is_none());
+        assert!(agent.pending_last_ack.is_none());
+        assert_eq!(safety_stops.get(), 1);
+        agent
+            .initialize_local_runtime_with(|| {
+                safety_stops.set(safety_stops.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(safety_stops.get(), 1);
     }
 
     #[test]
-    fn missing_cache_retries_a_failed_stop_then_consumes_it_once() {
+    fn startup_retries_a_failed_runtime_stop_then_runs_it_once() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(Some(temp.path()));
         let mut agent = agent(paths);
@@ -503,40 +422,27 @@ mod tests {
 
         assert!(
             agent
-                .restore_lkg_with(
-                    |_| panic!("no cache must not be applied"),
-                    || {
-                        safety_stops.set(safety_stops.get() + 1);
-                        bail!("injected safety-stop diagnostic")
-                    },
-                )
+                .initialize_local_runtime_with(|| {
+                    safety_stops.set(safety_stops.get() + 1);
+                    bail!("injected safety-stop diagnostic")
+                })
                 .is_err()
         );
         assert!(!agent.local_initialized);
         assert_eq!(safety_stops.get(), 1);
 
-        assert!(
-            agent
-                .restore_lkg_with(
-                    |_| panic!("no cache must not be applied"),
-                    || {
-                        safety_stops.set(safety_stops.get() + 1);
-                        Ok(())
-                    },
-                )
-                .unwrap()
-        );
+        agent
+            .initialize_local_runtime_with(|| {
+                safety_stops.set(safety_stops.get() + 1);
+                Ok(())
+            })
+            .unwrap();
         assert!(agent.local_initialized);
         assert_eq!(safety_stops.get(), 2);
 
-        assert!(
-            !agent
-                .restore_lkg_with(
-                    |_| panic!("initialized no-cache state must not apply"),
-                    || panic!("no-cache safety stop must not repeat"),
-                )
-                .unwrap()
-        );
+        agent
+            .initialize_local_runtime_with(|| panic!("safety stop must not repeat"))
+            .unwrap();
         assert_eq!(safety_stops.get(), 2);
     }
 

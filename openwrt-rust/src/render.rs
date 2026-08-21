@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_OWNER: &str = crate::OWNER;
-pub const DEFAULT_FRR_PATH: &str = "/etc/frr/frr.conf";
+pub const DEFAULT_FRR_PATH: &str = "/var/run/meduza/generated/frr/frr.conf";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedFile {
@@ -1043,7 +1043,9 @@ mod tests {
         assert!(wireguard.contains(WG_PRIVATE));
         assert!(wireguard.contains("AllowedIPs = 0.0.0.0/0"));
 
-        let frr = find(&files, "/etc/frr/frr.conf").text().unwrap();
+        let frr = find(&files, "/var/run/meduza/generated/frr/frr.conf")
+            .text()
+            .unwrap();
         assert!(frr.contains("router ospf"));
         assert!(frr.contains("neighbor 10.20.0.2 remote-as 65002"));
         assert!(frr.contains("neighbor 10.30.0.2 update-source wg-backbone"));

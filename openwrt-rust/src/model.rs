@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const SNAPSHOT_VERSION: u32 = 1;
-pub const DEFAULT_GENERATED_ROOT: &str = "/etc/meduza/generated";
+pub const DEFAULT_GENERATED_ROOT: &str = "/var/run/meduza/generated";
 pub const MAX_INSTANCE_BYTES: usize = 64;
 pub const MAX_NODE_ID_BYTES: usize = 128;
 pub const MAX_DEVICE_BYTES: usize = 15;

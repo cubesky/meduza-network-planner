@@ -16,7 +16,7 @@ pub const MAX_MANIFEST_FILE_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub root: Option<PathBuf>,
-    /// Operator configuration, PKI and generated VPN configuration only.
+    /// Operator configuration and PKI only. Generated VPN data is volatile.
     pub data: PathBuf,
     /// Controller-owned durable journals and last-known-good state.
     pub state: PathBuf,
@@ -28,12 +28,17 @@ pub struct Paths {
     pub manifest: PathBuf,
     pub pending_manifest: PathBuf,
     pub ownership: PathBuf,
+    pub firewall_state: PathBuf,
     pub reported: PathBuf,
     pub daemon_status: PathBuf,
     pub lock: PathBuf,
     pub ip_forward: PathBuf,
     pub ip_forward_marker: PathBuf,
+    /// Administrator-owned persistent FRR configuration, used only to restore
+    /// an early Rust takeover transaction.
     pub frr_config: PathBuf,
+    /// Volatile FRR input generated from the current etcd revision.
+    pub generated_frr: PathBuf,
 }
 
 impl Paths {
@@ -41,21 +46,26 @@ impl Paths {
         let data = atomic::rooted(root, "/etc/meduza");
         let state = atomic::rooted(root, "/etc/meduza-state");
         let managed = state.join("managed");
+        let runtime = atomic::rooted(root, "/var/run/meduza");
+        let generated = runtime.join("generated");
+        let generated_frr = generated.join("frr/frr.conf");
         Self {
             root: root.map(Path::to_path_buf),
-            generated: data.join("generated"),
+            generated,
             cache: state.join("cache.json"),
             cache_pending: state.join("cache.pending.json"),
             manifest: managed.join("interfaces"),
             pending_manifest: managed.join("interfaces.pending"),
             ownership: managed.join("ownership.json"),
+            firewall_state: managed.join("firewall.json"),
             reported: managed.join("reported.json"),
-            runtime: atomic::rooted(root, "/var/run/meduza"),
+            runtime,
             daemon_status: atomic::rooted(root, "/var/run/meduza/status.json"),
             lock: atomic::rooted(root, "/var/lock/meduza-openwrt.lock"),
             ip_forward: atomic::rooted(root, "/proc/sys/net/ipv4/ip_forward"),
             ip_forward_marker: atomic::rooted(root, "/var/run/meduza/ip-forward.changed"),
             frr_config: atomic::rooted(root, "/etc/frr/frr.conf"),
+            generated_frr,
             data,
             state,
             managed,
@@ -64,11 +74,19 @@ impl Paths {
 
     pub fn prepare(&self) -> Result<()> {
         atomic::ensure_private_dir(&self.data, 0o700)?;
-        self.migrate_legacy_rust_state()?;
+        self.migrate_layout()?;
         atomic::ensure_private_dir(&self.state, 0o700)?;
         atomic::ensure_private_dir(&self.managed, 0o700)?;
-        atomic::ensure_private_dir(&self.generated, 0o700)?;
-        atomic::ensure_private_dir(&self.runtime, 0o700)
+        atomic::ensure_private_dir(&self.runtime, 0o700)?;
+        atomic::ensure_private_dir(&self.generated, 0o700)
+    }
+
+    /// Converge both retired Rust layouts before any current state is read.
+    pub fn migrate_layout(&self) -> Result<bool> {
+        let state_moved = self.migrate_legacy_rust_state()?;
+        let generated_moved =
+            OwnershipDb::migrate_legacy_generated_layout(self, &self.data.join("generated"))?;
+        Ok(state_moved || generated_moved)
     }
 
     /// Move the first Rust release's durable state out of `/etc/meduza`.
@@ -146,16 +164,18 @@ impl Paths {
             bail!("legacy Rust ownership database disappeared during state migration");
         }
 
-        // The only persistent absolute path stored in the ownership database
-        // is the optional FRR backup. Generated paths intentionally remain
-        // beneath /etc/meduza/generated and therefore do not change.
+        // FRR remains durable. Generated records still name the retired data
+        // root at this point and are converted by `migrate_layout` immediately
+        // after the persistent state move completes.
         if let Some(record) = ownership.frr.as_mut()
             && record.backup.as_ref() == Some(&legacy.managed.join("frr.conf.backup"))
         {
             record.backup = Some(self.managed.join("frr.conf.backup"));
         }
+        let mut relocated_with_legacy_generated = self.clone();
+        relocated_with_legacy_generated.generated = legacy.generated.clone();
         ownership
-            .save(self)
+            .save(&relocated_with_legacy_generated)
             .context("could not publish relocated Rust ownership database")?;
 
         atomic::ensure_private_dir(&self.state, 0o700)?;
@@ -183,7 +203,9 @@ impl Paths {
         legacy.manifest = legacy.managed.join("interfaces");
         legacy.pending_manifest = legacy.managed.join("interfaces.pending");
         legacy.ownership = legacy.managed.join("ownership.json");
+        legacy.firewall_state = legacy.managed.join("firewall.json");
         legacy.reported = legacy.managed.join("reported.json");
+        legacy.generated = self.data.join("generated");
         legacy
     }
 }
@@ -265,6 +287,7 @@ fn validate_legacy_managed_dir(path: &Path) -> Result<()> {
         "interfaces",
         "interfaces.pending",
         "ownership.json",
+        "firewall.json",
         "reported.json",
         "frr.conf.backup",
         "frr.pending.conf",
@@ -581,7 +604,11 @@ mod tests {
         let root = Path::new("/test-root");
         let paths = Paths::from_root(Some(root));
         assert_eq!(paths.data, root.join("etc/meduza"));
-        assert_eq!(paths.generated, root.join("etc/meduza/generated"));
+        assert_eq!(paths.generated, root.join("var/run/meduza/generated"));
+        assert_eq!(
+            paths.generated_frr,
+            root.join("var/run/meduza/generated/frr/frr.conf")
+        );
         assert_eq!(paths.state, root.join("etc/meduza-state"));
         assert_eq!(paths.cache, root.join("etc/meduza-state/cache.json"));
         assert_eq!(
@@ -592,15 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn valid_prior_rust_state_is_relocated_without_touching_pki_or_generated() {
+    fn valid_prior_rust_state_is_relocated_without_touching_pki_or_unknown_legacy_data() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(Some(temp.path()));
         let legacy = paths.legacy_state_layout();
         fs::create_dir_all(paths.data.join("pki")).unwrap();
-        fs::create_dir_all(&paths.generated).unwrap();
+        let legacy_generated = paths.data.join("generated");
+        fs::create_dir_all(&legacy_generated).unwrap();
         fs::create_dir_all(&legacy.managed).unwrap();
         fs::write(paths.data.join("pki/client.key"), b"operator-secret").unwrap();
-        fs::write(paths.generated.join("operator-note"), b"generated-root").unwrap();
+        fs::write(legacy_generated.join("operator-note"), b"foreign-data").unwrap();
         fs::write(legacy.managed.join("frr.conf.backup"), b"router bgp 1\n").unwrap();
         fs::write(&legacy.cache, b"stable-cache").unwrap();
         fs::write(&legacy.cache_pending, b"pending-cache").unwrap();
@@ -638,9 +666,10 @@ mod tests {
             b"operator-secret"
         );
         assert_eq!(
-            fs::read(paths.generated.join("operator-note")).unwrap(),
-            b"generated-root"
+            fs::read(legacy_generated.join("operator-note")).unwrap(),
+            b"foreign-data"
         );
+        assert!(paths.generated.is_dir());
     }
 
     #[test]
@@ -733,7 +762,7 @@ mod tests {
     #[test]
     fn five_column_manifest_round_trip() {
         let row = ManifestEntry::parse_tsv(
-            "wireguard\toffice\twg_office\twg-office\t/etc/meduza/generated/wireguard/office/wg.conf",
+            "wireguard\toffice\twg_office\twg-office\t/var/run/meduza/generated/wireguard/office/wg.conf",
         )
         .unwrap();
         assert_eq!(row.kind, InterfaceKind::Wireguard);
