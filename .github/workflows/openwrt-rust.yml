@@ -106,7 +106,9 @@ jobs:
           grep -q -- '"reachable".to_owned()' \
             openwrt-rust/src/report.rs
           ! grep -q -- 'default_postinst' openwrt-rust/package/build-direct.sh
-          grep -q -- "trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2" \
+          ! grep -q -- 'sleep 2' openwrt-rust/package/build-direct.sh
+          ! grep -q -- '/etc/init.d/meduza start.*) &' openwrt-rust/package/build-direct.sh
+          grep -q -- '/etc/init.d/meduza start >/dev/null 2>&1' \
             openwrt-rust/package/build-direct.sh
 
   binary:

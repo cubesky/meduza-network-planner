@@ -138,8 +138,12 @@ rm -f /tmp/luci-indexcache.*
 if [ "${PKG_UPGRADE:-0}" != 1 ]; then
 	/etc/init.d/meduza enable >/dev/null 2>&1 || exit 1
 fi
-( trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2; \
-	/etc/init.d/meduza start || logger -t meduza "deferred post-install start failed" ) &
+# Starting an enabled procd service is a short registration call. Do not run
+# disabled-mode purge/cleanup inside the package manager transaction.
+if [ "$(uci -q get meduza.main.enable 2>/dev/null)" = 1 ]; then
+	/etc/init.d/meduza start >/dev/null 2>&1 || \
+		logger -t meduza "post-install start failed; start Meduza manually or reboot"
+fi
 exit 0
 EOF
 	cat >"$control/prerm" <<'EOF'
@@ -196,8 +200,12 @@ rm -f /tmp/luci-indexcache.*
 if [ "${PKG_UPGRADE:-0}" != 1 ]; then
 	/etc/init.d/meduza enable >/dev/null 2>&1 || exit 1
 fi
-( trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 2; \
-	/etc/init.d/meduza start || logger -t meduza "deferred post-install start failed" ) &
+# Starting an enabled procd service is a short registration call. Do not run
+# disabled-mode purge/cleanup inside the package manager transaction.
+if [ "$(uci -q get meduza.main.enable 2>/dev/null)" = 1 ]; then
+	/etc/init.d/meduza start >/dev/null 2>&1 || \
+		logger -t meduza "post-install start failed; start Meduza manually or reboot"
+fi
 exit 0
 EOF
 	{
