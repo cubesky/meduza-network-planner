@@ -219,16 +219,17 @@ return view.extend({
 		var frrPeers = !disabled && Array.isArray(status.frr_peers) ? status.frr_peers : [];
 		var frrBody = document.getElementById('meduza-frr-body');
 		if (frrBody)
-				dom.content(frrBody, frrPeers.length ? frrPeers.map(function(item) {
+			dom.content(frrBody, frrPeers.length ? frrPeers.map(function(item) {
 				return E('tr', {}, [
 					E('td', {}, [ String(item.protocol || '').toUpperCase() ]),
 					E('td', {}, [ item.peer || '-' ]),
+					E('td', {}, [ item.description || '-' ]),
 					E('td', {}, [ item.remote_as == null ? '-' : String(item.remote_as) ]),
 					E('td', {}, [ item.interface || '-' ]),
 					E('td', {}, [ item.detail || '-' ]),
 					E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(6, disabled ? inactiveMessage : _('No FRR peers are currently known.')) ]);
+			}) : [ emptyRow(7, disabled ? inactiveMessage : _('No FRR peers are currently known.')) ]);
 	},
 
 	updateLog: function(entries) {
@@ -320,6 +321,7 @@ return view.extend({
 			var frrTable = E('table', { 'class': 'table cbi-section-table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', {}, [ _('Protocol') ]), E('th', {}, [ _('Peer') ]),
+					E('th', {}, [ _('Description') ]),
 					E('th', {}, [ _('Remote AS') ]),
 					E('th', {}, [ _('Interface') ]), E('th', {}, [ _('FRR state') ]),
 					E('th', {}, [ _('Status') ])

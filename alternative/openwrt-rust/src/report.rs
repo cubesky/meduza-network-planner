@@ -14,6 +14,7 @@ const MAX_DAEMON_STATUS_BYTES: usize = 64 * 1024;
 const MAX_TINC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_TINC_DUMP_BYTES: usize = 1024 * 1024;
 const MAX_FRR_STATUS_BYTES: usize = 2 * 1024 * 1024;
+const MAX_GENERATED_FRR_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EtcdStatus {
@@ -56,6 +57,7 @@ pub struct TincPeerStatus {
 pub struct FrrPeerStatus {
     pub protocol: String,
     pub peer: String,
+    pub description: Option<String>,
     pub state: String,
     pub detail: String,
     pub remote_as: Option<u64>,
@@ -169,7 +171,7 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
     let frr_running = process_name_running(&["zebra", "watchfrr"]);
     let frr = if frr_running { "up" } else { "down" };
     let frr_peers = if frr_running {
-        collect_frr_peers(runner)
+        collect_frr_peers(paths, runner)
     } else {
         Vec::new()
     };
@@ -205,7 +207,7 @@ fn configured_controller_enabled<R: Runner>(runner: &R) -> Option<bool> {
     }
 }
 
-fn collect_frr_peers<R: Runner>(runner: &R) -> Vec<FrrPeerStatus> {
+fn collect_frr_peers<R: Runner>(paths: &Paths, runner: &R) -> Vec<FrrPeerStatus> {
     let mut peers = BTreeMap::<(String, String), FrrPeerStatus>::new();
     collect_frr_command(
         runner,
@@ -219,6 +221,20 @@ fn collect_frr_peers<R: Runner>(runner: &R) -> Vec<FrrPeerStatus> {
         parse_ospf_neighbors,
         &mut peers,
     );
+    // FRR versions do not expose neighbor descriptions under one stable JSON
+    // field name, and some omit them from summary output entirely. The
+    // owner-marked generated configuration is the authoritative etcd-derived
+    // fallback and also supplies names for OSPF router IDs that are iBGP peers.
+    match generated_frr_descriptions(paths) {
+        Ok(descriptions) => {
+            for peer in peers.values_mut() {
+                if peer.description.is_none() {
+                    peer.description = descriptions.get(&peer.peer).cloned();
+                }
+            }
+        }
+        Err(error) => tracing::warn!("could not read FRR peer descriptions: {error:#}"),
+    }
     peers.into_values().collect()
 }
 
@@ -282,6 +298,10 @@ fn walk_bgp_summary(value: &serde_json::Value, peers: &mut BTreeMap<String, FrrP
                         FrrPeerStatus {
                             protocol: "bgp".into(),
                             peer: peer.clone(),
+                            description: json_string(
+                                data,
+                                &["desc", "description", "peerDescription"],
+                            ),
                             state,
                             detail,
                             remote_as: data.get("remoteAs").and_then(serde_json::Value::as_u64),
@@ -328,6 +348,10 @@ fn walk_ospf_neighbors(value: &serde_json::Value, peers: &mut BTreeMap<String, F
                     FrrPeerStatus {
                         protocol: "ospf".into(),
                         peer,
+                        description: json_string(
+                            object,
+                            &["desc", "description", "peerDescription"],
+                        ),
                         state: normalize_ospf_state(&detail).into(),
                         detail,
                         remote_as: None,
@@ -346,6 +370,26 @@ fn walk_ospf_neighbors(value: &serde_json::Value, peers: &mut BTreeMap<String, F
         }
         _ => {}
     }
+}
+
+fn generated_frr_descriptions(paths: &Paths) -> Result<BTreeMap<String, String>> {
+    if !regular_file_exists(&paths.generated_frr)? {
+        return Ok(BTreeMap::new());
+    }
+    let bytes = atomic::read_bounded(&paths.generated_frr, MAX_GENERATED_FRR_BYTES)?;
+    let text = std::str::from_utf8(&bytes)?;
+    let owner_header = format!("! meduza-owner: {}", crate::OWNER);
+    if text.lines().next() != Some(owner_header.as_str()) {
+        bail!("generated FRR configuration has no Meduza owner marker");
+    }
+    let mut descriptions = BTreeMap::new();
+    for line in text.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 4 && fields[0] == "neighbor" && fields[2] == "description" {
+            descriptions.insert(fields[1].to_owned(), fields[3..].join(" "));
+        }
+    }
+    Ok(descriptions)
 }
 
 fn json_string(
@@ -596,8 +640,12 @@ pub fn print_status<R: Runner>(paths: &Paths, runner: &R, json: bool) -> Result<
         println!("frr/default: {}", status.frr);
         for peer in status.frr_peers {
             println!(
-                "frr/{}/{}: {} ({})",
-                peer.protocol, peer.peer, peer.state, peer.detail
+                "frr/{}/{}: {} ({}, {})",
+                peer.protocol,
+                peer.peer,
+                peer.state,
+                peer.description.as_deref().unwrap_or("-"),
+                peer.detail
             );
         }
     }
@@ -988,7 +1036,7 @@ mod tests {
                 "ipv4Unicast": {
                     "peers": {
                         "10.20.0.2": { "remoteAs": 65002, "state": "Established" },
-                        "10.30.0.2": { "remoteAs": 65003, "state": "Active" }
+                        "10.30.0.2": { "remoteAs": 65003, "state": "Active", "desc": "wg-backbone" }
                     }
                 }
             }"#,
@@ -1000,6 +1048,7 @@ mod tests {
         assert_eq!(peers[0].state, "up");
         assert_eq!(peers[0].remote_as, Some(65002));
         assert_eq!(peers[1].state, "connecting");
+        assert_eq!(peers[1].description.as_deref(), Some("wg-backbone"));
     }
 
     #[test]
@@ -1029,5 +1078,24 @@ mod tests {
         assert_eq!(peers[0].state, "up");
         assert_eq!(peers[0].interface.as_deref(), Some("wg-backbone:10.30.0.1"));
         assert_eq!(peers[1].state, "connecting");
+    }
+
+    #[test]
+    fn generated_frr_supplies_etcd_peer_descriptions() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        atomic::ensure_private_dir(paths.generated_frr.parent().unwrap(), 0o700).unwrap();
+        fs::write(
+            &paths.generated_frr,
+            format!(
+                "! meduza-owner: {}\nrouter bgp 65001\n neighbor 10.20.0.2 description office-vpn\n neighbor 10.255.0.2 description remote-router\n",
+                crate::OWNER
+            ),
+        )
+        .unwrap();
+
+        let descriptions = generated_frr_descriptions(&paths).unwrap();
+        assert_eq!(descriptions.get("10.20.0.2").unwrap(), "office-vpn");
+        assert_eq!(descriptions.get("10.255.0.2").unwrap(), "remote-router");
     }
 }
