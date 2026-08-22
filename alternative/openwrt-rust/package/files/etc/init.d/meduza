@@ -109,6 +109,14 @@ reconcile_settings() {
 }
 
 service_stopped() {
+	local enable
+	config_load meduza
+	config_get_bool enable main enable 0
+	# Disabled start_service() performs the authoritative full purge. Package
+	# removal also invokes purge after quiescing procd. Avoid a redundant
+	# runtime-stop here: APK's default pre-deinstall calls stop even when no
+	# daemon instance exists, which otherwise blocks the package transaction.
+	[ "$enable" = 1 ] || return 0
 	# procd calls this after the supervised process is gone, so cleanup cannot
 	# race an in-flight reconcile.  Persistent LKG and ownership remain intact.
 	"$PROG" runtime-stop

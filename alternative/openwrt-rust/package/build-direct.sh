@@ -89,19 +89,19 @@ cat >"$scripts/prerm-pkg" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 
-meduza_controller_registered() {
+meduza_controller_instance_registered() {
 	local services
 	services="$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null)" || return 2
 	case "$services" in
-		*'"meduza"'*) return 0 ;;
+		*'"instances":{"main"'*|*'"instances": {"main"'*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
-# APK default_prerm normally stopped the service before this hook, whereas
-# IPK normally invokes this hook first. Query procd so both orders are
-# idempotent, and retry a stop only when the exact service remains registered.
-if meduza_controller_registered; then
+# A disabled controller may retain a trigger-only procd service object but has
+# no main instance. Stop only a real instance; purge below is the single
+# authoritative cleanup for disabled and already-stopped installations.
+if meduza_controller_instance_registered; then
 	/etc/init.d/meduza stop >/dev/null 2>&1 || exit 1
 else
 	status=$?
@@ -232,16 +232,10 @@ EOF
 	} >"$scripts/post-upgrade"
 	cat >"$scripts/pre-deinstall" <<'EOF'
 #!/bin/sh
-[ -s "${IPKG_INSTROOT:-}/lib/functions.sh" ] || exit 0
-. "${IPKG_INSTROOT:-}/lib/functions.sh"
-export root="${IPKG_INSTROOT:-}"
-export pkgname="meduza-openwrt-rust"
-echo 'meduza: stopping controller before package removal' >&2
-# default_prerm emits an alarming ubus Not found diagnostic when procd has
-# already removed the service. Its return value does not represent stop()
-# failures; the following owner-aware purge is the authoritative cleanup and
-# will fail closed if any managed runtime could not be removed.
-default_prerm >/dev/null 2>&1 || true
+# Do not call default_prerm here. It unconditionally invokes the init script's
+# stop action even for a disabled controller with no main procd instance. The
+# owner-aware hook appended below performs the exact stop (when needed) and
+# the authoritative purge once, with visible diagnostics.
 EOF
 	sed '1{/^#!/d;}' "$scripts/prerm-pkg" >>"$scripts/pre-deinstall"
 	chmod 0755 "$scripts/pre-install" "$scripts/pre-upgrade" \

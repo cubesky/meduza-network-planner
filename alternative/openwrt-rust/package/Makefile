@@ -49,19 +49,19 @@ define Package/meduza-openwrt-rust/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT:-}" ] && exit 0
 
-meduza_controller_registered() {
+meduza_controller_instance_registered() {
 	local services
 	services="$$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null)" || return 2
 	case "$$services" in
-		*'"meduza"'*) return 0 ;;
+		*'"instances":{"main"'*|*'"instances": {"main"'*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
-# APK default_prerm normally stopped the service before this hook, whereas
-# IPK normally invokes this hook first. Query procd so both orders are
-# idempotent, and retry a stop only when the exact service remains registered.
-if meduza_controller_registered; then
+# A disabled controller may retain a trigger-only procd service object but has
+# no main instance. Stop only a real instance; purge below is the single
+# authoritative cleanup for disabled and already-stopped installations.
+if meduza_controller_instance_registered; then
 	/etc/init.d/meduza stop >/dev/null 2>&1 || exit 1
 else
 	status=$$?

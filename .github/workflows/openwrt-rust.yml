@@ -114,6 +114,9 @@ jobs:
           ! grep -q -- 'default_postinst' alternative/openwrt-rust/package/build-direct.sh
           ! grep -q -- 'sleep 2' alternative/openwrt-rust/package/build-direct.sh
           ! grep -q -- '/etc/init.d/meduza start.*) &' alternative/openwrt-rust/package/build-direct.sh
+          test "$(grep -c '^default_prerm' alternative/openwrt-rust/package/build-direct.sh)" -eq 1
+          grep -q -- 'meduza_controller_instance_registered' \
+            alternative/openwrt-rust/package/build-direct.sh
           grep -q -- '/etc/init.d/meduza start >/dev/null 2>&1' \
             alternative/openwrt-rust/package/build-direct.sh
 
