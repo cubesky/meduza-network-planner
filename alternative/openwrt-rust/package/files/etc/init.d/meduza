@@ -54,11 +54,11 @@ reload_service() {
 	restart
 }
 
-meduza_service_registered() {
+meduza_main_instance_registered() {
 	local services
 	services=$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null) || return 2
 	case "$services" in
-		*'"meduza"'*) return 0 ;;
+		*'"instances":{"main"'*|*'"instances": {"main"'*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -76,7 +76,7 @@ restart() {
 	local status
 	# A disabled controller has no procd instance. Treat that state as a clean
 	# restart source instead of failing on `ubus service delete ... Not found`.
-	if meduza_service_registered; then
+	if meduza_main_instance_registered; then
 		stop || return 1
 	else
 		status=$?

@@ -15,16 +15,16 @@ var callLogRead = rpc.declare({
 	expect: { log: [] }
 });
 
-var callRcInit = rpc.declare({
-	object: 'rc',
-	method: 'init',
-	params: [ 'name', 'action' ]
-});
-
 function reconcileMeduzaService() {
-	return callRcInit('meduza', 'reconcile_settings').then(function(result) {
-		if (result)
-			throw new Error(_('Meduza service restart failed.'));
+	// rpcd's `rc.init` endpoint accepts only the six standard rc.common
+	// actions and discards the invoked script's exit status. `reconcile_settings`
+	// is deliberately a custom action, so execute this exact ACL-whitelisted
+	// command through the file RPC and inspect its real exit code instead.
+	return fs.exec('/etc/init.d/meduza', [ 'reconcile_settings' ]).then(function(result) {
+		if (!result || Number(result.code) !== 0) {
+			var detail = String(result && result.stderr || '').trim();
+			throw new Error(detail || _('Meduza service reconciliation failed.'));
+		}
 
 		ui.addNotification(null,
 			E('p', {}, [ _('Settings were applied and the Meduza service was reconciled.') ]),

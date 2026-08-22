@@ -459,7 +459,7 @@ impl<R: Runner> Reconciler<R> {
         let generated_path = self.paths.generated_frr.to_string_lossy().into_owned();
         if let Err(error) = self.restart_frr_baseline().and_then(|()| {
             self.runner
-                .status("vtysh", ["-b", "-f", generated_path.as_str()])
+                .status("vtysh", frr_runtime_load_args(&generated_path))
         }) {
             let rollback = self.restore_runtime_frr();
             return match rollback {
@@ -700,7 +700,7 @@ impl<R: Runner> Reconciler<R> {
             tracing::warn!("managed FRR runtime is incomplete; attempting recovery");
             self.restart_frr_baseline()?;
             let path = self.paths.generated_frr.to_string_lossy().into_owned();
-            self.runner.status("vtysh", ["-b", "-f", path.as_str()])?;
+            self.runner.status("vtysh", frr_runtime_load_args(&path))?;
             write_runtime_frr_marker(
                 &self.paths,
                 &RuntimeFrrMarker {
@@ -710,6 +710,14 @@ impl<R: Runner> Reconciler<R> {
             )
         }
     }
+}
+
+/// `-b` means "load the boot startup configuration" and therefore selects
+/// `/etc/frr/frr.conf`. It must never be combined with our explicit volatile
+/// input. FRR documents `-f <file>` as the operation that reads and applies a
+/// chosen integrated configuration to the running daemons.
+fn frr_runtime_load_args(path: &str) -> [&str; 2] {
+    ["-f", path]
 }
 
 #[derive(Clone, Debug)]
@@ -1354,6 +1362,14 @@ mod tests {
         .unwrap();
 
         assert!(read_runtime_frr_marker(&paths).is_err());
+    }
+
+    #[test]
+    fn volatile_frr_load_never_selects_the_persistent_boot_configuration() {
+        assert_eq!(
+            frr_runtime_load_args("/var/run/meduza/generated/frr/frr.conf"),
+            ["-f", "/var/run/meduza/generated/frr/frr.conf"]
+        );
     }
 
     #[test]

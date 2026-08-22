@@ -13,8 +13,8 @@
 		},
 		"write": {
 			"uci": [ "meduza" ],
-			"ubus": {
-				"rc": [ "init" ]
+			"file": {
+				"/etc/init.d/meduza reconcile_settings": [ "exec" ]
 			}
 		}
 	}
