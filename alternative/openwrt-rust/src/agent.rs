@@ -19,12 +19,14 @@ pub struct Agent<R: Runner> {
     settings: Settings,
     local_initialized: bool,
     commit: Option<String>,
+    commit_revision: Option<i64>,
     pending_last_ack: Option<String>,
 }
 
 const REPORT_INTERVAL_SECONDS: u64 = 15;
 const REPORT_LEASE_SECONDS: i64 = 60;
 const REPORT_RETRY_MAX_SECONDS: u64 = 60;
+const RECONCILE_SUPERVISION_SECONDS: u64 = 5;
 
 /// Keep status publication outside the reconciliation task. OpenWrt helpers
 /// are synchronous and can take tens of seconds while an interface or daemon
@@ -66,6 +68,7 @@ impl<R: Runner> Agent<R> {
             settings,
             local_initialized: false,
             commit: None,
+            commit_revision: None,
             pending_last_ack: None,
         })
     }
@@ -78,6 +81,7 @@ impl<R: Runner> Agent<R> {
             // LuCI can distinguish an administratively disabled controller
             // from an unknown or crashed one. No etcd connection is made.
             self.commit = None;
+            self.commit_revision = None;
             report::persist_disabled_status(&self.paths, &self.runner)?;
             return Ok(());
         }
@@ -104,7 +108,7 @@ impl<R: Runner> Agent<R> {
             let wait = match result {
                 Ok(()) => {
                     delay = 1;
-                    5
+                    0
                 }
                 Err(error) => {
                     self.persist_etcd_state("error");
@@ -115,6 +119,9 @@ impl<R: Runner> Agent<R> {
                     wait
                 }
             };
+            if wait == 0 {
+                continue;
+            }
             if run_or_shutdown(shutdown.as_mut(), sleep(Duration::from_secs(wait)))
                 .await
                 .is_none()
@@ -170,14 +177,27 @@ impl<R: Runner> Agent<R> {
         let client = etcd.as_mut().expect("connected above");
         let operation = self.reconcile_generation(client).await;
         self.flush_last_ack(client).await;
-        operation
+        let revision = operation?;
+        client
+            .wait_for_commit_change(revision, Duration::from_secs(RECONCILE_SUPERVISION_SECONDS))
+            .await
     }
 
-    async fn reconcile_generation(&mut self, client: &mut Etcd) -> Result<()> {
+    async fn reconcile_generation(&mut self, client: &mut Etcd) -> Result<i64> {
         let (commit, revision) = client.get_with_revision("/commit").await?;
         crate::state::validate_commit(&commit)?;
         self.persist_etcd_state_with_commit("connected", Some(commit.clone()));
-        if self.commit.as_deref() != Some(commit.as_str()) {
+        if generation_changed(
+            self.commit.as_deref(),
+            self.commit_revision,
+            &commit,
+            revision,
+        ) {
+            tracing::info!(
+                commit = ?commit,
+                etcd_revision = revision,
+                "applying published etcd generation"
+            );
             let snapshot = self
                 .fetch_snapshot(client, commit.clone(), revision)
                 .await?;
@@ -191,9 +211,10 @@ impl<R: Runner> Agent<R> {
                 return Err(error);
             }
             self.commit = Some(commit);
+            self.commit_revision = Some(revision);
             self.pending_last_ack = Some(snapshot.applied_at);
         }
-        Ok(())
+        Ok(revision)
     }
 
     fn persist_etcd_state(&self, state: &str) {
@@ -227,8 +248,8 @@ impl<R: Runner> Agent<R> {
         let all_nodes = client
             .get_prefix_at("/nodes/", revision, &mut budget)
             .await?;
-        let confirmed = client.get("/commit").await?;
-        if confirmed != commit {
+        let (confirmed, confirmed_revision) = client.get_with_revision("/commit").await?;
+        if confirmed != commit || confirmed_revision != revision {
             anyhow::bail!("etcd commit changed while the snapshot was being read");
         }
         let snapshot = Snapshot {
@@ -257,11 +278,16 @@ impl<R: Runner> Agent<R> {
         match result {
             Ok(snapshot) => {
                 self.commit = Some(snapshot.commit);
+                // A persistent cache contains the opaque generation label but
+                // not the etcd MVCC revision. Force the next live observation
+                // to reconcile even if the publisher reused the same label.
+                self.commit_revision = None;
                 self.pending_last_ack = Some(snapshot.applied_at);
                 tracing::info!("rolled back to stable last-known-good configuration");
             }
             Err(_) => {
                 self.commit = None;
+                self.commit_revision = None;
                 if let Err(error) =
                     Reconciler::new(self.paths.clone(), self.runner.clone()).runtime_stop()
                 {
@@ -285,6 +311,15 @@ impl<R: Runner> Agent<R> {
             }
         }
     }
+}
+
+fn generation_changed(
+    applied_commit: Option<&str>,
+    applied_revision: Option<i64>,
+    live_commit: &str,
+    live_revision: i64,
+) -> bool {
+    applied_commit != Some(live_commit) || applied_revision != Some(live_revision)
 }
 
 async fn online_report_loop(settings: Settings) {
@@ -504,6 +539,7 @@ mod tests {
             settings: settings(),
             local_initialized: false,
             commit: None,
+            commit_revision: None,
             pending_last_ack: None,
         }
     }
@@ -596,5 +632,33 @@ mod tests {
             run_or_shutdown(shutdown.as_mut(), std::future::pending::<u8>()).await,
             None
         );
+    }
+
+    #[test]
+    fn a_republished_commit_value_is_a_new_generation() {
+        assert!(!generation_changed(
+            Some("release-42"),
+            Some(100),
+            "release-42",
+            100
+        ));
+        assert!(generation_changed(
+            Some("release-42"),
+            Some(100),
+            "release-42",
+            101
+        ));
+        assert!(generation_changed(
+            Some("release-42"),
+            None,
+            "release-42",
+            100
+        ));
+        assert!(generation_changed(
+            Some("release-41"),
+            Some(100),
+            "release-42",
+            101
+        ));
     }
 }

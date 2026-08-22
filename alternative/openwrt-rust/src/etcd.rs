@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use etcd_client::{
     Certificate, Client, ConnectOptions, GetOptions, Identity, KvClient, PutOptions, TlsOptions,
+    WatchOptions,
 };
+use tokio::time::timeout;
 
 use crate::config::Settings;
 use crate::model::FlattenedBudget;
@@ -97,6 +99,39 @@ impl Etcd {
             }
         }
         Ok(values)
+    }
+
+    /// Wait until `/commit` is changed after the supplied MVCC revision. The
+    /// start revision closes the GET-to-watch race: a publish that lands while
+    /// the watch is being created is replayed by etcd instead of being missed.
+    /// A short timeout keeps runtime supervision active even when no new
+    /// generation is published.
+    pub async fn wait_for_commit_change(
+        &mut self,
+        after_revision: i64,
+        max_wait: Duration,
+    ) -> Result<()> {
+        let options = WatchOptions::new().with_start_revision(after_revision.saturating_add(1));
+        let mut stream = self.client.watch("/commit", Some(options)).await?;
+        let wait = async {
+            while let Some(response) = stream.message().await? {
+                if response.canceled() {
+                    bail!(
+                        "etcd commit watch was canceled at compact revision {}: {}",
+                        response.compact_revision(),
+                        response.cancel_reason()
+                    );
+                }
+                if !response.events().is_empty() {
+                    return Ok(());
+                }
+            }
+            bail!("etcd commit watch ended unexpectedly")
+        };
+        match timeout(max_wait, wait).await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
+        }
     }
 
     pub async fn put(&mut self, key: &str, value: &str) -> Result<()> {
