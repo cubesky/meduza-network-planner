@@ -1,5 +1,5 @@
 __pycache__/
-/openwrt-rust/target/
-/openwrt-rust/target-root/
+/alternative/openwrt-rust/target/
+/alternative/openwrt-rust/target-root/
 /.openwrt-downloads/
 /.openwrt-sdk-filogic/

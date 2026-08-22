@@ -585,165 +585,818 @@ fn render_frr(
     desired: &DesiredState,
     options: &RenderOptions,
 ) -> Result<RenderedFile> {
-    let router_id = snapshot
-        .node_value("bgp/router_id")
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            snapshot
-                .node_value("router_id")
-                .filter(|value| !value.is_empty())
-        });
-    if let Some(value) = router_id {
-        value
-            .parse::<Ipv4Addr>()
-            .with_context(|| format!("invalid FRR router ID: {value:?}"))?;
+    let plan = FrrPlan::from_snapshot(snapshot, desired)?;
+    let mut lines = vec![
+        format!("! meduza-owner: {}", options.owner),
+        "frr defaults traditional".into(),
+        "service integrated-vtysh-config".into(),
+        format!("hostname {}", snapshot.node_id),
+    ];
+    if let Some(router_id) = plan.router_id {
+        lines.push(format!("ip router-id {router_id}"));
     }
-    let area = snapshot
-        .node_value("ospf/area")
-        .filter(|value| !value.is_empty())
-        .unwrap_or("0");
-    validate_ospf_area(area)?;
-    let lans = prefix_lines(snapshot.node_value("lan"), "LAN prefix")?;
-    let private_lans = prefix_lines(snapshot.node_value("private_lan"), "private LAN prefix")?;
-    let internal = snapshot
-        .global_value("internal_routing_system")
-        .filter(|value| !value.is_empty())
-        .unwrap_or("ospf");
-    if !matches!(internal, "ospf" | "bgp") {
-        bail!("unsupported internal_routing_system: {internal:?}");
+    lines.extend([
+        String::new(),
+        "ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0".into(),
+        String::new(),
+    ]);
+
+    append_ospf_connected_policy(&mut lines, "LAN", &plan.lans);
+    append_ospf_connected_policy(&mut lines, "PRIVATE-LAN", &plan.private_lans);
+    append_bgp_filter_policy(&mut lines, "IN", &plan.in_rules);
+    append_bgp_filter_policy(&mut lines, "OUT", &plan.out_rules);
+    append_private_lan_policy(&mut lines, &plan.private_lans);
+
+    lines.extend([
+        "route-map RM-OSPF-TO-BGP deny 20".into(),
+        format!(" match tag {TAG_NO_REINJECT}"),
+        "!".into(),
+        "route-map RM-OSPF-TO-BGP permit 30".into(),
+        "!".into(),
+        String::new(),
+        "route-map RM-BGP-TO-OSPF permit 10".into(),
+    ]);
+    if plan.to_ospf_default_only {
+        lines.push(" match ip address prefix-list PL-DEFAULT".into());
+    }
+    lines.extend([
+        format!(" set tag {TAG_NO_REINJECT}"),
+        "!".into(),
+        String::new(),
+    ]);
+
+    append_bgp_control_policy(&mut lines, &plan.transports);
+    if plan.ibgp_neighbors.iter().any(|neighbor| neighbor.roaming) {
+        lines.extend([
+            "route-map RM-BGP-IN-ROAMING permit 10".into(),
+            " match ip address prefix-list PL-BGP-IN".into(),
+            " set local-preference 50".into(),
+            "route-map RM-BGP-IN-ROAMING permit 20".into(),
+            "!".into(),
+            String::new(),
+        ]);
     }
 
-    let mut output = String::new();
-    writeln!(output, "! meduza-owner: {}", options.owner)?;
-    writeln!(output, "frr defaults traditional")?;
-    writeln!(output, "hostname meduza-{}", snapshot.node_id)?;
-    writeln!(output, "service integrated-vtysh-config")?;
-    writeln!(output, "!")?;
-
-    if snapshot.node_enabled("ospf/enable") {
-        writeln!(output, "router ospf")?;
-        if let Some(router_id) = router_id {
-            writeln!(output, " ospf router-id {router_id}")?;
-        }
-        for prefix in lans.iter().chain(private_lans.iter()) {
-            writeln!(output, " network {prefix} area {area}")?;
-        }
-        writeln!(output, "!")?;
+    if plan.ospf_enabled {
+        append_ospf_router(&mut lines, &plan);
+    }
+    if plan.bgp_enabled {
+        append_bgp_router(&mut lines, &plan)?;
     }
 
-    if let Some(asn) = snapshot
-        .node_value("bgp/asn")
-        .filter(|value| !value.is_empty())
-    {
-        validate_asn(asn, "local BGP ASN")?;
-        writeln!(output, "router bgp {asn}")?;
-        if let Some(router_id) = router_id {
-            writeln!(output, " bgp router-id {router_id}")?;
-        }
-        let mut neighbors = BTreeMap::<Ipv4Addr, (String, String)>::new();
-        for interface in desired
-            .interfaces
-            .iter()
-            .filter(|item| matches!(item.kind, VpnKind::OpenVpn | VpnKind::WireGuard))
-        {
-            let base = format!("{}/{}/bgp/", interface.kind.as_str(), interface.instance);
-            if snapshot
-                .node_value(&format!("{base}enable"))
-                .is_some_and(|value| !parse_enabled(value))
-            {
-                continue;
-            }
-            let peer_ip = snapshot
-                .node_value(&format!("{base}peer_ip"))
-                .filter(|value| !value.is_empty());
-            let peer_asn = snapshot
-                .node_value(&format!("{base}peer_asn"))
-                .filter(|value| !value.is_empty());
-            match (peer_ip, peer_asn) {
-                (None, None) => continue,
-                (Some(ip), Some(peer_asn)) => {
-                    let ip = ip
-                        .parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid BGP peer IP: {ip:?}"))?;
-                    validate_asn(peer_asn, "BGP peer ASN")?;
-                    insert_neighbor(
-                        &mut neighbors,
-                        ip,
-                        peer_asn.to_owned(),
-                        interface.device.clone(),
-                    )?;
-                }
-                _ => bail!(
-                    "BGP transport {}/{} must set both peer_ip and peer_asn",
-                    interface.kind,
-                    interface.instance
-                ),
-            }
-        }
-        if internal == "bgp" {
-            for node_id in snapshot.all_node_ids() {
-                if node_id == snapshot.node_id {
-                    continue;
-                }
-                validate_node_id(&node_id)?;
-                let Some(peer) = snapshot
-                    .all_node_value(&node_id, "router_id")
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| {
-                        snapshot
-                            .all_node_value(&node_id, "bgp/router_id")
-                            .filter(|value| !value.is_empty())
-                    })
-                else {
-                    continue;
-                };
-                let peer = peer
-                    .parse::<Ipv4Addr>()
-                    .with_context(|| format!("invalid iBGP router ID for {node_id}: {peer:?}"))?;
-                if router_id.is_some_and(|local| local == peer.to_string()) {
-                    continue;
-                }
-                insert_neighbor(&mut neighbors, peer, "internal".into(), String::new())?;
-            }
-        }
-        for (ip, (remote_as, source)) in neighbors {
-            writeln!(output, " neighbor {ip} remote-as {remote_as}")?;
-            if !source.is_empty() {
-                writeln!(output, " neighbor {ip} update-source {source}")?;
-            }
-        }
-        writeln!(output, " address-family ipv4 unicast")?;
-        for prefix in &lans {
-            ensure_ipv4_prefix(prefix, "BGP LAN")?;
-            writeln!(output, "  network {prefix}")?;
-        }
-        if internal == "bgp" {
-            for prefix in &private_lans {
-                ensure_ipv4_prefix(prefix, "BGP private LAN")?;
-                writeln!(output, "  network {prefix}")?;
-            }
-        }
-        writeln!(output, " exit-address-family")?;
-        writeln!(output, "!")?;
-    }
-    writeln!(output, "line vty")?;
-    writeln!(output, "!")?;
+    let output = lines.join("\n").trim().to_owned() + "\n";
     Ok(rendered_text(options.frr_path.clone(), 0o640, output))
 }
 
-fn insert_neighbor(
-    neighbors: &mut BTreeMap<Ipv4Addr, (String, String)>,
-    address: Ipv4Addr,
-    remote_as: String,
-    source: String,
-) -> Result<()> {
-    if let Some(existing) = neighbors.get(&address) {
-        if existing != &(remote_as.clone(), source.clone()) {
-            bail!("conflicting BGP definitions for neighbor {address}");
+const TAG_NO_REINJECT: u32 = 65_000;
+const COMMUNITY_EBGP_LEARNED: u32 = 9_999;
+
+#[derive(Debug, Clone)]
+struct PrefixRule {
+    action: String,
+    rest: String,
+}
+
+#[derive(Debug, Clone)]
+struct FrrTransport {
+    kind: VpnKind,
+    name: String,
+    peer_ip: Ipv4Addr,
+    peer_asn: String,
+    update_source: String,
+    weight: Option<u32>,
+    no_transit: bool,
+    no_forward: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InternalBgpNeighbor {
+    name: String,
+    router_id: Ipv4Addr,
+    roaming: bool,
+}
+
+#[derive(Debug)]
+struct FrrPlan {
+    router_id: Option<Ipv4Addr>,
+    internal: String,
+    ospf_enabled: bool,
+    bgp_enabled: bool,
+    local_asn: Option<String>,
+    max_paths: u32,
+    ospf_area: String,
+    active_ifaces: Vec<String>,
+    ospf_redistribute_bgp: bool,
+    to_ospf_default_only: bool,
+    lans: Vec<String>,
+    private_lans: Vec<String>,
+    access_networks: Vec<String>,
+    advertised_networks: Vec<String>,
+    edge_broadcast: Vec<String>,
+    in_rules: Vec<PrefixRule>,
+    out_rules: Vec<PrefixRule>,
+    transit_all: bool,
+    transit_asns: BTreeSet<String>,
+    transports: Vec<FrrTransport>,
+    ibgp_neighbors: Vec<InternalBgpNeighbor>,
+}
+
+impl FrrPlan {
+    fn from_snapshot(snapshot: &FlatSnapshot, desired: &DesiredState) -> Result<Self> {
+        let router_id = snapshot
+            .node_value("router_id")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<Ipv4Addr>()
+                    .with_context(|| format!("invalid FRR router ID: {value:?}"))
+            })
+            .transpose()?;
+        let internal = snapshot
+            .global_value("internal_routing_system")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("ospf")
+            .to_owned();
+        if !matches!(internal.as_str(), "ospf" | "bgp") {
+            bail!("unsupported internal_routing_system: {internal:?}");
         }
-        return Ok(());
+
+        let configured_ospf = exact_true(snapshot.node_value("ospf/enable"));
+        let bgp_enabled = exact_true(snapshot.node_value("bgp/enable"));
+        let ospf_enabled = internal != "bgp" && configured_ospf;
+        let local_asn = snapshot
+            .node_value("bgp/local_asn")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if bgp_enabled {
+            let asn = local_asn
+                .as_deref()
+                .context("BGP is enabled but bgp/local_asn is not configured")?;
+            validate_asn(asn, "local BGP ASN")?;
+        }
+        let max_paths = parse_positive_u32(
+            snapshot.node_value("bgp/max_paths").unwrap_or("1"),
+            "BGP maximum paths",
+        )?;
+        let ospf_area = snapshot
+            .node_value("ospf/area")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("0")
+            .to_owned();
+        validate_ospf_area(&ospf_area)?;
+
+        let active_ifaces = sorted_tokens(
+            snapshot.node_value("ospf/active_ifaces"),
+            "OSPF active interface",
+        )?;
+        let inject_site_lan =
+            exact_true_or_default(snapshot.node_value("ospf/inject_site_lan"), true);
+        let inject_private_lan =
+            exact_true_or_default(snapshot.node_value("ospf/inject_private_lan"), true);
+        let lans = if inject_site_lan {
+            sorted_ipv4_prefixes(snapshot.node_value("lan"), "LAN prefix")?
+        } else {
+            Vec::new()
+        };
+        let private_lans = if inject_private_lan {
+            sorted_ipv4_prefixes(snapshot.node_value("private_lan"), "private LAN prefix")?
+        } else {
+            Vec::new()
+        };
+        let access_networks = parse_access_networks(snapshot)?;
+        let advertised_networks = parse_advertised_network_mappings(snapshot)?;
+        let edge_broadcast = sorted_ipv4_prefixes(
+            snapshot.global_value("bgp/edge_broadcast"),
+            "BGP edge broadcast prefix",
+        )?;
+        let in_rules = parse_prefix_rules(
+            snapshot.global_value("bgp/filter/in"),
+            &[("deny", "0.0.0.0/0"), ("permit", "0.0.0.0/0 le 32")],
+        )?;
+        let out_rules = parse_prefix_rules(
+            snapshot.global_value("bgp/filter/out"),
+            &[("permit", "0.0.0.0/0 le 32")],
+        )?;
+        let (transit_all, transit_asns) = parse_transit_asns(snapshot)?;
+        let transports = parse_frr_transports(snapshot, desired)?;
+        let ibgp_neighbors = if internal == "bgp" && bgp_enabled {
+            parse_internal_bgp_neighbors(snapshot)?
+        } else {
+            Vec::new()
+        };
+        if !ibgp_neighbors.is_empty() && router_id.is_none() {
+            bail!("internal BGP requires /nodes/<NODE_ID>/router_id");
+        }
+
+        Ok(Self {
+            router_id,
+            internal,
+            ospf_enabled,
+            bgp_enabled,
+            local_asn,
+            max_paths,
+            ospf_area,
+            active_ifaces,
+            ospf_redistribute_bgp: exact_true_or_default(
+                snapshot.node_value("ospf/redistribute_bgp"),
+                true,
+            ),
+            to_ospf_default_only: exact_true(snapshot.node_value("bgp/to_ospf/default_only")),
+            lans,
+            private_lans,
+            access_networks,
+            advertised_networks,
+            edge_broadcast,
+            in_rules,
+            out_rules,
+            transit_all,
+            transit_asns,
+            transports,
+            ibgp_neighbors,
+        })
     }
-    neighbors.insert(address, (remote_as, source));
+}
+
+fn exact_true(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+fn exact_true_or_default(value: Option<&str>, default: bool) -> bool {
+    value.map_or(default, |value| value == "true")
+}
+
+fn parse_positive_u32(value: &str, description: &str) -> Result<u32> {
+    let parsed: u32 = validate_single_line(value, description)?
+        .parse()
+        .with_context(|| format!("invalid {description}: {value:?}"))?;
+    if parsed == 0 {
+        bail!("{description} cannot be zero");
+    }
+    Ok(parsed)
+}
+
+fn sorted_tokens(value: Option<&str>, description: &str) -> Result<Vec<String>> {
+    value
+        .map(nonblank_lines)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| validate_token(&value, description).map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+fn sorted_ipv4_prefixes(value: Option<&str>, description: &str) -> Result<Vec<String>> {
+    prefix_lines(value, description)?
+        .into_iter()
+        .map(|prefix| {
+            ensure_ipv4_prefix(&prefix, description)?;
+            Ok(prefix)
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+fn parse_access_networks(snapshot: &FlatSnapshot) -> Result<Vec<String>> {
+    if !exact_true(snapshot.node_value("access/enable")) {
+        return Ok(Vec::new());
+    }
+    let Some(value) = snapshot
+        .node_value("access/network")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![canonical_ipv4_network(value, "access network")?])
+}
+
+fn canonical_ipv4_network(value: &str, description: &str) -> Result<String> {
+    let (address, prefix) = ipv4_cidr_parts(value, description)?;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Ok(format!(
+        "{}/{}",
+        Ipv4Addr::from(u32::from(address) & mask),
+        prefix
+    ))
+}
+
+fn ipv4_cidr_parts(value: &str, description: &str) -> Result<(Ipv4Addr, u8)> {
+    let value = validate_cidr(value, description)?;
+    ensure_ipv4_prefix(value, description)?;
+    let (address, prefix) = value
+        .split_once('/')
+        .context("validated IPv4 CIDR has no prefix")?;
+    Ok((
+        address.parse().context("validated IPv4 address changed")?,
+        prefix.parse().context("validated IPv4 prefix changed")?,
+    ))
+}
+
+fn parse_advertised_network_mappings(snapshot: &FlatSnapshot) -> Result<Vec<String>> {
+    let prefix = format!("/nodes/{}/network_mapping/", snapshot.node_id);
+    let mut advertised = BTreeSet::new();
+    for (key, target) in snapshot
+        .node
+        .range(prefix.clone()..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+    {
+        let source = key
+            .strip_prefix(&prefix)
+            .context("network mapping prefix changed")?;
+        if source.is_empty() || target.trim().is_empty() {
+            continue;
+        }
+        let (_, source_prefix) = ipv4_cidr_parts(source, "network mapping source")?;
+        let (_, target_prefix) = ipv4_cidr_parts(target.trim(), "network mapping target")?;
+        if source_prefix != target_prefix {
+            bail!(
+                "network mapping {source:?} -> {:?} has different prefix lengths",
+                target.trim()
+            );
+        }
+        advertised.insert(source.to_owned());
+    }
+    Ok(advertised.into_iter().collect())
+}
+
+fn parse_prefix_rules(value: Option<&str>, defaults: &[(&str, &str)]) -> Result<Vec<PrefixRule>> {
+    let mut rules = Vec::new();
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        for line in nonblank_lines(value) {
+            if line.starts_with('#') {
+                continue;
+            }
+            let (action, rest) = line
+                .split_once(char::is_whitespace)
+                .with_context(|| format!("invalid prefix-list rule line: {line:?}"))?;
+            let action = action.to_ascii_lowercase();
+            if !matches!(action.as_str(), "permit" | "deny") {
+                bail!("invalid action in prefix-list rule: {line:?}");
+            }
+            let rest = rest.trim();
+            validate_prefix_rule_rest(rest)?;
+            rules.push(PrefixRule {
+                action,
+                rest: rest.to_owned(),
+            });
+        }
+    } else {
+        for (action, rest) in defaults {
+            rules.push(PrefixRule {
+                action: (*action).into(),
+                rest: (*rest).into(),
+            });
+        }
+    }
+    Ok(rules)
+}
+
+fn validate_prefix_rule_rest(value: &str) -> Result<()> {
+    let mut tokens = value.split_whitespace();
+    let prefix = tokens.next().context("prefix-list rule has no prefix")?;
+    ipv4_cidr_parts(prefix, "BGP prefix-list rule")?;
+    let remainder: Vec<_> = tokens.collect();
+    if remainder.len() % 2 != 0 {
+        bail!("invalid BGP prefix-list modifiers: {value:?}");
+    }
+    for pair in remainder.chunks_exact(2) {
+        if !matches!(pair[0], "ge" | "le") {
+            bail!("invalid BGP prefix-list modifier: {:?}", pair[0]);
+        }
+        let length: u8 = pair[1]
+            .parse()
+            .with_context(|| format!("invalid BGP prefix length: {:?}", pair[1]))?;
+        if length > 32 {
+            bail!("BGP prefix length exceeds 32: {length}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_transit_asns(snapshot: &FlatSnapshot) -> Result<(bool, BTreeSet<String>)> {
+    let mut all = false;
+    let mut asns = BTreeSet::new();
+    for value in snapshot
+        .global_value("bgp/transit")
+        .map(nonblank_lines)
+        .unwrap_or_default()
+    {
+        if value == "*" {
+            all = true;
+        } else {
+            validate_asn(&value, "BGP transit ASN")?;
+            asns.insert(value);
+        }
+    }
+    Ok((all, asns))
+}
+
+fn parse_frr_transports(
+    snapshot: &FlatSnapshot,
+    desired: &DesiredState,
+) -> Result<Vec<FrrTransport>> {
+    let mut transports = Vec::new();
+    let mut peers = BTreeSet::new();
+    for interface in desired
+        .interfaces
+        .iter()
+        .filter(|interface| matches!(interface.kind, VpnKind::OpenVpn | VpnKind::WireGuard))
+    {
+        let interface_base = format!("{}/{}", interface.kind.as_str(), interface.instance);
+        if !exact_true(snapshot.node_value(&format!("{interface_base}/enable"))) {
+            continue;
+        }
+        let base = format!("{interface_base}/bgp/");
+        if !exact_true_or_default(snapshot.node_value(&format!("{base}enable")), true) {
+            continue;
+        }
+        let peer_ip = snapshot
+            .node_value(&format!("{base}peer_ip"))
+            .filter(|value| !value.is_empty());
+        let peer_asn = snapshot
+            .node_value(&format!("{base}peer_asn"))
+            .filter(|value| !value.is_empty());
+        let (peer_ip, peer_asn) = match (peer_ip, peer_asn) {
+            (None, None) => continue,
+            (Some(peer_ip), Some(peer_asn)) => (peer_ip, peer_asn),
+            _ => bail!(
+                "BGP transport {}/{} must set both peer_ip and peer_asn",
+                interface.kind,
+                interface.instance
+            ),
+        };
+        let peer_ip = peer_ip
+            .parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid BGP peer IP: {peer_ip:?}"))?;
+        validate_asn(peer_asn, "BGP peer ASN")?;
+        if !peers.insert(peer_ip) {
+            bail!("duplicate BGP transport neighbor: {peer_ip}");
+        }
+        let update_source = if interface.kind == VpnKind::WireGuard {
+            interface.device.clone()
+        } else {
+            snapshot
+                .node_value(&format!("{base}update_source"))
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&interface.device)
+                .to_owned()
+        };
+        validate_token(&update_source, "BGP update source")?;
+        let weight = snapshot
+            .node_value(&format!("{base}weight"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_positive_u32(value, "BGP neighbor weight"))
+            .transpose()?;
+        transports.push(FrrTransport {
+            kind: interface.kind,
+            name: interface.instance.clone(),
+            peer_ip,
+            peer_asn: peer_asn.to_owned(),
+            update_source,
+            weight,
+            no_transit: snapshot
+                .node_value(&format!("{base}no_transit"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            no_forward: snapshot
+                .node_value(&format!("{base}no_forward"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        });
+    }
+    Ok(transports)
+}
+
+fn parse_internal_bgp_neighbors(snapshot: &FlatSnapshot) -> Result<Vec<InternalBgpNeighbor>> {
+    let mut result = Vec::new();
+    let mut router_ids = BTreeSet::new();
+    for node_id in snapshot.all_node_ids() {
+        if node_id == snapshot.node_id {
+            continue;
+        }
+        validate_node_id(&node_id)?;
+        let Some(router_id) = snapshot
+            .all_node_value(&node_id, "router_id")
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let router_id = router_id
+            .parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid iBGP router ID for {node_id}: {router_id:?}"))?;
+        if !router_ids.insert(router_id) {
+            bail!("duplicate iBGP router ID: {router_id}");
+        }
+        let behavior = snapshot
+            .all_node_value(&node_id, "behavior")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("static");
+        if !matches!(behavior, "static" | "roaming") {
+            bail!("unsupported node behavior for {node_id}: {behavior:?}");
+        }
+        result.push(InternalBgpNeighbor {
+            name: node_id,
+            router_id,
+            roaming: behavior == "roaming",
+        });
+    }
+    Ok(result)
+}
+
+fn append_ospf_connected_policy(lines: &mut Vec<String>, suffix: &str, prefixes: &[String]) {
+    if prefixes.is_empty() {
+        return;
+    }
+    for (index, prefix) in prefixes.iter().enumerate() {
+        lines.push(format!(
+            "ip prefix-list PL-OSPF-{suffix} seq {} permit {prefix}",
+            (index + 1) * 10
+        ));
+    }
+    lines.extend([
+        String::new(),
+        format!(
+            "route-map RM-OSPF-CONN{} permit 10",
+            if suffix == "LAN" { "" } else { "-PRIVATE" }
+        ),
+        format!(" match ip address prefix-list PL-OSPF-{suffix}"),
+        "!".into(),
+        String::new(),
+    ]);
+}
+
+fn append_bgp_filter_policy(lines: &mut Vec<String>, direction: &str, rules: &[PrefixRule]) {
+    for (index, rule) in rules.iter().enumerate() {
+        lines.push(format!(
+            "ip prefix-list PL-BGP-{direction} seq {} {} {}",
+            (index + 1) * 10,
+            rule.action,
+            rule.rest
+        ));
+    }
+    if direction == "IN" {
+        lines.push(String::new());
+    }
+    lines.extend([
+        format!("route-map RM-BGP-{direction} permit 10"),
+        format!(" match ip address prefix-list PL-BGP-{direction}"),
+        "!".into(),
+        String::new(),
+    ]);
+}
+
+fn append_private_lan_policy(lines: &mut Vec<String>, private_lans: &[String]) {
+    if private_lans.is_empty() {
+        return;
+    }
+    for (index, prefix) in private_lans.iter().enumerate() {
+        lines.push(format!(
+            "ip prefix-list PL-PRIVATE-LAN seq {} permit {prefix}",
+            (index + 1) * 10
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "route-map RM-BGP-OUT-EXTERNAL deny 5".into(),
+        " match ip address prefix-list PL-PRIVATE-LAN".into(),
+        "route-map RM-BGP-OUT-EXTERNAL permit 10".into(),
+        " match ip address prefix-list PL-BGP-OUT".into(),
+        "!".into(),
+        String::new(),
+        "route-map RM-BGP-OUT-INTERNAL permit 5".into(),
+        " match ip address prefix-list PL-PRIVATE-LAN".into(),
+        "route-map RM-BGP-OUT-INTERNAL permit 10".into(),
+        " match ip address prefix-list PL-BGP-OUT".into(),
+        "!".into(),
+        String::new(),
+        "route-map RM-OSPF-TO-BGP deny 10".into(),
+        " match ip address prefix-list PL-PRIVATE-LAN".into(),
+        "!".into(),
+    ]);
+}
+
+fn append_bgp_control_policy(lines: &mut Vec<String>, transports: &[FrrTransport]) {
+    let has_no_forward = transports.iter().any(|transport| transport.no_forward);
+    let has_no_transit = transports.iter().any(|transport| transport.no_transit);
+    let mut sorted: Vec<_> = transports.iter().collect();
+    sorted.sort_by_key(|transport| transport.peer_ip.to_string());
+    if has_no_forward {
+        lines.extend([
+            format!("bgp community-list standard EBGP_LEARNED permit {COMMUNITY_EBGP_LEARNED}"),
+            "!".into(),
+            "route-map RM-BGP-IN-TAG-EBGP permit 10".into(),
+            " match ip address prefix-list PL-BGP-IN".into(),
+            format!(" set community {COMMUNITY_EBGP_LEARNED} additive"),
+            "route-map RM-BGP-IN-TAG-EBGP permit 20".into(),
+            "!".into(),
+            String::new(),
+        ]);
+    }
+    for transport in sorted.iter().filter(|transport| transport.no_transit) {
+        let peer = transport.peer_ip.to_string().replace('.', "-");
+        lines.extend([
+            format!("route-map RM-BGP-IN-{peer} permit 10"),
+            " match ip address prefix-list PL-BGP-IN".into(),
+            " match as-path 1".into(),
+            format!("route-map RM-BGP-IN-{peer} deny 20"),
+            " match ip address prefix-list PL-BGP-IN".into(),
+            format!("route-map RM-BGP-IN-{peer} permit 30"),
+            " ! Allow all other routes".into(),
+            "!".into(),
+            String::new(),
+        ]);
+    }
+    if has_no_transit {
+        lines.extend([
+            "bgp as-path access-list 1 permit ^[0-9]+$".into(),
+            "!".into(),
+        ]);
+    }
+    for transport in sorted.iter().filter(|transport| transport.no_forward) {
+        let peer = transport.peer_ip.to_string().replace('.', "-");
+        lines.extend([
+            format!("route-map RM-BGP-OUT-{peer} deny 10"),
+            " match community EBGP_LEARNED".into(),
+            format!("route-map RM-BGP-OUT-{peer} permit 20"),
+            " ! Allow locally-originated and iBGP routes".into(),
+            "!".into(),
+            String::new(),
+        ]);
+    }
+}
+
+fn append_ospf_router(lines: &mut Vec<String>, plan: &FrrPlan) {
+    for interface in &plan.active_ifaces {
+        lines.extend([
+            format!("interface {interface}"),
+            format!(" ip ospf area {}", plan.ospf_area),
+            " ip ospf network broadcast".into(),
+            "!".into(),
+        ]);
+    }
+    lines.push("router ospf".into());
+    if let Some(router_id) = plan.router_id {
+        lines.push(format!(" ospf router-id {router_id}"));
+    }
+    if !plan.active_ifaces.is_empty() {
+        lines.push(" passive-interface default".into());
+        for interface in &plan.active_ifaces {
+            lines.push(format!(" no passive-interface {interface}"));
+        }
+    }
+    if !plan.lans.is_empty() {
+        lines.push(" redistribute connected route-map RM-OSPF-CONN".into());
+    }
+    if !plan.private_lans.is_empty() {
+        lines.push(" redistribute connected route-map RM-OSPF-CONN-PRIVATE".into());
+    }
+    if plan.ospf_redistribute_bgp && plan.bgp_enabled {
+        lines.push(" redistribute bgp route-map RM-BGP-TO-OSPF".into());
+    }
+    lines.extend(["!".into(), String::new()]);
+}
+
+fn append_bgp_router(lines: &mut Vec<String>, plan: &FrrPlan) -> Result<()> {
+    let local_asn = plan
+        .local_asn
+        .as_deref()
+        .context("validated BGP plan has no local ASN")?;
+    lines.push(format!("router bgp {local_asn}"));
+    if let Some(router_id) = plan.router_id {
+        lines.push(format!(" bgp router-id {router_id}"));
+    }
+    for transport in &plan.transports {
+        lines.extend([
+            format!(
+                " neighbor {} remote-as {}",
+                transport.peer_ip, transport.peer_asn
+            ),
+            format!(
+                " neighbor {} description {}",
+                transport.peer_ip,
+                if transport.kind == VpnKind::OpenVpn {
+                    transport.name.clone()
+                } else {
+                    format!("wg-{}", transport.name)
+                }
+            ),
+            format!(
+                " neighbor {} update-source {}",
+                transport.peer_ip, transport.update_source
+            ),
+        ]);
+    }
+    let update_source = plan
+        .router_id
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    for neighbor in &plan.ibgp_neighbors {
+        lines.extend([
+            format!(" neighbor {} remote-as internal", neighbor.router_id),
+            format!(
+                " neighbor {} description {}",
+                neighbor.router_id, neighbor.name
+            ),
+            format!(
+                " neighbor {} update-source {update_source}",
+                neighbor.router_id
+            ),
+        ]);
+    }
+    lines.extend([
+        " address-family ipv4 unicast".into(),
+        format!("  maximum-paths {}", plan.max_paths),
+    ]);
+    for prefix in plan
+        .lans
+        .iter()
+        .chain(plan.access_networks.iter())
+        .chain(
+            (plan.internal == "bgp")
+                .then_some(plan.private_lans.iter())
+                .into_iter()
+                .flatten(),
+        )
+        .chain(plan.advertised_networks.iter())
+    {
+        lines.push(format!("  network {prefix}"));
+    }
+    if !plan.transports.is_empty() {
+        for prefix in &plan.edge_broadcast {
+            lines.push(format!("  network {prefix}"));
+        }
+    }
+    if plan.ospf_enabled {
+        lines.push("  redistribute ospf route-map RM-OSPF-TO-BGP".into());
+    }
+    let has_no_forward = plan.transports.iter().any(|transport| transport.no_forward);
+    for transport in &plan.transports {
+        lines.push(format!("  neighbor {} activate", transport.peer_ip));
+        if let Some(weight) = transport.weight {
+            lines.push(format!("  neighbor {} weight {weight}", transport.peer_ip));
+        }
+        let peer = transport.peer_ip.to_string().replace('.', "-");
+        if transport.no_transit {
+            lines.push(format!(
+                "  neighbor {} route-map RM-BGP-IN-{peer} in",
+                transport.peer_ip
+            ));
+        } else if has_no_forward && !transport.no_forward {
+            lines.push(format!(
+                "  neighbor {} route-map RM-BGP-IN-TAG-EBGP in",
+                transport.peer_ip
+            ));
+        } else {
+            lines.push(format!(
+                "  neighbor {} route-map RM-BGP-IN in",
+                transport.peer_ip
+            ));
+        }
+        let outbound = if transport.no_forward {
+            format!("RM-BGP-OUT-{peer}")
+        } else if plan.private_lans.is_empty() {
+            "RM-BGP-OUT".into()
+        } else {
+            "RM-BGP-OUT-EXTERNAL".into()
+        };
+        lines.push(format!(
+            "  neighbor {} route-map {outbound} out",
+            transport.peer_ip
+        ));
+        if !transport.no_forward
+            && (plan.transit_all || plan.transit_asns.contains(&transport.peer_asn))
+        {
+            lines.push(format!("  neighbor {} next-hop-self", transport.peer_ip));
+        }
+    }
+    for neighbor in &plan.ibgp_neighbors {
+        lines.push(format!("  neighbor {} activate", neighbor.router_id));
+        lines.push(format!(
+            "  neighbor {} route-map {} in",
+            neighbor.router_id,
+            if neighbor.roaming {
+                "RM-BGP-IN-ROAMING"
+            } else {
+                "RM-BGP-IN"
+            }
+        ));
+        lines.push(format!(
+            "  neighbor {} route-map {} out",
+            neighbor.router_id,
+            if plan.private_lans.is_empty() {
+                "RM-BGP-OUT"
+            } else {
+                "RM-BGP-OUT-INTERNAL"
+            }
+        ));
+        lines.push(format!("  neighbor {} next-hop-self", neighbor.router_id));
+    }
+    lines.extend([" exit-address-family".into(), "!".into(), String::new()]);
     Ok(())
 }
 
@@ -987,7 +1640,8 @@ mod tests {
         put("ospf/enable", "true");
         put("ospf/area", "0.0.0.0");
         put("router_id", "10.255.0.1");
-        put("bgp/asn", "65001");
+        put("bgp/enable", "true");
+        put("bgp/local_asn", "65001");
         put("lan", "192.168.10.0/24");
         put("private_lan", "172.16.10.0/24");
 
@@ -1048,11 +1702,146 @@ mod tests {
         let frr = find(&files, "/var/run/meduza/generated/frr/frr.conf")
             .text()
             .unwrap();
-        assert!(frr.contains("router ospf"));
+        assert!(!frr.contains("router ospf"));
+        assert!(frr.contains("router bgp 65001"));
+        assert!(frr.contains("bgp router-id 10.255.0.1"));
         assert!(frr.contains("neighbor 10.20.0.2 remote-as 65002"));
+        assert!(frr.contains("neighbor 10.20.0.2 update-source tun-office"));
         assert!(frr.contains("neighbor 10.30.0.2 update-source wg-backbone"));
         assert!(frr.contains("neighbor 10.255.0.2 remote-as internal"));
         assert!(frr.contains("network 172.16.10.0/24"));
+    }
+
+    #[test]
+    fn frr_matches_full_generator_routing_policy_surface() {
+        let mut snapshot = comprehensive_snapshot();
+        for (suffix, value) in [
+            ("bgp/max_paths", "4"),
+            ("bgp/to_ospf/default_only", "true"),
+            ("access/enable", "true"),
+            ("access/network", "10.40.0.7/24"),
+            ("openvpn/office/bgp/update_source", "ovpn-source"),
+            ("openvpn/office/bgp/weight", "150"),
+            ("openvpn/office/bgp/no_transit", "true"),
+            ("wireguard/backbone/bgp/no_forward", "true"),
+        ] {
+            snapshot
+                .node
+                .insert(format!("/nodes/router-01/{suffix}"), value.into());
+        }
+        snapshot.node.insert(
+            "/nodes/router-01/network_mapping/198.51.100.0/24".into(),
+            "10.50.0.0/24".into(),
+        );
+        for (suffix, value) in [
+            ("bgp/filter/in", "deny 0.0.0.0/0\npermit 10.0.0.0/8 le 32"),
+            ("bgp/filter/out", "permit 192.0.2.0/24"),
+            ("bgp/transit", "65002"),
+            ("bgp/edge_broadcast", "203.0.113.0/24"),
+        ] {
+            snapshot
+                .global
+                .insert(format!("/global/{suffix}"), value.into());
+        }
+        snapshot
+            .all_nodes
+            .insert("/nodes/remote-02/behavior".into(), "roaming".into());
+
+        let desired = build_desired(&snapshot).unwrap();
+        let files = render_all(&snapshot, &desired).unwrap();
+        let frr = find(&files, "/var/run/meduza/generated/frr/frr.conf")
+            .text()
+            .unwrap();
+
+        assert!(frr.starts_with("! meduza-owner: meduza-openwrt-rust-v1\n"));
+        assert!(frr.contains("\nhostname router-01\n"));
+        assert!(frr.contains("\nip router-id 10.255.0.1\n"));
+        assert!(!frr.contains("hostname meduza-router-01"));
+        assert!(!frr.contains("line vty"));
+        assert!(frr.contains("ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0"));
+        assert!(frr.contains("ip prefix-list PL-OSPF-LAN seq 10 permit 192.168.10.0/24"));
+        assert!(frr.contains("route-map RM-OSPF-CONN permit 10"));
+        assert!(frr.contains("route-map RM-BGP-TO-OSPF permit 10\n match ip address prefix-list PL-DEFAULT\n set tag 65000"));
+        assert!(frr.contains("ip prefix-list PL-BGP-IN seq 20 permit 10.0.0.0/8 le 32"));
+        assert!(frr.contains(
+            "ip prefix-list PL-BGP-OUT seq 10 permit 192.0.2.0/24\nroute-map RM-BGP-OUT permit 10"
+        ));
+        assert!(frr.contains("route-map RM-BGP-OUT-EXTERNAL deny 5"));
+        assert!(frr.contains("bgp community-list standard EBGP_LEARNED permit 9999"));
+        assert!(frr.contains("route-map RM-BGP-IN-10-20-0-2 permit 10"));
+        assert!(frr.contains("bgp as-path access-list 1 permit ^[0-9]+$"));
+        assert!(frr.contains("route-map RM-BGP-OUT-10-30-0-2 deny 10"));
+        assert!(frr.contains("route-map RM-BGP-IN-ROAMING permit 10"));
+        assert!(frr.contains(" neighbor 10.20.0.2 description office"));
+        assert!(frr.contains(" neighbor 10.20.0.2 update-source ovpn-source"));
+        assert!(frr.contains(" neighbor 10.30.0.2 description wg-backbone"));
+        assert!(frr.contains("  maximum-paths 4"));
+        assert!(frr.contains("  network 10.40.0.0/24"));
+        assert!(frr.contains("  network 198.51.100.0/24"));
+        assert!(frr.contains("  network 203.0.113.0/24"));
+        assert!(frr.contains("  neighbor 10.20.0.2 weight 150"));
+        assert!(frr.contains("  neighbor 10.20.0.2 route-map RM-BGP-IN-10-20-0-2 in"));
+        assert!(frr.contains("  neighbor 10.20.0.2 next-hop-self"));
+        assert!(frr.contains("  neighbor 10.30.0.2 route-map RM-BGP-OUT-10-30-0-2 out"));
+        assert!(!frr.contains("  neighbor 10.30.0.2 next-hop-self"));
+        assert!(frr.contains("  neighbor 10.255.0.2 route-map RM-BGP-IN-ROAMING in"));
+        assert!(frr.contains("  neighbor 10.255.0.2 route-map RM-BGP-OUT-INTERNAL out"));
+    }
+
+    #[test]
+    fn legacy_bgp_asn_is_not_accepted() {
+        let mut snapshot = comprehensive_snapshot();
+        snapshot.node.remove("/nodes/router-01/bgp/local_asn");
+        snapshot
+            .node
+            .insert("/nodes/router-01/bgp/asn".into(), "65009".into());
+        let desired = build_desired(&snapshot).unwrap();
+
+        let error = render_all(&snapshot, &desired).unwrap_err().to_string();
+        assert!(error.contains("bgp/local_asn"));
+    }
+
+    #[test]
+    fn local_asn_without_bgp_enable_does_not_enable_bgp() {
+        let mut snapshot = comprehensive_snapshot();
+        snapshot
+            .node
+            .insert("/nodes/router-01/bgp/enable".into(), "false".into());
+        let desired = build_desired(&snapshot).unwrap();
+        let files = render_all(&snapshot, &desired).unwrap();
+        let frr = find(&files, "/var/run/meduza/generated/frr/frr.conf")
+            .text()
+            .unwrap();
+
+        assert!(!frr.contains("router bgp"));
+    }
+
+    #[test]
+    fn current_ospf_schema_renders_node_router_id() {
+        let mut snapshot = comprehensive_snapshot();
+        snapshot
+            .global
+            .insert("/global/internal_routing_system".into(), "ospf".into());
+        snapshot.node.insert(
+            "/nodes/router-01/ospf/active_ifaces".into(),
+            "et1\net0\net0".into(),
+        );
+        let desired = build_desired(&snapshot).unwrap();
+        let files = render_all(&snapshot, &desired).unwrap();
+        let frr = find(&files, "/var/run/meduza/generated/frr/frr.conf")
+            .text()
+            .unwrap();
+
+        assert!(frr.contains("router ospf"));
+        assert!(frr.contains("ospf router-id 10.255.0.1"));
+        assert!(frr.contains("interface et0\n ip ospf area 0.0.0.0\n ip ospf network broadcast"));
+        assert!(frr.contains(" passive-interface default"));
+        assert!(frr.contains(" no passive-interface et0"));
+        assert!(frr.contains(" redistribute connected route-map RM-OSPF-CONN"));
+        assert!(frr.contains(" redistribute connected route-map RM-OSPF-CONN-PRIVATE"));
+        assert!(frr.contains(" redistribute bgp route-map RM-BGP-TO-OSPF"));
+        assert!(frr.contains("router bgp 65001"));
+        assert!(frr.contains("  redistribute ospf route-map RM-OSPF-TO-BGP"));
     }
 
     #[test]

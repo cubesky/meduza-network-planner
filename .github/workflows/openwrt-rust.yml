@@ -8,11 +8,11 @@ on:
     tags:
       - "v*"
     paths:
-      - "openwrt-rust/**"
+      - "alternative/openwrt-rust/**"
       - ".github/workflows/openwrt-rust.yml"
   pull_request:
     paths:
-      - "openwrt-rust/**"
+      - "alternative/openwrt-rust/**"
       - ".github/workflows/openwrt-rust.yml"
   workflow_dispatch:
     inputs:
@@ -57,59 +57,59 @@ jobs:
             --component clippy --component rustfmt
 
       - name: Check formatting
-        working-directory: openwrt-rust
+        working-directory: alternative/openwrt-rust
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        working-directory: openwrt-rust
+        working-directory: alternative/openwrt-rust
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run unit and integration tests
-        working-directory: openwrt-rust
+        working-directory: alternative/openwrt-rust
         run: cargo test --locked --all-features
 
       - name: Check OpenWrt package scripts
         run: |
-          sh -n openwrt-rust/package/files/etc/init.d/meduza
-          sh -n openwrt-rust/package/build-direct.sh
+          sh -n alternative/openwrt-rust/package/files/etc/init.d/meduza
+          sh -n alternative/openwrt-rust/package/build-direct.sh
           python3 -m json.tool \
-            openwrt-rust/package/files/usr/share/luci/menu.d/meduza.json \
+            alternative/openwrt-rust/package/files/usr/share/luci/menu.d/meduza.json \
             >/dev/null
           python3 -m json.tool \
-            openwrt-rust/package/files/usr/share/rpcd/acl.d/meduza.json \
+            alternative/openwrt-rust/package/files/usr/share/rpcd/acl.d/meduza.json \
             >/dev/null
           node --check \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
 
       - name: Check direct-runtime and LuCI contracts
         run: |
-          test ! -e openwrt-rust/src/uci.rs
-          ! grep -REn '/etc/init.d/openvpn' openwrt-rust/src
-          grep -q -- '"ifup"' openwrt-rust/src/network.rs
-          grep -q -- 'proto=none' openwrt-rust/src/network.rs
-          grep -q -- 'const MEDUZA_ZONE: &str = "meduza"' openwrt-rust/src/firewall.rs
-          grep -q -- 'forwarding_key(MEDUZA_ZONE, zone)' openwrt-rust/src/firewall.rs
-          grep -q -- 'forwarding_key(zone, MEDUZA_ZONE)' openwrt-rust/src/firewall.rs
-          grep -q -- '"--daemon"' openwrt-rust/src/runtime.rs
+          test ! -e alternative/openwrt-rust/src/uci.rs
+          ! grep -REn '/etc/init.d/openvpn' alternative/openwrt-rust/src
+          grep -q -- '"ifup"' alternative/openwrt-rust/src/network.rs
+          grep -q -- 'proto=none' alternative/openwrt-rust/src/network.rs
+          grep -q -- 'const MEDUZA_ZONE: &str = "meduza"' alternative/openwrt-rust/src/firewall.rs
+          grep -q -- 'forwarding_key(MEDUZA_ZONE, zone)' alternative/openwrt-rust/src/firewall.rs
+          grep -q -- 'forwarding_key(zone, MEDUZA_ZONE)' alternative/openwrt-rust/src/firewall.rs
+          grep -q -- '"--daemon"' alternative/openwrt-rust/src/runtime.rs
           grep -q -- "data-tab': 'status'" \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- "data-tab': 'routing'" \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- "data-tab': 'settings'" \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- 'meduza-outbound-body' \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- 'callLogRead' \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- 'status.tinc_peers' \
-            openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- '"reachable".to_owned()' \
-            openwrt-rust/src/report.rs
-          ! grep -q -- 'default_postinst' openwrt-rust/package/build-direct.sh
-          ! grep -q -- 'sleep 2' openwrt-rust/package/build-direct.sh
-          ! grep -q -- '/etc/init.d/meduza start.*) &' openwrt-rust/package/build-direct.sh
+            alternative/openwrt-rust/src/report.rs
+          ! grep -q -- 'default_postinst' alternative/openwrt-rust/package/build-direct.sh
+          ! grep -q -- 'sleep 2' alternative/openwrt-rust/package/build-direct.sh
+          ! grep -q -- '/etc/init.d/meduza start.*) &' alternative/openwrt-rust/package/build-direct.sh
           grep -q -- '/etc/init.d/meduza start >/dev/null 2>&1' \
-            openwrt-rust/package/build-direct.sh
+            alternative/openwrt-rust/package/build-direct.sh
 
   binary:
     name: Static ELF ${{ matrix.asset_arch }}
@@ -150,8 +150,8 @@ jobs:
             .openwrt-downloads
             ~/.cargo/registry
             ~/.cargo/git
-            openwrt-rust/target
-          key: rust-openwrt-${{ env.BINARY_SDK_RELEASE }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}-${{ hashFiles('openwrt-rust/Cargo.lock') }}
+            alternative/openwrt-rust/target
+          key: rust-openwrt-${{ env.BINARY_SDK_RELEASE }}-${{ matrix.openwrt_target }}-${{ matrix.openwrt_subtarget }}-${{ hashFiles('alternative/openwrt-rust/Cargo.lock') }}
 
       - name: Download and verify OpenWrt SDK
         shell: bash
@@ -213,7 +213,7 @@ jobs:
           export "AR_${target_suffix}=${ar}"
           export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-          cargo +"${RUST_VERSION}" build --manifest-path openwrt-rust/Cargo.toml \
+          cargo +"${RUST_VERSION}" build --manifest-path alternative/openwrt-rust/Cargo.toml \
             --locked --release --target "${RUST_TARGET}"
 
       - name: Prove the artifact is the expected static ELF
@@ -224,7 +224,7 @@ jobs:
           ELF_MACHINE: ${{ matrix.elf_machine }}
         run: |
           set -euo pipefail
-          source="openwrt-rust/target/${RUST_TARGET}/release/meduza-openwrt"
+          source="alternative/openwrt-rust/target/${RUST_TARGET}/release/meduza-openwrt"
           test -x "${source}"
           file "${source}" | grep -Eiq 'ELF .* (static|statically)'
           readelf --file-header "${source}" \
@@ -363,7 +363,7 @@ jobs:
           short_hash="${GITHUB_SHA:0:7}"
           output="build-artifact/meduza-openwrt-rust-${release_date}-${short_hash}-${ASSET_ARCH}.${PACKAGE_FORMAT}"
           package_version="0.1.0-r${GITHUB_RUN_NUMBER}"
-          if ! sh openwrt-rust/package/build-direct.sh \
+          if ! sh alternative/openwrt-rust/package/build-direct.sh \
             "${PACKAGE_FORMAT}" \
             "${PACKAGE_ARCH}" \
             "${package_version}" \

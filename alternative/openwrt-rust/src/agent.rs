@@ -3,7 +3,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::time::{Instant, sleep};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::command::Runner;
 use crate::config::Settings;
@@ -19,6 +20,41 @@ pub struct Agent<R: Runner> {
     local_initialized: bool,
     commit: Option<String>,
     pending_last_ack: Option<String>,
+}
+
+const REPORT_INTERVAL_SECONDS: u64 = 15;
+const REPORT_LEASE_SECONDS: i64 = 60;
+const REPORT_RETRY_MAX_SECONDS: u64 = 60;
+
+/// Keep status publication outside the reconciliation task. OpenWrt helpers
+/// are synchronous and can take tens of seconds while an interface or daemon
+/// settles; coupling the online lease to that work makes an otherwise healthy
+/// node disappear from etcd and freezes every VPN status timestamp.
+struct ReporterTasks {
+    online: JoinHandle<()>,
+    runtime: JoinHandle<()>,
+}
+
+impl ReporterTasks {
+    fn start<R: Runner>(settings: &Settings, paths: &Paths, runner: &R) -> Self {
+        let online_settings = settings.clone();
+        let runtime_settings = settings.clone();
+        let runtime_paths = paths.clone();
+        let runtime_runner = runner.clone();
+        Self {
+            online: tokio::spawn(async move { online_report_loop(online_settings).await }),
+            runtime: tokio::spawn(async move {
+                runtime_report_loop(runtime_settings, runtime_paths, runtime_runner).await
+            }),
+        }
+    }
+}
+
+impl Drop for ReporterTasks {
+    fn drop(&mut self) {
+        self.online.abort();
+        self.runtime.abort();
+    }
 }
 
 impl<R: Runner> Agent<R> {
@@ -48,9 +84,9 @@ impl<R: Runner> Agent<R> {
         }
         Reconciler::new(self.paths.clone(), self.runner.clone()).prepare()?;
         self.persist_etcd_state("waiting");
+        let _reporters = ReporterTasks::start(&self.settings, &self.paths, &self.runner);
 
         let mut delay = 1u64;
-        let mut next_report = Instant::now();
         let mut etcd: Option<Etcd> = None;
         // Create and poll exactly one signal future for the daemon lifetime.
         // Recreating ctrl_c() around a synchronous local restore can leave a
@@ -60,11 +96,7 @@ impl<R: Runner> Agent<R> {
         tokio::pin!(shutdown);
 
         loop {
-            let Some(result) = run_or_shutdown(
-                shutdown.as_mut(),
-                self.iteration(&mut etcd, &mut next_report),
-            )
-            .await
+            let Some(result) = run_or_shutdown(shutdown.as_mut(), self.iteration(&mut etcd)).await
             else {
                 self.persist_etcd_state("stopped");
                 tracing::info!("shutdown requested");
@@ -123,11 +155,7 @@ impl<R: Runner> Agent<R> {
         Ok(())
     }
 
-    async fn iteration(
-        &mut self,
-        etcd: &mut Option<Etcd>,
-        next_report: &mut Instant,
-    ) -> Result<()> {
+    async fn iteration(&mut self, etcd: &mut Option<Etcd>) -> Result<()> {
         self.initialize_local_runtime()?;
         // Once a generation is locally committed, supervise its native
         // runtimes before touching etcd. This keeps VPN and FRR recovery
@@ -142,34 +170,8 @@ impl<R: Runner> Agent<R> {
         }
         let client = etcd.as_mut().expect("connected above");
         let operation = self.reconcile_generation(client).await;
-
-        // Reporting describes reachability and the currently observed local
-        // runtime, not whether the newest desired generation was accepted.
-        // Keep it independent from snapshot validation/apply so a broken
-        // generation still exposes the node as online and its VPNs as
-        // down/connecting/unavailable in etcd.
         self.flush_last_ack(client).await;
-        let report = if Instant::now() >= *next_report {
-            match self.publish_report(client).await {
-                Ok(()) => {
-                    *next_report = Instant::now() + Duration::from_secs(15);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            Ok(())
-        };
-
-        match (operation, report) {
-            (Err(operation), Err(report)) => {
-                tracing::warn!("status report also failed: {report:#}");
-                Err(operation)
-            }
-            (Err(operation), Ok(())) => Err(operation),
-            (Ok(()), Err(report)) => Err(report),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        operation
     }
 
     async fn reconcile_generation(&mut self, client: &mut Etcd) -> Result<()> {
@@ -284,68 +286,143 @@ impl<R: Runner> Agent<R> {
             }
         }
     }
+}
 
-    async fn publish_report(&self, client: &mut Etcd) -> Result<()> {
-        // Reachability must not depend on a readable local manifest or on
-        // individual VPN probes. Publish the lease first, then enrich the
-        // report with local runtime state.
-        client
-            .put_with_lease(
-                &format!("/updated/{}/online", self.settings.node_id),
-                "1",
-                60,
-            )
-            .await?;
-        let status = report::collect(&self.paths, &self.runner)?;
-        let mut current = Vec::new();
-        for (path, state) in &status.interfaces {
-            let Some((kind, name)) = path.split_once('/') else {
-                continue;
-            };
-            client
-                .put(
-                    &format!("/updated/{}/{kind}/{name}/status", self.settings.node_id),
-                    &format!("{state} {}", status.observed_at),
-                )
-                .await?;
-            if matches!(kind, "openvpn" | "wireguard" | "tinc" | "frr") {
-                current.push((kind.to_owned(), name.to_owned()));
+async fn online_report_loop(settings: Settings) {
+    let mut client = None;
+    let mut retry = 1u64;
+    loop {
+        let result: Result<()> = async {
+            if client.is_none() {
+                client = Some(Etcd::connect(&settings).await?);
             }
+            client
+                .as_mut()
+                .expect("online reporter connected above")
+                .put_with_lease(
+                    &format!("/updated/{}/online", settings.node_id),
+                    "1",
+                    REPORT_LEASE_SECONDS,
+                )
+                .await
         }
+        .await;
+        let wait = match result {
+            Ok(()) => {
+                retry = 1;
+                REPORT_INTERVAL_SECONDS
+            }
+            Err(error) => {
+                tracing::warn!(
+                    retry_seconds = retry,
+                    "could not publish etcd online lease: {error:#}"
+                );
+                client = None;
+                let wait = retry;
+                retry = (retry * 2).min(REPORT_RETRY_MAX_SECONDS);
+                wait
+            }
+        };
+        sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+async fn runtime_report_loop<R: Runner>(settings: Settings, paths: Paths, runner: R) {
+    let mut client = None;
+    let mut retry = 1u64;
+    loop {
+        let collect_paths = paths.clone();
+        let collect_runner = runner.clone();
+        let result: Result<()> = async {
+            if client.is_none() {
+                client = Some(Etcd::connect(&settings).await?);
+            }
+            // Status probes execute native OpenWrt commands. Keep them off the
+            // async runtime workers so a slow vtysh/tinc/wg invocation cannot
+            // delay the independent online lease task.
+            let status = tokio::task::spawn_blocking(move || {
+                report::collect(&collect_paths, &collect_runner)
+            })
+            .await
+            .context("runtime status collector terminated unexpectedly")??;
+            publish_runtime_report(
+                client.as_mut().expect("runtime reporter connected above"),
+                &settings.node_id,
+                &paths,
+                &status,
+            )
+            .await
+        }
+        .await;
+        let wait = match result {
+            Ok(()) => {
+                retry = 1;
+                REPORT_INTERVAL_SECONDS
+            }
+            Err(error) => {
+                tracing::warn!(
+                    retry_seconds = retry,
+                    "could not publish etcd runtime status: {error:#}"
+                );
+                client = None;
+                let wait = retry;
+                retry = (retry * 2).min(REPORT_RETRY_MAX_SECONDS);
+                wait
+            }
+        };
+        sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+async fn publish_runtime_report(
+    client: &mut Etcd,
+    node_id: &str,
+    paths: &Paths,
+    status: &report::LocalStatus,
+) -> Result<()> {
+    let mut current = Vec::new();
+    for (path, state) in &status.interfaces {
+        let Some((kind, name)) = path.split_once('/') else {
+            continue;
+        };
         client
             .put(
-                &format!("/updated/{}/frr/default/status", self.settings.node_id),
-                &format!("{} {}", status.frr, status.observed_at),
+                &format!("/updated/{node_id}/{kind}/{name}/status"),
+                &format!("{state} {}", status.observed_at),
             )
             .await?;
-        let current_set = current
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        // Early Rust builds reported one synthetic Tinc instance. Remove that
-        // compatibility key once real per-peer reporting is available, unless
-        // a peer is genuinely named "default".
-        if !current_set.contains(&("tinc".into(), "default".into())) {
-            client
-                .delete(&format!(
-                    "/updated/{}/tinc/default/status",
-                    self.settings.node_id
-                ))
-                .await?;
+        if matches!(kind, "openvpn" | "wireguard" | "tinc" | "frr") {
+            current.push((kind.to_owned(), name.to_owned()));
         }
-        for (kind, name) in
-            report::read_reported(&self.paths, &self.settings.node_id)?.difference(&current_set)
-        {
-            client
-                .put(
-                    &format!("/updated/{}/{kind}/{name}/status", self.settings.node_id),
-                    &format!("down {}", status.observed_at),
-                )
-                .await?;
-        }
-        report::persist_reported(&self.paths, &self.settings.node_id, &current)?;
-        Ok(())
     }
+    client
+        .put(
+            &format!("/updated/{node_id}/frr/default/status"),
+            &format!("{} {}", status.frr, status.observed_at),
+        )
+        .await?;
+    let current_set = current
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    // Early Rust builds reported one synthetic Tinc instance. Remove that
+    // compatibility key once real per-peer reporting is available, unless a
+    // peer is genuinely named "default".
+    if !current_set.contains(&("tinc".into(), "default".into())) {
+        client
+            .delete(&format!("/updated/{node_id}/tinc/default/status"))
+            .await?;
+    }
+    for (kind, name) in report::read_reported(paths, node_id)?.difference(&current_set) {
+        client
+            .put(
+                &format!("/updated/{node_id}/{kind}/{name}/status"),
+                &format!("down {}", status.observed_at),
+            )
+            .await?;
+    }
+    report::persist_reported(paths, node_id, &current)?;
+    Ok(())
 }
 
 #[cfg(unix)]

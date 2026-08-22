@@ -447,10 +447,19 @@ pub fn generated_config_path(root: &Path, kind: VpnKind, instance: &str) -> Resu
 pub fn default_device_name(kind: VpnKind, instance: &str) -> Result<String> {
     validate_instance_name(instance)?;
     let (prefix, retained) = match kind {
-        VpnKind::OpenVpn => ("ovpn", 5usize),
+        VpnKind::OpenVpn => ("tun", 6usize),
         VpnKind::WireGuard => ("wg", 7usize),
         VpnKind::Tinc => bail!("tinc has no instance-derived default device name"),
     };
+    if let Some(digit) = instance
+        .as_bytes()
+        .last()
+        .filter(|byte| byte.is_ascii_digit())
+    {
+        let value = format!("{prefix}{}", char::from(*digit));
+        validate_device_name(&value)?;
+        return Ok(value);
+    }
     let candidate = format!("{prefix}-{instance}");
     if candidate.len() <= MAX_DEVICE_BYTES {
         validate_device_name(&candidate)?;
@@ -595,7 +604,7 @@ mod tests {
             .unwrap();
         assert_eq!(openvpn.logical, "ovpn_long_office_name");
         assert_eq!(openvpn.device.len(), 15);
-        assert!(openvpn.device.starts_with("ovpn-long-"));
+        assert!(openvpn.device.starts_with("tun-long-o-"));
         assert_eq!(
             desired
                 .interface(VpnKind::WireGuard, "site-a")
@@ -613,7 +622,15 @@ mod tests {
         let digest = Sha256::digest(b"openvpn:long-office-name");
         assert_eq!(
             first,
-            format!("ovpn-long--{:02x}{:02x}", digest[0], digest[1])
+            format!("tun-long-o-{:02x}{:02x}", digest[0], digest[1])
+        );
+        assert_eq!(
+            default_device_name(VpnKind::OpenVpn, "office7").unwrap(),
+            "tun7"
+        );
+        assert_eq!(
+            default_device_name(VpnKind::WireGuard, "backbone4").unwrap(),
+            "wg4"
         );
     }
 
