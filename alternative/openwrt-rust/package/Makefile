@@ -48,12 +48,29 @@ endef
 define Package/meduza-openwrt-rust/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT:-}" ] && exit 0
-if [ -x /etc/init.d/meduza ]; then
+
+meduza_controller_registered() {
+	local services
+	services="$$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null)" || return 2
+	case "$$services" in
+		*'"meduza"'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# APK default_prerm normally stopped the service before this hook, whereas
+# IPK normally invokes this hook first. Query procd so both orders are
+# idempotent, and retry a stop only when the exact service remains registered.
+if meduza_controller_registered; then
 	/etc/init.d/meduza stop >/dev/null 2>&1 || exit 1
+else
+	status=$$?
+	[ "$$status" -eq 1 ] || exit "$$status"
 fi
 [ "$${PKG_UPGRADE:-0}" = 1 ] && exit 0
 [ -x /usr/sbin/meduza-openwrt ] || exit 1
-/usr/sbin/meduza-openwrt purge >/dev/null 2>&1 || exit 1
+echo 'meduza: removing managed VPN, FRR, firewall and runtime state' >&2
+/usr/sbin/meduza-openwrt purge || exit 1
 [ ! -x /etc/init.d/meduza ] || /etc/init.d/meduza disable >/dev/null 2>&1 || exit 1
 exit 0
 endef
