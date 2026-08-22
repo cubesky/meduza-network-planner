@@ -12,7 +12,10 @@
 			}
 		},
 		"write": {
-			"uci": [ "meduza" ]
+			"uci": [ "meduza" ],
+			"ubus": {
+				"rc": [ "init" ]
+			}
 		}
 	}
 }

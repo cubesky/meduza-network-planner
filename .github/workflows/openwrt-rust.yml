@@ -101,6 +101,12 @@ jobs:
             alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- 'callLogRead' \
             alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- "object: 'rc'" \
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- "document.addEventListener('uci-applied'" \
+            alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
+          grep -q -- '"rc"' \
+            alternative/openwrt-rust/package/files/usr/share/rpcd/acl.d/meduza.json
           grep -q -- 'status.tinc_peers' \
             alternative/openwrt-rust/package/files/www/luci-static/resources/view/meduza/settings.js
           grep -q -- '"reachable".to_owned()' \

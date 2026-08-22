@@ -15,6 +15,30 @@ var callLogRead = rpc.declare({
 	expect: { log: [] }
 });
 
+var callRcInit = rpc.declare({
+	object: 'rc',
+	method: 'init',
+	params: [ 'name', 'action' ]
+});
+
+function reconcileMeduzaService() {
+	return callRcInit('meduza', 'reconcile_settings').then(function(result) {
+		if (result)
+			throw new Error(_('Meduza service restart failed.'));
+
+		ui.addNotification(null,
+			E('p', {}, [ _('Settings were applied and the Meduza service was reconciled.') ]),
+			'info');
+	});
+}
+
+function notifyServiceFailure(error) {
+	ui.addNotification(null, E('p', {}, [
+		_('Settings were saved, but the Meduza service could not be reconciled: '),
+		String(error && error.message || error)
+	]), 'danger');
+}
+
 function validateNodeId(sectionId, value) {
 	if (value.length === 0)
 		return _('Node ID is required.');
@@ -80,7 +104,7 @@ function emptyRow(columns, message) {
 function fetchStatus() {
 	return L.resolveDefault(
 		fs.exec_direct('/usr/sbin/meduza-openwrt', [ 'status', '--json' ], 'json'),
-		{ etcd: { state: 'unknown' }, interface_details: [], tinc_peers: [], frr: 'down', frr_peers: [] }
+		{ etcd: { state: 'error' }, interface_details: [], tinc_peers: [], frr: 'down', frr_peers: [] }
 	);
 }
 
@@ -105,6 +129,41 @@ function renderLog(entries) {
 }
 
 return view.extend({
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev).then(function() {
+			return uci.changes();
+		}).then(function(changes) {
+			var changed = Object.keys(changes || {}).some(function(config) {
+				return Array.isArray(changes[config]) && changes[config].length > 0;
+			});
+
+			if (!changed)
+				return reconcileMeduzaService().catch(function(error) {
+					notifyServiceFailure(error);
+					throw error;
+				});
+
+			var onApplied;
+			var onReverted;
+			var cleanup = function() {
+				document.removeEventListener('uci-applied', onApplied);
+				document.removeEventListener('uci-reverted', onReverted);
+			};
+			onApplied = function() {
+				cleanup();
+				reconcileMeduzaService().catch(notifyServiceFailure);
+			};
+			onReverted = cleanup;
+			document.addEventListener('uci-applied', onApplied);
+			document.addEventListener('uci-reverted', onReverted);
+
+			// LuCI's changes.apply() is intentionally fire-and-forget. The
+			// uci-applied event is the commit boundary; restarting before it would
+			// make the daemon read the previous value of the enable flag.
+			ui.changes.apply(mode == '0');
+		});
+	},
+
 	load: function() {
 		return Promise.all([
 			uci.load('meduza'),

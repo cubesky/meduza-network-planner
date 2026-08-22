@@ -82,19 +82,21 @@ struct Reported {
 }
 
 pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
-    let mut etcd = read_etcd_status(paths)?.unwrap_or_else(|| EtcdStatus {
-        version: 1,
-        state: "unknown".into(),
-        node_id: String::new(),
-        commit: None,
-        updated_at: timestamp(),
+    let configured_enabled = configured_controller_enabled(runner);
+    let mut etcd = read_etcd_status(paths)?.unwrap_or_else(|| {
+        let state = match configured_enabled {
+            Some(false) => "disabled",
+            Some(true) => "stopped",
+            None => "unknown",
+        };
+        EtcdStatus::new(state, "", None)
     });
     // The UCI flag is the administrative source of truth. It also closes the
     // short restart window where an old connected status file may still be
     // present while procd is stopping the daemon and starting disabled-mode
     // cleanup. Failure to query UCI is non-fatal; the durable daemon status
     // remains the fallback for recovery and test environments.
-    if configured_controller_enabled(runner) == Some(false) && etcd.state != "disabled" {
+    if configured_enabled == Some(false) && etcd.state != "disabled" {
         etcd = EtcdStatus::new("disabled", &etcd.node_id, None);
     }
 
@@ -774,6 +776,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct EnabledUci;
+
+    impl Runner for EnabledUci {
+        fn output<I, S>(&self, program: &str, args: I) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|value| value.as_ref().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(program, "uci");
+            assert_eq!(args, ["-q", "get", "meduza.main.enable"]);
+            Ok(Output {
+                status: successful_exit_status(),
+                stdout: b"1\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
     #[cfg(unix)]
     fn successful_exit_status() -> ExitStatus {
         use std::os::unix::process::ExitStatusExt;
@@ -877,6 +902,20 @@ mod tests {
         assert!(collected.interfaces.is_empty());
         assert!(collected.interface_details.is_empty());
         assert_eq!(collected.frr, "disabled");
+    }
+
+    #[test]
+    fn enabled_controller_without_a_daemon_record_is_stopped_not_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+
+        let collected = collect(&paths, &EnabledUci).unwrap();
+
+        assert_eq!(collected.etcd.state, "stopped");
+        assert!(collected.etcd.commit.is_none());
+        assert!(collected.interfaces.is_empty());
+        assert!(collected.interface_details.is_empty());
+        assert_eq!(collected.frr, "down");
     }
 
     #[test]

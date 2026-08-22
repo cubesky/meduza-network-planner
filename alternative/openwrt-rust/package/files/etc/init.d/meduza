@@ -11,6 +11,7 @@ extra_command "purge" "Stop Meduza and remove all owner-marked resources"
 extra_command "recover" "Replay or roll back an interrupted transaction"
 extra_command "doctor" "Check configuration and native runtime dependencies"
 extra_command "status_json" "Print detailed Meduza status as JSON"
+extra_command "reconcile_settings" "Apply the current enabled or disabled controller state"
 
 start_service() {
 	local enable
@@ -53,9 +54,58 @@ reload_service() {
 	restart
 }
 
+meduza_service_registered() {
+	local services
+	services=$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null) || return 2
+	case "$services" in
+		*'"meduza"'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+meduza_instance_running() {
+	local services
+	services=$(ubus -S call service list '{"name":"meduza"}' 2>/dev/null) || return 2
+	case "$services" in
+		*'"running":true'*|*'"running": true'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 restart() {
-	stop || return 1
+	local status
+	# A disabled controller has no procd instance. Treat that state as a clean
+	# restart source instead of failing on `ubus service delete ... Not found`.
+	if meduza_service_registered; then
+		stop || return 1
+	else
+		status=$?
+		[ "$status" -eq 1 ] || return "$status"
+	fi
 	start
+}
+
+reconcile_settings() {
+	local enable status
+	config_load meduza
+	config_get_bool enable main enable 0
+
+	if [ "$enable" = 1 ]; then
+		# A running instance receives the ordinary UCI reload trigger. Do not
+		# bounce it a second time when LuCI observes the same committed change.
+		if meduza_instance_running; then
+			return 0
+		else
+			status=$?
+			[ "$status" -eq 1 ] || return "$status"
+		fi
+		start
+		return $?
+	fi
+
+	# Disabled mode has no persistent procd instance. A restart performs the
+	# owner-aware cleanup and publishes the explicit disabled status.
+	restart
 }
 
 service_stopped() {
