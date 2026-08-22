@@ -243,17 +243,21 @@ fn render_tinc(
 fn tinc_host_name(snapshot: &FlatSnapshot, node_id: &str) -> Result<String> {
     validate_node_id(node_id)?;
     let explicit = local_or_all_value(snapshot, node_id, "tinc/name").unwrap_or("");
-    let value = if explicit.is_empty() {
-        node_id.replace(['.', '-'], "_")
+    // Keep the Host/Name/ConnectTo identity byte-for-byte compatible with the
+    // full generator: both an explicit tinc/name and the NODE_ID fallback are
+    // normalized by removing every non-alphanumeric character.  Replacing
+    // punctuation with '_' (or retaining an explicit '_') creates a different
+    // Tinc node identity when Rust and full-controller nodes share a mesh.
+    let source = if explicit.is_empty() {
+        node_id
     } else {
-        if !explicit
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
-            bail!("unsafe explicit tinc host name for {node_id}: {explicit:?}");
-        }
-        explicit.to_owned()
+        explicit
     };
+    let value = source
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(char::from)
+        .collect::<String>();
     if value.is_empty() || value.len() > 128 {
         bail!("invalid tinc host name for {node_id}");
     }
@@ -1684,8 +1688,10 @@ mod tests {
         let files = render_all_with_options(&snapshot, &desired, &options).unwrap();
 
         let tinc = find(&files, "/tinc/mesh/tinc.conf").text().unwrap();
-        assert!(tinc.contains("Name=router_01"));
-        assert!(tinc.contains("ConnectTo = remote_02"));
+        assert!(tinc.contains("Name=router01"));
+        assert!(tinc.contains("ConnectTo = remote02"));
+        assert!(find(&files, "/tinc/mesh/hosts/router01").text().is_ok());
+        assert!(find(&files, "/tinc/mesh/hosts/remote02").text().is_ok());
         assert_eq!(find(&files, "/tinc/mesh/rsa_key.priv").mode, 0o600);
 
         let openvpn = find(&files, "/openvpn/office/openvpn.conf").text().unwrap();
