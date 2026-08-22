@@ -293,12 +293,14 @@ impl<R: Runner> Reconciler<R> {
             tracing::info!("no Meduza-owned OpenWrt state to purge");
             return Ok(());
         }
+        tracing::info!(phase = "inventory", "purging Meduza-owned OpenWrt state");
         let entries = merge_inventory(
             &read_manifest(&self.paths.manifest)?,
             &read_manifest(&self.paths.pending_manifest)?,
         );
         let entries = inventory_with_generated(&self.paths, entries)?;
         let mut errors = Vec::new();
+        tracing::info!(phase = "vpn-runtime", "purging Meduza-owned OpenWrt state");
         let runtime_stopped =
             match Runtime::new(self.paths.clone(), self.runner.clone()).stop_all(&entries) {
                 Ok(()) => true,
@@ -308,6 +310,10 @@ impl<R: Runner> Reconciler<R> {
                 }
             };
         if runtime_stopped {
+            tracing::info!(
+                phase = "generated-config",
+                "purging Meduza-owned OpenWrt state"
+            );
             let mut ownership = OwnershipDb::load(&self.paths)?;
             for entry in &entries {
                 if let Err(error) = ownership.remove_generated(&self.paths, entry) {
@@ -318,12 +324,15 @@ impl<R: Runner> Reconciler<R> {
                 }
             }
         }
+        tracing::info!(phase = "frr", "purging Meduza-owned OpenWrt state");
         if let Err(error) = self.restore_frr() {
             errors.push(format!("FRR restore failed: {error:#}"));
         }
+        tracing::info!(phase = "firewall", "purging Meduza-owned OpenWrt state");
         if let Err(error) = Firewall::new(self.paths.clone(), self.runner.clone()).sync(None, &[]) {
             errors.push(format!("firewall membership cleanup failed: {error:#}"));
         }
+        tracing::info!(phase = "network", "purging Meduza-owned OpenWrt state");
         if let Err(error) =
             NetworkInterfaces::new(self.paths.clone(), self.runner.clone()).prune(&[])
         {
@@ -335,6 +344,7 @@ impl<R: Runner> Reconciler<R> {
         if !errors.is_empty() {
             bail!("{}", errors.join("; "));
         }
+        tracing::info!(phase = "state", "finalizing Meduza purge");
         let db = OwnershipDb::load(&self.paths)?;
         if !db.generated.is_empty()
             || !db.wireguard_stages.is_empty()
