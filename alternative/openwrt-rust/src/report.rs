@@ -82,6 +82,45 @@ struct Reported {
 }
 
 pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
+    let mut etcd = read_etcd_status(paths)?.unwrap_or_else(|| EtcdStatus {
+        version: 1,
+        state: "unknown".into(),
+        node_id: String::new(),
+        commit: None,
+        updated_at: timestamp(),
+    });
+    // The UCI flag is the administrative source of truth. It also closes the
+    // short restart window where an old connected status file may still be
+    // present while procd is stopping the daemon and starting disabled-mode
+    // cleanup. Failure to query UCI is non-fatal; the durable daemon status
+    // remains the fallback for recovery and test environments.
+    if configured_controller_enabled(runner) == Some(false) && etcd.state != "disabled" {
+        etcd = EtcdStatus::new("disabled", &etcd.node_id, None);
+    }
+
+    // A stopped or administratively disabled controller no longer owns a
+    // live observation cycle. Do not resurrect stale VPN/FRR state from an
+    // interrupted purge, an old manifest, or processes that are still
+    // winding down. The next daemon start replaces this record with
+    // waiting/connecting before status collection becomes active again.
+    if matches!(etcd.state.as_str(), "disabled" | "stopped") {
+        let frr = if etcd.state == "disabled" {
+            "disabled"
+        } else {
+            "down"
+        };
+        return Ok(LocalStatus {
+            node_id: (!etcd.node_id.is_empty()).then(|| etcd.node_id.clone()),
+            observed_at: timestamp(),
+            etcd,
+            interfaces: BTreeMap::new(),
+            interface_details: Vec::new(),
+            tinc_peers: Vec::new(),
+            frr: frr.into(),
+            frr_peers: Vec::new(),
+        });
+    }
+
     let runtime = Runtime::new(paths.clone(), runner.clone());
     let mut interfaces = BTreeMap::new();
     let mut interface_details = Vec::new();
@@ -138,13 +177,6 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
             peer.state.clone(),
         );
     }
-    let etcd = read_etcd_status(paths)?.unwrap_or_else(|| EtcdStatus {
-        version: 1,
-        state: "unknown".into(),
-        node_id: String::new(),
-        commit: None,
-        updated_at: timestamp(),
-    });
     Ok(LocalStatus {
         node_id: (!etcd.node_id.is_empty()).then(|| etcd.node_id.clone()),
         observed_at: timestamp(),
@@ -155,6 +187,20 @@ pub fn collect<R: Runner>(paths: &Paths, runner: &R) -> Result<LocalStatus> {
         frr: frr.into(),
         frr_peers,
     })
+}
+
+fn configured_controller_enabled<R: Runner>(runner: &R) -> Option<bool> {
+    let output = runner
+        .output("uci", ["-q", "get", "meduza.main.enable"])
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 16 {
+        return None;
+    }
+    match String::from_utf8(output.stdout).ok()?.trim() {
+        "1" | "true" | "on" | "yes" | "enabled" => Some(true),
+        "0" | "false" | "off" | "no" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 fn collect_frr_peers<R: Runner>(runner: &R) -> Vec<FrrPeerStatus> {
@@ -516,7 +562,7 @@ pub fn persist_disabled_status<R: Runner>(paths: &Paths, runner: &R) -> Result<(
         _ => String::new(),
     };
     atomic::ensure_private_dir(&paths.runtime, 0o700)?;
-    persist_etcd_status(paths, &EtcdStatus::new("stopped", &node_id, None))
+    persist_etcd_status(paths, &EtcdStatus::new("disabled", &node_id, None))
 }
 
 fn read_etcd_status(paths: &Paths) -> Result<Option<EtcdStatus>> {
@@ -528,7 +574,7 @@ fn read_etcd_status(paths: &Paths) -> Result<Option<EtcdStatus>> {
     if value.version != 1
         || !matches!(
             value.state.as_str(),
-            "waiting" | "connecting" | "connected" | "error" | "stopped"
+            "waiting" | "connecting" | "connected" | "error" | "stopped" | "disabled"
         )
     {
         bail!("invalid daemon status record");
@@ -687,7 +733,7 @@ pub fn validate_status_value(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::process::Output;
+    use std::process::{ExitStatus, Output};
 
     use super::*;
     use crate::state::write_manifest;
@@ -703,6 +749,41 @@ mod tests {
         {
             bail!("UCI unavailable")
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DisabledUci;
+
+    impl Runner for DisabledUci {
+        fn output<I, S>(&self, program: &str, args: I) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|value| value.as_ref().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(program, "uci");
+            assert_eq!(args, ["-q", "get", "meduza.main.enable"]);
+            Ok(Output {
+                status: successful_exit_status(),
+                stdout: b"0\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
     }
 
     fn manifest_entry(instance: &str) -> ManifestEntry {
@@ -756,12 +837,46 @@ mod tests {
         persist_disabled_status(&paths, &UnavailableUci).unwrap();
 
         let status = read_etcd_status(&paths).unwrap().unwrap();
-        assert_eq!(status.state, "stopped");
+        assert_eq!(status.state, "disabled");
         assert!(status.node_id.is_empty());
         assert!(status.commit.is_none());
         assert!(!paths.data.exists());
         assert!(!paths.state.exists());
         assert!(paths.daemon_status.is_file());
+
+        // Even if stale persistent inventory reappears after an interrupted
+        // cleanup, an administratively disabled controller must never expose
+        // its old VPN/FRR observations as live status.
+        atomic::ensure_private_dir(&paths.managed, 0o700).unwrap();
+        write_manifest(&paths.manifest, &[manifest_entry("stale")]).unwrap();
+        let collected = collect(&paths, &UnavailableUci).unwrap();
+        assert_eq!(collected.etcd.state, "disabled");
+        assert!(collected.interfaces.is_empty());
+        assert!(collected.interface_details.is_empty());
+        assert!(collected.tinc_peers.is_empty());
+        assert_eq!(collected.frr, "disabled");
+        assert!(collected.frr_peers.is_empty());
+    }
+
+    #[test]
+    fn disabled_uci_flag_overrides_a_stale_connected_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(Some(temp.path()));
+        paths.prepare().unwrap();
+        persist_etcd_status(
+            &paths,
+            &EtcdStatus::new("connected", "router-01", Some("generation-1".into())),
+        )
+        .unwrap();
+        write_manifest(&paths.manifest, &[manifest_entry("stale")]).unwrap();
+
+        let collected = collect(&paths, &DisabledUci).unwrap();
+
+        assert_eq!(collected.etcd.state, "disabled");
+        assert!(collected.etcd.commit.is_none());
+        assert!(collected.interfaces.is_empty());
+        assert!(collected.interface_details.is_empty());
+        assert_eq!(collected.frr, "disabled");
     }
 
     #[test]

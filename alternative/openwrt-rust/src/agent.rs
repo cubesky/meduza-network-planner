@@ -77,9 +77,8 @@ impl<R: Runner> Agent<R> {
             // connection record. Recreate only the volatile status parent so
             // LuCI can distinguish an administratively disabled controller
             // from an unknown or crashed one. No etcd connection is made.
-            crate::atomic::ensure_private_dir(&self.paths.runtime, 0o700)?;
             self.commit = None;
-            self.persist_etcd_state("stopped");
+            report::persist_disabled_status(&self.paths, &self.runner)?;
             return Ok(());
         }
         Reconciler::new(self.paths.clone(), self.runner.clone()).prepare()?;

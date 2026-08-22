@@ -60,11 +60,13 @@ function pairedValue(peer, message) {
 
 function statusClass(state) {
 	return state === 'up' || state === 'connected' ? 'success' :
-		state === 'connecting' || state === 'waiting' ? 'warning' : 'danger';
+		state === 'connecting' || state === 'waiting' ||
+		state === 'disabled' || state === 'stopped' ? 'warning' : 'danger';
 }
 
 function statusBadge(state) {
-	var label = state === 'stopped' ? _('Not connected') : (state || _('unknown'));
+	var label = state === 'disabled' ? _('Disabled / not connected') :
+		state === 'stopped' ? _('Not connected') : (state || _('unknown'));
 	return E('span', {
 		'class': 'label ' + statusClass(state),
 		'style': 'display:inline-block;min-width:6em;text-align:center'
@@ -112,8 +114,16 @@ return view.extend({
 		]);
 	},
 
-	updateStatus: function(status) {
+	updateStatus: function(status, controllerEnabled) {
 		var etcd = status.etcd || { state: 'unknown' };
+		var disabled = controllerEnabled === false || etcd.state === 'disabled';
+		if (disabled)
+			etcd = {
+				state: 'disabled',
+				node_id: etcd.node_id || status.node_id || '',
+				commit: null,
+				updated_at: etcd.updated_at || status.observed_at || ''
+			};
 		var etcdBox = document.getElementById('meduza-etcd-status');
 		if (etcdBox)
 			dom.content(etcdBox, [
@@ -121,9 +131,10 @@ return view.extend({
 				E('small', {}, [ _('Commit: '), etcd.commit || '-', ' · ', etcd.updated_at || '-' ])
 			]);
 
-		var details = Array.isArray(status.interface_details) ? status.interface_details : [];
+		var details = !disabled && Array.isArray(status.interface_details) ? status.interface_details : [];
 		var outbound = details.filter(function(item) { return item.kind !== 'tinc'; });
-		var tinc = Array.isArray(status.tinc_peers) ? status.tinc_peers : [];
+		var tinc = !disabled && Array.isArray(status.tinc_peers) ? status.tinc_peers : [];
+		var inactiveMessage = _('Controller is disabled.');
 		var outboundBody = document.getElementById('meduza-outbound-body');
 		if (outboundBody)
 			dom.content(outboundBody, outbound.length ? outbound.map(function(item) {
@@ -132,7 +143,7 @@ return view.extend({
 					E('td', {}, [ item.logical ]),
 					E('td', {}, [ item.device ]), E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(5, _('No outbound VPN connections are managed.')) ]);
+			}) : [ emptyRow(5, disabled ? inactiveMessage : _('No outbound VPN connections are managed.')) ]);
 
 		var tincBody = document.getElementById('meduza-tinc-body');
 		if (tincBody)
@@ -141,12 +152,12 @@ return view.extend({
 					E('td', {}, [ item.peer ]), E('td', {}, [ item.network ]),
 					E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(3, _('No remote Tinc peers are configured.')) ]);
+			}) : [ emptyRow(3, disabled ? inactiveMessage : _('No remote Tinc peers are configured.')) ]);
 
 		var frr = document.getElementById('meduza-frr-status');
 		if (frr)
-			dom.content(frr, statusBadge(status.frr || 'down'));
-		var frrPeers = Array.isArray(status.frr_peers) ? status.frr_peers : [];
+			dom.content(frr, statusBadge(disabled ? 'disabled' : (status.frr || 'down')));
+		var frrPeers = !disabled && Array.isArray(status.frr_peers) ? status.frr_peers : [];
 		var frrBody = document.getElementById('meduza-frr-body');
 		if (frrBody)
 				dom.content(frrBody, frrPeers.length ? frrPeers.map(function(item) {
@@ -158,7 +169,7 @@ return view.extend({
 					E('td', {}, [ item.detail || '-' ]),
 					E('td', {}, [ statusBadge(item.state) ])
 				]);
-			}) : [ emptyRow(6, _('No FRR peers are currently known.')) ]);
+			}) : [ emptyRow(6, disabled ? inactiveMessage : _('No FRR peers are currently known.')) ]);
 	},
 
 	updateLog: function(entries) {
@@ -176,7 +187,8 @@ return view.extend({
 		var o;
 		s.addremove = false;
 
-		o = s.option(form.Flag, 'enable', _('Enable controller'));
+		var enableOption = s.option(form.Flag, 'enable', _('Enable controller'));
+		o = enableOption;
 		o.default = o.disabled;
 		o.rmempty = false;
 
@@ -273,12 +285,12 @@ return view.extend({
 			var page = E([], [ E('h2', {}, [ _('Meduza') ]), tabs ]);
 			ui.tabs.initTabGroup(tabs.childNodes);
 			window.setTimeout(L.bind(function() {
-				this.updateStatus(data[2]);
+				this.updateStatus(data[2], String(enableOption.formvalue('main') || '0') === '1');
 				this.updateLog(data[3]);
 			}, this), 0);
 			poll.add(L.bind(function() {
 				return Promise.all([ fetchStatus(), fetchMeduzaLog() ]).then(L.bind(function(values) {
-					this.updateStatus(values[0]);
+					this.updateStatus(values[0], String(enableOption.formvalue('main') || '0') === '1');
 					this.updateLog(values[1]);
 				}, this));
 			}, this), 5);

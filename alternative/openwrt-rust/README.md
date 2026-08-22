@@ -154,7 +154,9 @@ OpenVPN/WireGuard and filtered Meduza logs; the second shows each remote Tinc
 peer's live reachability plus individual BGP/OSPF neighbor state from FRR; the
 third contains these settings and certificate paths. Disabling the controller
 performs owner-aware cleanup without contacting etcd and leaves a volatile
-`Not connected` status for the page.
+`Disabled / not connected` status for the page. While disabled, the status
+endpoint and LuCI page suppress stale VPN, Tinc and FRR observations instead
+of presenting a prior `up` result as current state.
 
 Example configuration:
 
